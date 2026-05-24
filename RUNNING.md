@@ -273,3 +273,49 @@ s_clean_distribution.csv
 - 如果 GPU 占用很低，先看终端进度：可能仍在图片读取、坏图检查、特征缓存校验或 KNN 构建阶段。
 - 如果 DINOv2 权重缓存损坏，先删除 torch hub checkpoints 中对应的 DINOv2 权重，再重新运行。
 - `random` 后端只能检查流程，不代表实验效果。
+
+## V1.5 GCDD vs Centroid 诊断
+
+V1.5 不训练、不重新筛样本，只分析 V1 已生成的 `Full GCDD-clean` 和 `Centroid filtering` 差异。
+
+运行命令：
+
+```powershell
+python tools/analyze_gcdd_centroid_diff.py --input-dir outputs/v1_web_bird
+```
+
+如果你的结果目录不同，替换 `--input-dir`：
+
+```powershell
+python tools/analyze_gcdd_centroid_diff.py --input-dir output/v1_web_bird
+```
+
+默认输出：
+
+```text
+<input-dir>/gcdd_centroid_analysis/
+```
+
+主要输出：
+
+```text
+overlap_summary.csv
+per_class_overlap.csv
+per_class_overlap_top_low_jaccard.csv
+per_class_gcdd_only_top_classes.csv
+per_class_centroid_only_top_classes.csv
+group_metric_summary.csv
+hard_clean_group_distribution.csv
+visualization_index.csv
+class_visualization_index.csv
+analysis_summary.md
+figures/distributions/
+figures/neighbors/
+figures/classes/
+```
+
+说明：
+
+- 如果当前 V1 目录没有 `linear_all_train_scores.csv`，脚本会跳过基于 loss/confidence 的 hard-clean 统计。
+- 新版本 V1 后续会自动写 `linear_all_train_scores.csv`，以后再跑 V1.5 时会自动启用 loss/confidence 分析。
+- HTML 可视化引用原始图片路径；如果是在本地查看 autodl 下载结果，但本地没有对应图片路径，HTML 中图片可能无法显示。

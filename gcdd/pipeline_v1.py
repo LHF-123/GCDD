@@ -89,6 +89,7 @@ def run_v1_web_bird(cfg: dict) -> None:
 
     all_train_logits = predict_logits(all_model, train_x)
     confidence, loss = true_class_scores(all_train_logits, train_labels, all_model.classes)
+    write_linear_all_scores(output_dir / "linear_all_train_scores.csv", train_records, confidence, loss)
     log_stage("[6/9] Building aligned baseline splits.")
     baseline_masks = {
         "Confidence filtering": select_top_per_class(confidence, train_labels, keep_counts, largest=True),
@@ -301,6 +302,20 @@ def write_baseline_splits(output_dir: Path, records: list[ImageRecord], masks: d
             for i, record in enumerate(records)
         ]
         write_csv(output_dir / filename, rows, ["index", "path", "web_label", "state"])
+
+
+def write_linear_all_scores(path: Path, records: list[ImageRecord], confidence: np.ndarray, loss: np.ndarray) -> None:
+    rows = [
+        {
+            "index": record.index,
+            "path": str(record.path),
+            "web_label": record.label,
+            "confidence": float(confidence[i]),
+            "loss": float(loss[i]),
+        }
+        for i, record in enumerate(records)
+    ]
+    write_csv(path, rows, ["index", "path", "web_label", "confidence", "loss"])
 
 
 def build_v1_summary(
