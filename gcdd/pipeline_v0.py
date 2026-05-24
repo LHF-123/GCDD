@@ -41,7 +41,7 @@ def run_v0_smoke(cfg: dict) -> None:
     write_split(output_dir / "debug_split.csv", records, state)
 
     train_logs = train_linear_smoke(features["cls"], labels, state == "clean", cfg)
-    write_csv(output_dir / "debug_train_log.csv", train_logs, ["epoch", "loss", "top1", "top5", "train_samples"])
+    write_csv(output_dir / "debug_train_log.csv", train_logs, ["epoch", "lr", "loss", "top1", "top5", "train_samples"])
 
     summary = build_summary(records, bad_images, feature_failures, features, graphs, metrics, split_info, train_logs, cfg)
     write_json(output_dir / "debug_summary.json", summary)

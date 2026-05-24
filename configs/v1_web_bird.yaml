@@ -39,6 +39,7 @@ train:
   epochs: 50
   batch_size: 256
   lr: 0.05
+  min_lr: 0.0
+  scheduler: cosine
   seed: 42
   feature: cls
-

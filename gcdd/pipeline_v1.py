@@ -95,11 +95,11 @@ def run_v1_web_bird(cfg: dict) -> None:
         train_logs.extend(logs)
         summaries.append(summarize_epoch_logs(method, logs))
 
-    write_csv(output_dir / "train_log.csv", train_logs, ["method", "epoch", "loss", "top1", "top5", "train_samples", "eval_samples"])
+    write_csv(output_dir / "train_log.csv", train_logs, ["method", "epoch", "lr", "loss", "top1", "top5", "train_samples", "eval_samples"])
     write_csv(
         output_dir / "eval_log.csv",
         train_logs,
-        ["method", "epoch", "loss", "top1", "top5", "train_samples", "eval_samples"],
+        ["method", "epoch", "lr", "loss", "top1", "top5", "train_samples", "eval_samples"],
     )
     write_csv(
         output_dir / "baseline_compare_web_bird.csv",

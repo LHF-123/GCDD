@@ -22,7 +22,7 @@ def train_linear_smoke(features: np.ndarray, labels: np.ndarray, clean_mask: np.
     if num_classes == 0:
         raise ValueError("No labels available for training.")
     if num_classes == 1:
-        return [{"epoch": 1, "loss": 0.0, "top1": 1.0, "top5": 1.0, "train_samples": int(clean_mask.sum())}]
+        return [{"epoch": 1, "lr": float(cfg["train"]["lr"]), "loss": 0.0, "top1": 1.0, "top5": 1.0, "train_samples": int(clean_mask.sum())}]
 
     x = standardize(features.astype(np.float32))
     train_idx = np.where(clean_mask)[0]
@@ -31,12 +31,12 @@ def train_linear_smoke(features: np.ndarray, labels: np.ndarray, clean_mask: np.
 
     weights = rng.normal(scale=0.01, size=(x.shape[1], num_classes)).astype(np.float32)
     bias = np.zeros(num_classes, dtype=np.float32)
-    lr = float(cfg["train"]["lr"])
     batch_size = int(cfg["train"]["batch_size"])
     epochs = int(cfg["train"]["epochs"])
     logs: list[dict[str, float | int]] = []
 
     for epoch in range(1, epochs + 1):
+        epoch_lr = learning_rate_for_epoch(cfg, epoch, epochs)
         rng.shuffle(train_idx)
         losses = []
         for start in range(0, len(train_idx), batch_size):
@@ -49,14 +49,15 @@ def train_linear_smoke(features: np.ndarray, labels: np.ndarray, clean_mask: np.
             grad = probs
             grad[np.arange(len(idx)), y] -= 1.0
             grad /= len(idx)
-            weights -= lr * (x[idx].T @ grad)
-            bias -= lr * grad.sum(axis=0)
+            weights -= epoch_lr * (x[idx].T @ grad)
+            bias -= epoch_lr * grad.sum(axis=0)
 
         eval_logits = x @ weights + bias
         top1, top5 = topk_accuracy(eval_logits, encoded, k5=min(5, num_classes))
         logs.append(
             {
                 "epoch": epoch,
+                "lr": epoch_lr,
                 "loss": float(np.mean(losses)) if losses else 0.0,
                 "top1": top1,
                 "top5": top5,
@@ -92,12 +93,12 @@ def train_linear_eval(
     num_classes = len(classes)
     weights = rng.normal(scale=0.01, size=(x_train.shape[1], num_classes)).astype(np.float32)
     bias = np.zeros(num_classes, dtype=np.float32)
-    lr = float(cfg["train"]["lr"])
     batch_size = int(cfg["train"]["batch_size"])
     epochs = int(cfg["train"]["epochs"])
     logs: list[dict[str, float | int | str]] = []
 
     for epoch in range(1, epochs + 1):
+        epoch_lr = learning_rate_for_epoch(cfg, epoch, epochs)
         rng.shuffle(train_idx)
         losses = []
         for start in range(0, len(train_idx), batch_size):
@@ -110,8 +111,8 @@ def train_linear_eval(
             grad = probs
             grad[np.arange(len(idx)), y] -= 1.0
             grad /= len(idx)
-            weights -= lr * (x_train[idx].T @ grad)
-            bias -= lr * grad.sum(axis=0)
+            weights -= epoch_lr * (x_train[idx].T @ grad)
+            bias -= epoch_lr * grad.sum(axis=0)
 
         eval_logits = x_eval[eval_known] @ weights + bias
         top1, top5 = topk_accuracy(eval_logits, encoded_eval[eval_known], k5=min(5, num_classes))
@@ -119,6 +120,7 @@ def train_linear_eval(
             {
                 "method": method,
                 "epoch": epoch,
+                "lr": epoch_lr,
                 "loss": float(np.mean(losses)) if losses else 0.0,
                 "top1": top1,
                 "top5": top5,
@@ -128,6 +130,20 @@ def train_linear_eval(
         )
 
     return logs, LinearModel(weights=weights, bias=bias, mean=mean, std=std, classes=classes)
+
+
+def learning_rate_for_epoch(cfg: dict, epoch: int, total_epochs: int) -> float:
+    base_lr = float(cfg["train"]["lr"])
+    min_lr = float(cfg["train"].get("min_lr", 0.0))
+    scheduler = str(cfg["train"].get("scheduler", "none")).lower()
+    if total_epochs <= 1 or scheduler == "none":
+        return base_lr
+    progress = (epoch - 1) / max(1, total_epochs - 1)
+    if scheduler == "linear":
+        return min_lr + (base_lr - min_lr) * (1.0 - progress)
+    if scheduler == "cosine":
+        return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + np.cos(np.pi * progress))
+    raise ValueError(f"Unsupported train.scheduler: {scheduler}")
 
 
 def predict_logits(model: LinearModel, features: np.ndarray) -> np.ndarray:

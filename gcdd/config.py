@@ -47,6 +47,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "epochs": 1,
         "batch_size": 32,
         "lr": 0.05,
+        "min_lr": 0.0,
+        "scheduler": "none",
         "seed": 42,
     },
 }
@@ -94,4 +96,3 @@ def parse_set_override(item: str) -> tuple[str, Any]:
     except json.JSONDecodeError:
         value = raw_value
     return key, value
-

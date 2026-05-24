@@ -130,35 +130,101 @@ V1 默认配置在：
 configs/v1_web_bird.yaml
 ```
 
-关键字段：
+关键字段和含义：
 
 ```yaml
 dataset:
+  # 数据集根目录；命令行 --data-root 会覆盖它。
+  root: ""
+
+  # 可选 CSV 索引文件；为空时按目录结构扫描图片。
+  index_file: ""
+
+  # 训练集目录名。你的结构中是 web-bird/train，所以这里是 train。
   train_split: train
+
+  # 评估集目录名。你的结构中是 web-bird/val，所以这里是 val。
   eval_split: val
 
+  # 调试用：只取前 N 个类别；正式实验应留空。
+  max_classes:
+
+  # 调试用：每类最多取多少 train 样本；正式实验应留空。
+  max_train_per_class:
+
+  # 调试用：每类最多取多少 val 样本；正式实验应留空。
+  max_eval_per_class:
+
+  # 是否在索引阶段检查坏图；WebFG-496 建议保持 true。
+  verify_images: true
+
 feature:
+  # 特征后端。正式 V1 用 dinov2_vitb14；random 只用于流程调试。
   backend: dinov2_vitb14
+
+  # DINOv2 特征提取 batch size；显存不足时调小。
   batch_size: 16
+
+  # 输入图片 resize 尺寸。
+  input_size: 224
+
+  # Top-patch 特征使用响应最高的 patch 比例。
+  top_patch_ratio: 0.2
+
+  # 是否复用已有特征缓存；只有 paths.txt 与当前索引完全一致才会复用。
   reuse: true
 
 graph:
+  # class-wise KNN 的候选池大小。
   k_pool_class: 100
+
+  # global KNN 的候选池大小。
   k_pool_global: 300
+
+  # RRF 后保留的类内邻居数。
   k_class: 20
+
+  # RRF 后保留的全局邻居数。
   k_global: 50
+
+  # Reciprocal Rank Fusion 的平滑参数。
   rrf_k0: 20
 
 selection:
+  # Otsu 阈值直方图 bin 数。
   otsu_bins: 256
+
+  # 每类 clean ratio 的上下限，防止 Otsu 过低或过高。
   clean_ratio_clip: [0.3, 0.9]
 
 train:
+  # 线性分类器训练轮数。V1 正式默认 50。
   epochs: 50
+
+  # 线性分类器 batch size。
   batch_size: 256
+
+  # 线性分类器学习率。
   lr: 0.05
+
+  # 最小学习率，scheduler 衰减到这个值。
+  min_lr: 0.0
+
+  # 学习率调度。正式 V1 默认 cosine；可选 none、linear、cosine。
+  scheduler: cosine
+
+  # 训练和抽样随机种子。
+  seed: 42
+
+  # 用哪种特征训练线性分类器；当前默认 cls。
   feature: cls
 ```
+
+epoch 建议：
+
+- V1 正式默认先跑 `50`，因为 5 个方法都会训练，直接改成 `100` 会让耗时接近翻倍。
+- 如果 `run_summary.md` 或 `baseline_compare_web_bird.csv` 中出现 `best_top1` 明显高于 `final_top1`，或者 `last10_std` 偏高，说明后期不稳定，可以再跑 `--epochs 100`。
+- 如果 50 epoch 下 `final_top1` 接近 `best_top1` 且 `last10_std` 很小，不需要延长。
 
 ## V1 主要输出文件
 
