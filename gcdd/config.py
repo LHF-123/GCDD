@@ -24,6 +24,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "feature": {
         "backend": "dinov2_vitb14",
+        "local_repo": "",
         "device": "auto",
         "batch_size": 8,
         "input_size": 224,

@@ -7,7 +7,7 @@ import numpy as np
 
 from .baselines import centroid_scores, per_class_keep_counts, select_top_per_class
 from .data import ImageRecord, build_verified_index
-from .features import extract_features
+from .features import FeatureExtractor
 from .graph import build_rrf_graphs
 from .io_utils import ensure_dir, write_csv, write_json, write_yaml
 from .pipeline_v0 import class_clip_rate, top_bottom_summary, write_index, write_scores, write_split
@@ -50,8 +50,9 @@ def run_v1_web_bird(cfg: dict) -> None:
     log_stage(f"[1/9] Train/eval valid images: {len(train_records)} / {len(eval_records)}. Bad images: {len(train_bad) + len(eval_bad)}.")
 
     log_stage("[2/9] Loading or extracting train/eval features...")
-    train_features, train_records, train_feature_failures = load_or_extract_feature_set(output_dir, "train", train_records, cfg)
-    eval_features, eval_records, eval_feature_failures = load_or_extract_feature_set(output_dir, "eval", eval_records, cfg)
+    feature_extractor: list[FeatureExtractor | None] = [None]
+    train_features, train_records, train_feature_failures = load_or_extract_feature_set(output_dir, "train", train_records, cfg, feature_extractor)
+    eval_features, eval_records, eval_feature_failures = load_or_extract_feature_set(output_dir, "eval", eval_records, cfg, feature_extractor)
     write_index(output_dir / "dataset_index.csv", train_records)
     write_index(output_dir / "eval_index.csv", eval_records)
     write_bad_images(output_dir, train_bad, eval_bad, train_feature_failures, eval_feature_failures)
@@ -147,6 +148,7 @@ def load_or_extract_feature_set(
     prefix: str,
     records: list[ImageRecord],
     cfg: dict,
+    feature_extractor: list[FeatureExtractor | None],
 ) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
     if cfg["feature"].get("reuse", True):
         loaded = try_load_features(output_dir, prefix, records)
@@ -154,7 +156,9 @@ def load_or_extract_feature_set(
             log_stage(f"[features] Reusing cached {prefix} features from {output_dir}.")
             return loaded, records, []
     log_stage(f"[features] No valid cache for {prefix}; extracting features.")
-    features, kept_records, failures = extract_features(records, cfg, stage_name=prefix)
+    if feature_extractor[0] is None:
+        feature_extractor[0] = FeatureExtractor(cfg)
+    features, kept_records, failures = feature_extractor[0].extract(records, stage_name=prefix)
     kept_records = reindex_records(kept_records)
     save_features(output_dir, prefix, features, kept_records)
     return features, kept_records, failures

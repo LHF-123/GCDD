@@ -15,6 +15,7 @@ output:
 
 feature:
   backend: dinov2_vitb14
+  local_repo: ""
   device: auto
   batch_size: 128
   input_size: 224

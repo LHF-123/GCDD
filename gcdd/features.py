@@ -11,14 +11,110 @@ from .data import ImageRecord
 from .progress import log_stage, progress_iter
 
 
+class FeatureExtractor:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.backend = cfg["feature"]["backend"]
+        self._dinov2: DINOv2FeatureBackend | None = None
+        if self.backend == "dinov2_vitb14":
+            self._dinov2 = DINOv2FeatureBackend(cfg)
+        elif self.backend != "random":
+            raise ValueError(f"Unsupported feature backend: {self.backend}")
+
+    def extract(self, records: list[ImageRecord], stage_name: str = "features") -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
+        if self.backend == "random":
+            log_stage(f"[features] Building random {stage_name} features for {len(records)} images.")
+            return extract_random_features(records, self.cfg), records, []
+        if self._dinov2 is None:
+            raise RuntimeError("DINOv2 backend was not initialized.")
+        return self._dinov2.extract(records, stage_name)
+
+
+class DINOv2FeatureBackend:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.torch, transforms = import_torch_stack()
+        self.device = resolve_device(self.torch, cfg["feature"]["device"])
+        log_stage(f"[features] Loading DINOv2 ViT-B/14 on {self.device}.")
+        self.model = load_dinov2_model(self.torch, cfg).eval().to(self.device)
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((int(cfg["feature"]["input_size"]), int(cfg["feature"]["input_size"]))),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ]
+        )
+
+    def extract(self, records: list[ImageRecord], stage_name: str) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
+        batch_size = int(self.cfg["feature"]["batch_size"])
+        top_ratio = float(self.cfg["feature"]["top_patch_ratio"])
+        collected: dict[str, list[np.ndarray]] = {"cls": [], "gap": [], "top": []}
+        kept_all: list[ImageRecord] = []
+        failures: list[dict[str, str]] = []
+        total_batches = (len(records) + batch_size - 1) // batch_size
+        log_stage(f"[features] Extracting {stage_name}: {len(records)} images, batch_size={batch_size}.")
+
+        for start in progress_iter(range(0, len(records), batch_size), total=total_batches, desc=f"Extracting {stage_name}"):
+            batch_records = records[start : start + batch_size]
+            images = []
+            kept_records = []
+            for record in batch_records:
+                try:
+                    with Image.open(record.path) as img:
+                        images.append(self.transform(img.convert("RGB")))
+                    kept_records.append(record)
+                except Exception as exc:  # noqa: BLE001 - log and keep feature extraction running.
+                    failures.append(
+                        {
+                            "index": str(record.index),
+                            "path": str(record.path),
+                            "label": record.label,
+                            "reason": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+            if not images:
+                continue
+
+            batch = self.torch.stack(images, dim=0).to(self.device)
+            with self.torch.no_grad():
+                cls, gap, top = forward_dinov2(self.model, batch, top_ratio)
+            collected["cls"].append(cls.cpu().numpy().astype(np.float32))
+            collected["gap"].append(gap.cpu().numpy().astype(np.float32))
+            collected["top"].append(top.cpu().numpy().astype(np.float32))
+            kept_all.extend(kept_records)
+
+        if not collected["cls"]:
+            raise RuntimeError("No features were extracted. Check dataset paths and image validity.")
+        return {name: np.concatenate(parts, axis=0) for name, parts in collected.items()}, kept_all, failures
+
+
 def extract_features(records: list[ImageRecord], cfg: dict, stage_name: str = "features") -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
-    backend = cfg["feature"]["backend"]
-    if backend == "random":
-        log_stage(f"[features] Building random {stage_name} features for {len(records)} images.")
-        return extract_random_features(records, cfg), records, []
-    if backend == "dinov2_vitb14":
-        return extract_dinov2_features(records, cfg, stage_name)
-    raise ValueError(f"Unsupported feature backend: {backend}")
+    return FeatureExtractor(cfg).extract(records, stage_name)
+
+
+def load_dinov2_model(torch: Any, cfg: dict) -> Any:
+    local_repo = str(cfg["feature"].get("local_repo") or "").strip()
+    if local_repo:
+        path = Path(local_repo).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"feature.local_repo does not exist: {path}")
+        log_stage(f"[features] Loading DINOv2 from configured local repo: {path}")
+        return torch.hub.load(str(path), "dinov2_vitb14", source="local", trust_repo=True)
+
+    cache_repo = default_torch_hub_repo("facebookresearch_dinov2_main")
+    if cache_repo.exists():
+        log_stage(f"[features] Loading DINOv2 from local torch hub cache: {cache_repo}")
+        return torch.hub.load(str(cache_repo), "dinov2_vitb14", source="local", trust_repo=True)
+
+    log_stage("[features] Local DINOv2 repo cache not found; falling back to GitHub torch.hub load.")
+    return torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
+
+
+def default_torch_hub_repo(repo_dir_name: str) -> Path:
+    import os
+
+    hub_dir = Path(os.environ.get("TORCH_HOME", Path.home() / ".cache" / "torch")) / "hub"
+    return hub_dir / repo_dir_name
 
 
 def extract_random_features(records: list[ImageRecord], cfg: dict) -> dict[str, np.ndarray]:
@@ -33,60 +129,7 @@ def extract_random_features(records: list[ImageRecord], cfg: dict) -> dict[str, 
 
 
 def extract_dinov2_features(records: list[ImageRecord], cfg: dict, stage_name: str) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
-    torch, transforms = import_torch_stack()
-    device = resolve_device(torch, cfg["feature"]["device"])
-    log_stage(f"[features] Loading DINOv2 ViT-B/14 on {device}.")
-    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
-    model.eval().to(device)
-
-    transform = transforms.Compose(
-        [
-            transforms.Resize((int(cfg["feature"]["input_size"]), int(cfg["feature"]["input_size"]))),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-        ]
-    )
-
-    batch_size = int(cfg["feature"]["batch_size"])
-    top_ratio = float(cfg["feature"]["top_patch_ratio"])
-    collected: dict[str, list[np.ndarray]] = {"cls": [], "gap": [], "top": []}
-    kept_all: list[ImageRecord] = []
-    failures: list[dict[str, str]] = []
-    total_batches = (len(records) + batch_size - 1) // batch_size
-    log_stage(f"[features] Extracting {stage_name}: {len(records)} images, batch_size={batch_size}.")
-
-    for start in progress_iter(range(0, len(records), batch_size), total=total_batches, desc=f"Extracting {stage_name}"):
-        batch_records = records[start : start + batch_size]
-        images = []
-        kept_records = []
-        for record in batch_records:
-            try:
-                with Image.open(record.path) as img:
-                    images.append(transform(img.convert("RGB")))
-                kept_records.append(record)
-            except Exception as exc:  # noqa: BLE001 - log and keep V0 running.
-                failures.append(
-                    {
-                        "index": str(record.index),
-                        "path": str(record.path),
-                        "label": record.label,
-                        "reason": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-        if not images:
-            continue
-
-        batch = torch.stack(images, dim=0).to(device)
-        with torch.no_grad():
-            cls, gap, top = forward_dinov2(model, batch, top_ratio)
-        collected["cls"].append(cls.cpu().numpy().astype(np.float32))
-        collected["gap"].append(gap.cpu().numpy().astype(np.float32))
-        collected["top"].append(top.cpu().numpy().astype(np.float32))
-        kept_all.extend(kept_records)
-
-    if not collected["cls"]:
-        raise RuntimeError("No features were extracted. Check dataset paths and image validity.")
-    return {name: np.concatenate(parts, axis=0) for name, parts in collected.items()}, kept_all, failures
+    return DINOv2FeatureBackend(cfg).extract(records, stage_name)
 
 
 def forward_dinov2(model: Any, batch: Any, top_ratio: float) -> tuple[Any, Any, Any]:
