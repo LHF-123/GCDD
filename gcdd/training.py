@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .progress import log_stage
+
 
 @dataclass
 class LinearModel:
@@ -54,6 +56,7 @@ def train_linear_smoke(features: np.ndarray, labels: np.ndarray, clean_mask: np.
 
         eval_logits = x @ weights + bias
         top1, top5 = topk_accuracy(eval_logits, encoded, k5=min(5, num_classes))
+        log_stage(f"[train] smoke epoch {epoch}/{epochs}: lr={epoch_lr:.6g}, loss={float(np.mean(losses)) if losses else 0.0:.4f}, top1={top1:.4f}")
         logs.append(
             {
                 "epoch": epoch,
@@ -116,6 +119,11 @@ def train_linear_eval(
 
         eval_logits = x_eval[eval_known] @ weights + bias
         top1, top5 = topk_accuracy(eval_logits, encoded_eval[eval_known], k5=min(5, num_classes))
+        log_stage(
+            f"[train] {method} epoch {epoch}/{epochs}: "
+            f"lr={epoch_lr:.6g}, loss={float(np.mean(losses)) if losses else 0.0:.4f}, "
+            f"top1={top1:.4f}, top5={top5:.4f}"
+        )
         logs.append(
             {
                 "method": method,

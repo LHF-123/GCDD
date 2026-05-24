@@ -8,6 +8,7 @@ from .data import ImageRecord, build_debug_index
 from .features import extract_features
 from .graph import build_rrf_graphs
 from .io_utils import ensure_dir, write_csv, write_json, write_yaml
+from .progress import log_stage
 from .scoring import compute_scores
 from .training import train_linear_smoke
 
@@ -17,6 +18,7 @@ def run_v0_smoke(cfg: dict) -> None:
     ensure_dir(output_dir)
     write_yaml(output_dir / "resolved_config.yaml", cfg)
 
+    log_stage("[1/6] Building debug index and checking bad images...")
     records, bad_images = build_debug_index(cfg)
     if not records:
         raise RuntimeError("No valid images found after bad-image filtering and class sampling.")
@@ -24,28 +26,33 @@ def run_v0_smoke(cfg: dict) -> None:
     write_index(output_dir / "debug_index.csv", records)
     write_csv(output_dir / "bad_images.csv", bad_images, ["index", "path", "label", "split", "reason"])
 
-    features, kept_records, feature_failures = extract_features(records, cfg)
+    log_stage("[2/6] Extracting debug features...")
+    features, kept_records, feature_failures = extract_features(records, cfg, stage_name="debug")
     if feature_failures:
         write_csv(output_dir / "feature_failures.csv", feature_failures, ["index", "path", "label", "reason"])
     records = reindex_records(kept_records)
     labels = np.array([record.label for record in records])
     save_debug_features(output_dir, features)
 
+    log_stage("[3/6] Building debug RRF graphs...")
     graphs = build_rrf_graphs(features, labels, cfg)
     np.save(output_dir / "debug_class_knn_indices.npy", graphs["class_indices"])
     np.save(output_dir / "debug_global_knn_indices.npy", graphs["global_indices"])
 
+    log_stage("[4/6] Computing debug S_clean and Otsu split...")
     metrics, split_info = compute_scores(labels, graphs, cfg)
     state = split_info["state"]
     write_scores(output_dir / "debug_scores.csv", records, metrics, split_info)
     write_split(output_dir / "debug_split.csv", records, state)
 
+    log_stage("[5/6] Training debug linear classifier for smoke test...")
     train_logs = train_linear_smoke(features["cls"], labels, state == "clean", cfg)
     write_csv(output_dir / "debug_train_log.csv", train_logs, ["epoch", "lr", "loss", "top1", "top5", "train_samples"])
 
     summary = build_summary(records, bad_images, feature_failures, features, graphs, metrics, split_info, train_logs, cfg)
     write_json(output_dir / "debug_summary.json", summary)
     write_run_summary(output_dir / "run_summary.md", summary)
+    log_stage(f"[6/6] V0 smoke test finished. Summary: {output_dir / 'run_summary.md'}")
 
 
 def make_output_dir(cfg: dict) -> Path:

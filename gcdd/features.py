@@ -8,14 +8,16 @@ import numpy as np
 from PIL import Image
 
 from .data import ImageRecord
+from .progress import log_stage, progress_iter
 
 
-def extract_features(records: list[ImageRecord], cfg: dict) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
+def extract_features(records: list[ImageRecord], cfg: dict, stage_name: str = "features") -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
     backend = cfg["feature"]["backend"]
     if backend == "random":
+        log_stage(f"[features] Building random {stage_name} features for {len(records)} images.")
         return extract_random_features(records, cfg), records, []
     if backend == "dinov2_vitb14":
-        return extract_dinov2_features(records, cfg)
+        return extract_dinov2_features(records, cfg, stage_name)
     raise ValueError(f"Unsupported feature backend: {backend}")
 
 
@@ -30,9 +32,10 @@ def extract_random_features(records: list[ImageRecord], cfg: dict) -> dict[str, 
     return {name: np.vstack(values).astype(np.float32) for name, values in features.items()}
 
 
-def extract_dinov2_features(records: list[ImageRecord], cfg: dict) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
+def extract_dinov2_features(records: list[ImageRecord], cfg: dict, stage_name: str) -> tuple[dict[str, np.ndarray], list[ImageRecord], list[dict[str, str]]]:
     torch, transforms = import_torch_stack()
     device = resolve_device(torch, cfg["feature"]["device"])
+    log_stage(f"[features] Loading DINOv2 ViT-B/14 on {device}.")
     model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14", trust_repo=True)
     model.eval().to(device)
 
@@ -49,8 +52,10 @@ def extract_dinov2_features(records: list[ImageRecord], cfg: dict) -> tuple[dict
     collected: dict[str, list[np.ndarray]] = {"cls": [], "gap": [], "top": []}
     kept_all: list[ImageRecord] = []
     failures: list[dict[str, str]] = []
+    total_batches = (len(records) + batch_size - 1) // batch_size
+    log_stage(f"[features] Extracting {stage_name}: {len(records)} images, batch_size={batch_size}.")
 
-    for start in range(0, len(records), batch_size):
+    for start in progress_iter(range(0, len(records), batch_size), total=total_batches, desc=f"Extracting {stage_name}"):
         batch_records = records[start : start + batch_size]
         images = []
         kept_records = []

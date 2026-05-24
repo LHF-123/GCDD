@@ -16,7 +16,7 @@ output:
 feature:
   backend: dinov2_vitb14
   device: auto
-  batch_size: 16
+  batch_size: 128
   input_size: 224
   top_patch_ratio: 0.2
   random_dim: 128

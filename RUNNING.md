@@ -162,8 +162,8 @@ feature:
   # 特征后端。正式 V1 用 dinov2_vitb14；random 只用于流程调试。
   backend: dinov2_vitb14
 
-  # DINOv2 特征提取 batch size；显存不足时调小。
-  batch_size: 16
+  # DINOv2 特征提取 batch size；32GB 显存建议先用 128，OOM 再调小。
+  batch_size: 128
 
   # 输入图片 resize 尺寸。
   input_size: 224
@@ -269,5 +269,7 @@ s_clean_distribution.csv
 
 - WebFG-496 可能有坏图，坏图会写入 `bad_images.csv` 并跳过。
 - `feature.reuse: true` 时会复用已有特征，但只有缓存的 `paths.txt` 与当前索引完全一致才会复用。
+- 5090 32GB 显存建议 V1 从 `feature.batch_size=128` 开始；如果 OOM，降到 `64` 或 `32`。
+- 如果 GPU 占用很低，先看终端进度：可能仍在图片读取、坏图检查、特征缓存校验或 KNN 构建阶段。
 - 如果 DINOv2 权重缓存损坏，先删除 torch hub checkpoints 中对应的 DINOv2 权重，再重新运行。
 - `random` 后端只能检查流程，不代表实验效果。

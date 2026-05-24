@@ -11,6 +11,7 @@ from .features import extract_features
 from .graph import build_rrf_graphs
 from .io_utils import ensure_dir, write_csv, write_json, write_yaml
 from .pipeline_v0 import class_clip_rate, top_bottom_summary, write_index, write_scores, write_split
+from .progress import log_stage
 from .scoring import compute_scores
 from .training import predict_logits, summarize_epoch_logs, train_linear_eval, true_class_scores
 
@@ -29,6 +30,7 @@ def run_v1_web_bird(cfg: dict) -> None:
     ensure_dir(output_dir)
     write_yaml(output_dir / "resolved_config.yaml", cfg)
 
+    log_stage("[1/9] Building train/eval indexes and checking bad images...")
     train_records, train_bad = build_verified_index(
         cfg,
         split=cfg["dataset"].get("train_split", "train"),
@@ -45,7 +47,9 @@ def run_v1_web_bird(cfg: dict) -> None:
         raise RuntimeError("No valid train images found.")
     if not eval_records:
         raise RuntimeError("No valid eval images found. Check dataset.eval_split.")
+    log_stage(f"[1/9] Train/eval valid images: {len(train_records)} / {len(eval_records)}. Bad images: {len(train_bad) + len(eval_bad)}.")
 
+    log_stage("[2/9] Loading or extracting train/eval features...")
     train_features, train_records, train_feature_failures = load_or_extract_feature_set(output_dir, "train", train_records, cfg)
     eval_features, eval_records, eval_feature_failures = load_or_extract_feature_set(output_dir, "eval", eval_records, cfg)
     write_index(output_dir / "dataset_index.csv", train_records)
@@ -55,9 +59,11 @@ def run_v1_web_bird(cfg: dict) -> None:
     train_labels = np.array([record.label for record in train_records])
     eval_labels = np.array([record.label for record in eval_records])
     graph_features = {name: train_features[name] for name in ("cls", "gap", "top")}
+    log_stage("[3/9] Building class/global RRF graphs...")
     graphs = build_rrf_graphs(graph_features, train_labels, cfg)
     save_graphs(output_dir, graphs)
 
+    log_stage("[4/9] Computing GCDD scores and Adaptive-Otsu split...")
     metrics, split_info = compute_scores(train_labels, graphs, cfg)
     gcdd_mask = split_info["state"] == "clean"
     write_scores(output_dir / "gcdd_scores.csv", train_records, metrics, split_info)
@@ -76,12 +82,14 @@ def run_v1_web_bird(cfg: dict) -> None:
     train_logs: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
 
+    log_stage("[5/9] Training DINOv2 Linear all.")
     all_logs, all_model = train_linear_eval(train_x, train_labels, eval_x, eval_labels, all_mask, cfg, "DINOv2 Linear all")
     train_logs.extend(all_logs)
     summaries.append(summarize_epoch_logs("DINOv2 Linear all", all_logs))
 
     all_train_logits = predict_logits(all_model, train_x)
     confidence, loss = true_class_scores(all_train_logits, train_labels, all_model.classes)
+    log_stage("[6/9] Building aligned baseline splits.")
     baseline_masks = {
         "Confidence filtering": select_top_per_class(confidence, train_labels, keep_counts, largest=True),
         "Loss filtering": select_top_per_class(loss, train_labels, keep_counts, largest=False),
@@ -90,11 +98,13 @@ def run_v1_web_bird(cfg: dict) -> None:
     }
     write_baseline_splits(output_dir, train_records, baseline_masks)
 
+    log_stage("[7/9] Training aligned filtering baselines.")
     for method in V1_METHODS[1:]:
         logs, _ = train_linear_eval(train_x, train_labels, eval_x, eval_labels, baseline_masks[method], cfg, method)
         train_logs.extend(logs)
         summaries.append(summarize_epoch_logs(method, logs))
 
+    log_stage("[8/9] Writing logs and comparison tables.")
     write_csv(output_dir / "train_log.csv", train_logs, ["method", "epoch", "lr", "loss", "top1", "top5", "train_samples", "eval_samples"])
     write_csv(
         output_dir / "eval_log.csv",
@@ -124,6 +134,7 @@ def run_v1_web_bird(cfg: dict) -> None:
     )
     write_json(output_dir / "v1_summary.json", summary)
     write_run_summary(output_dir / "run_summary.md", summary)
+    log_stage(f"[9/9] V1 finished. Summary: {output_dir / 'run_summary.md'}")
 
 
 def make_output_dir(cfg: dict) -> Path:
@@ -139,8 +150,10 @@ def load_or_extract_feature_set(
     if cfg["feature"].get("reuse", True):
         loaded = try_load_features(output_dir, prefix, records)
         if loaded is not None:
+            log_stage(f"[features] Reusing cached {prefix} features from {output_dir}.")
             return loaded, records, []
-    features, kept_records, failures = extract_features(records, cfg)
+    log_stage(f"[features] No valid cache for {prefix}; extracting features.")
+    features, kept_records, failures = extract_features(records, cfg, stage_name=prefix)
     kept_records = reindex_records(kept_records)
     save_features(output_dir, prefix, features, kept_records)
     return features, kept_records, failures

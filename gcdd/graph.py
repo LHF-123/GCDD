@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import numpy as np
 
+from .progress import log_stage, progress_iter
+
 
 def build_rrf_graphs(features: dict[str, np.ndarray], labels: np.ndarray, cfg: dict) -> dict[str, np.ndarray]:
     graph_cfg = cfg["graph"]
     backend = graph_cfg.get("knn_backend", "auto")
     if backend not in {"auto", "numpy"}:
         raise ValueError("V0 currently supports exact numpy KNN only; use graph.knn_backend=auto or numpy.")
+    log_stage("[graph] Building class-wise RRF graph.")
     class_indices, class_weights = build_rrf_graph(
         features,
         labels,
@@ -16,6 +19,7 @@ def build_rrf_graphs(features: dict[str, np.ndarray], labels: np.ndarray, cfg: d
         k=int(graph_cfg["k_class"]),
         k0=float(graph_cfg["rrf_k0"]),
     )
+    log_stage("[graph] Building global RRF graph.")
     global_indices, global_weights = build_rrf_graph(
         features,
         labels,
@@ -45,13 +49,13 @@ def build_rrf_graph(
     weights = np.zeros((n, k), dtype=np.float32)
     normalized = {name: normalize_rows(value.astype(np.float32)) for name, value in features.items()}
     if mode == "class":
-        pools = {name: class_topk_pool(value, labels, k_pool) for name, value in normalized.items()}
+        pools = {name: class_topk_pool(value, labels, k_pool, desc=f"class pool {name}") for name, value in normalized.items()}
     elif mode == "global":
-        pools = {name: global_topk_pool(value, k_pool) for name, value in normalized.items()}
+        pools = {name: global_topk_pool(value, k_pool, desc=f"global pool {name}") for name, value in normalized.items()}
     else:
         raise ValueError(f"Unsupported graph mode: {mode}")
 
-    for i in range(n):
+    for i in progress_iter(range(n), total=n, desc=f"RRF fuse {mode}"):
         score_map: dict[int, float] = {}
         for pool in pools.values():
             for rank, j in enumerate(pool[i], start=1):
@@ -70,10 +74,11 @@ def build_rrf_graph(
     return indices, weights
 
 
-def class_topk_pool(features: np.ndarray, labels: np.ndarray, k_pool: int) -> np.ndarray:
+def class_topk_pool(features: np.ndarray, labels: np.ndarray, k_pool: int, desc: str) -> np.ndarray:
     n = len(labels)
     pool = np.full((n, k_pool), -1, dtype=np.int64)
-    for label in sorted(set(labels.tolist())):
+    unique_labels = sorted(set(labels.tolist()))
+    for label in progress_iter(unique_labels, total=len(unique_labels), desc=desc):
         idx = np.where(labels == label)[0]
         if len(idx) <= 1:
             continue
@@ -84,13 +89,14 @@ def class_topk_pool(features: np.ndarray, labels: np.ndarray, k_pool: int) -> np
     return pool
 
 
-def global_topk_pool(features: np.ndarray, k_pool: int, block_size: int = 256) -> np.ndarray:
+def global_topk_pool(features: np.ndarray, k_pool: int, desc: str, block_size: int = 256) -> np.ndarray:
     n = features.shape[0]
     pool = np.full((n, k_pool), -1, dtype=np.int64)
     take = min(k_pool, max(0, n - 1))
     if take == 0:
         return pool
-    for start in range(0, n, block_size):
+    total_blocks = (n + block_size - 1) // block_size
+    for start in progress_iter(range(0, n, block_size), total=total_blocks, desc=desc):
         end = min(start + block_size, n)
         sim = features[start:end] @ features.T
         rows = np.arange(end - start)
