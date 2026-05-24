@@ -1,0 +1,44 @@
+dataset:
+  name: Web-Bird
+  root: ""
+  index_file: ""
+  train_split: train
+  eval_split: val
+  max_classes:
+  max_train_per_class:
+  max_eval_per_class:
+  verify_images: true
+
+output:
+  root: outputs
+  version: v1_web_bird
+
+feature:
+  backend: dinov2_vitb14
+  device: auto
+  batch_size: 16
+  input_size: 224
+  top_patch_ratio: 0.2
+  random_dim: 128
+  reuse: true
+
+graph:
+  knn_backend: auto
+  k_pool_class: 100
+  k_pool_global: 300
+  k_class: 20
+  k_global: 50
+  rrf_k0: 20
+
+selection:
+  otsu_bins: 256
+  clean_ratio_clip: [0.3, 0.9]
+  epsilon: 1.0e-8
+
+train:
+  epochs: 50
+  batch_size: 256
+  lr: 0.05
+  seed: 42
+  feature: cls
+

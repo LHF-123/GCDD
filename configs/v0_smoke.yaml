@@ -1,0 +1,40 @@
+dataset:
+  name: Web-Bird
+  root: "E:/下载/dataset/webfg496/web-bird"
+  index_file: ""
+  split: train
+  samples_per_class: 10
+  max_classes:
+  verify_images: true
+
+output:
+  root: outputs
+  version: v0_smoke
+
+feature:
+  backend: dinov2_vitb14
+  device: auto
+  batch_size: 8
+  input_size: 224
+  top_patch_ratio: 0.2
+  random_dim: 128
+
+graph:
+  knn_backend: auto
+  k_pool_class: 20
+  k_pool_global: 50
+  k_class: 5
+  k_global: 10
+  rrf_k0: 20
+
+selection:
+  otsu_bins: 256
+  clean_ratio_clip: [0.3, 0.9]
+  epsilon: 1.0e-8
+
+train:
+  epochs: 1
+  batch_size: 32
+  lr: 0.05
+  seed: 42
+
