@@ -289,6 +289,24 @@ V1.5 不训练、不重新筛样本，只分析 V1 已生成的 `Full GCDD-clean
 python tools/analyze_gcdd_centroid_diff.py --input-dir outputs/v1_web_bird
 ```
 
+默认会把 HTML 可视化涉及到的图片复制到：
+
+```text
+<input-dir>/gcdd_centroid_analysis/figures/assets/
+```
+
+HTML 使用相对路径引用这些 asset，所以下载整个 `gcdd_centroid_analysis` 文件夹后也能看图。
+
+如果 V1 是在 autodl 跑的，CSV 里的图片路径通常是 `/root/autodl-tmp/web-bird/...`。在本地重新生成 assets 时，需要把远端根目录映射到本地数据集根目录：
+
+```powershell
+python tools/analyze_gcdd_centroid_diff.py `
+  --input-dir outputs/v1_web_bird `
+  --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
+```
+
+如果直接在 autodl 上生成分析目录，并且原始图片仍在 `/root/autodl-tmp/web-bird`，不需要 `--path-map`。
+
 如果你的结果目录不同，替换 `--input-dir`：
 
 ```powershell
@@ -323,4 +341,75 @@ figures/classes/
 
 - 如果当前 V1 目录没有 `linear_all_train_scores.csv`，脚本会跳过基于 loss/confidence 的 hard-clean 统计。
 - 新版本 V1 后续会自动写 `linear_all_train_scores.csv`，以后再跑 V1.5 时会自动启用 loss/confidence 分析。
-- HTML 可视化引用原始图片路径；如果是在本地查看 autodl 下载结果，但本地没有对应图片路径，HTML 中图片可能无法显示。
+- 如不想复制图片，可加 `--no-copy-assets`，此时 HTML 会直接引用原始图片路径。
+
+## V1.6 Gated GCDD Split
+
+V1.6 用来验证一个更直接的问题：`Full GCDD-clean` 里是否存在一批 `Q_same` 低、`centroid_score` 低的可疑样本。它读取 V1 已有输出，不重新提特征、不重新计算 GCDD、不改原始 V1 结果。
+
+第一步只统计并生成 3 个 gated split，不训练：
+
+```powershell
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird
+```
+
+默认阈值定义：
+
+```text
+low_Q_same: 每个类别内 Q_same 排后 30%
+low_centroid: 每个类别内 centroid_score 排后 30%
+```
+
+生成的 split：
+
+```text
+gcdd_qgate_split.csv      # Full GCDD clean 中 low_Q_same 改为 ignored
+gcdd_pgate_split.csv      # Full GCDD clean 中 low_centroid 改为 ignored
+gcdd_qp_gate_split.csv    # Full GCDD clean 中 low_Q_same 且 low_centroid 改为 ignored
+```
+
+第一轮不补齐被删样本，目的是直接判断这些可疑样本是否有害。正式训练 3 个 gated split：
+
+```powershell
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird --train
+```
+
+常用参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--low-ratio 0.3` | 每类低分样本比例，默认 30%。 |
+| `--output-dir` | 指定 V1.6 输出目录，默认 `<input-dir>/v1_6_gated_splits`。 |
+| `--train` | 训练 `qgate`、`pgate`、`qp_gate` 三个 split。 |
+| `--epochs` | 覆盖线性分类器训练轮数。正式对比默认沿用 V1 的 50。 |
+| `--feature cls` | 使用哪个缓存特征训练，默认沿用 V1 配置。 |
+
+主要输出：
+
+```text
+v1_6_gated_splits/
+  suspicious_ratio_summary.csv
+  per_class_gate_summary.csv
+  gated_sample_flags.csv
+  gcdd_qgate_split.csv
+  gcdd_pgate_split.csv
+  gcdd_qp_gate_split.csv
+  gated_compare_web_bird.csv        # 使用 --train 时生成
+  combined_compare_web_bird.csv     # 使用 --train 时生成，合并 V1 关键结果
+  train_log.csv                     # 使用 --train 时生成
+  run_summary.md
+```
+
+优先看：
+
+```text
+suspicious_ratio_summary.csv
+run_summary.md
+combined_compare_web_bird.csv
+```
+
+判断规则：
+
+- 如果 `gcdd_qp_gate` 高于 `Full GCDD-clean`，说明原始 GCDD-clean 中确实有局部连通噪声。
+- 如果 `gcdd_qp_gate` 还能接近或超过 `Centroid filtering`，说明 GCDD 仍有继续改的价值。
+- 如果三个 gate 都不涨，先不要进入 V2，应重新检查 score 设计或承认 centroid 当前更强。

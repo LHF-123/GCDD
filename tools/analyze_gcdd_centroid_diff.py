@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import html
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,62 @@ GROUP_ORDER = ["both", "gcdd_only", "centroid_only", "neither"]
 METRIC_FIELDS = ["S_clean", "D_class", "R_class", "I_class_norm", "Q_same", "centroid_score", "confidence", "loss"]
 
 
+class AssetContext:
+    def __init__(self, asset_dir: Path, copy_assets: bool, path_maps: list[tuple[str, str]] | None = None):
+        self.asset_dir = asset_dir
+        self.copy_assets = copy_assets
+        self.path_maps = path_maps or []
+        self.cache: dict[str, Path] = {}
+        ensure_dir(asset_dir)
+
+    def html_src(self, image_path: str, html_file: Path, index: int | None = None) -> str:
+        source = Path(image_path)
+        if not self.copy_assets:
+            return source.as_uri() if source.is_absolute() else image_path
+        asset = self.copy_image(source, index)
+        if asset is None:
+            return source.as_uri() if source.is_absolute() else image_path
+        return os.path.relpath(asset, html_file.parent).replace("\\", "/")
+
+    def asset_path(self, image_path: str, index: int | None = None) -> str:
+        source = Path(image_path)
+        if not self.copy_assets:
+            return ""
+        asset = self.copy_image(source, index)
+        return str(asset) if asset is not None else ""
+
+    def copy_image(self, source: Path, index: int | None = None) -> Path | None:
+        resolved_source = self.resolve_source(source)
+        if resolved_source is None:
+            return None
+        key = str(resolved_source)
+        if key in self.cache:
+            return self.cache[key]
+        prefix = f"{index:06d}_" if index is not None else ""
+        target = self.asset_dir / f"{prefix}{safe_name(resolved_source.name)}"
+        suffix_count = 1
+        while target.exists() and not same_file(target, resolved_source):
+            target = self.asset_dir / f"{prefix}{safe_name(resolved_source.stem)}_{suffix_count}{resolved_source.suffix}"
+            suffix_count += 1
+        if not target.exists():
+            shutil.copy2(resolved_source, target)
+        self.cache[key] = target
+        return target
+
+    def resolve_source(self, source: Path) -> Path | None:
+        if source.exists():
+            return source
+        raw = str(source).replace("\\", "/")
+        for old, new in self.path_maps:
+            old_norm = old.replace("\\", "/").rstrip("/")
+            if raw == old_norm or raw.startswith(old_norm + "/"):
+                suffix = raw[len(old_norm) :].lstrip("/")
+                mapped = Path(new).expanduser() / Path(*suffix.split("/"))
+                if mapped.exists():
+                    return mapped
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze GCDD-clean vs centroid-clean split differences.")
     parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
@@ -29,7 +87,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="Web-Bird", help="Dataset name written to summary tables.")
     parser.add_argument("--neighbor-samples", type=int, default=20, help="Base sample count for neighbor HTML pages.")
     parser.add_argument("--no-figures", action="store_true", help="Skip matplotlib distribution figures.")
+    parser.add_argument("--copy-assets", action="store_true", default=True, help="Copy visualization images into figures/assets and use relative HTML paths.")
+    parser.add_argument("--no-copy-assets", action="store_false", dest="copy_assets", help="Do not copy images; HTML uses original file paths.")
+    parser.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW", help="Map original image root to local root before copying assets.")
     return parser.parse_args()
+
+
+def parse_path_maps(items: list[str]) -> list[tuple[str, str]]:
+    maps = []
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"--path-map must use OLD=NEW format, got: {item}")
+        old, new = item.split("=", 1)
+        maps.append((old, new))
+    return maps
 
 
 def main() -> None:
@@ -39,6 +110,7 @@ def main() -> None:
     ensure_dir(output_dir)
     ensure_dir(output_dir / "figures" / "distributions")
     ensure_dir(output_dir / "figures" / "neighbors")
+    ensure_dir(output_dir / "figures" / "assets")
 
     data = load_analysis_data(input_dir)
     groups = assign_groups(data["gcdd_clean"], data["centroid_clean"])
@@ -48,9 +120,10 @@ def main() -> None:
     per_class_rows = write_per_class_outputs(output_dir, data, groups)
     group_rows = write_group_metric_summary(output_dir / "group_metric_summary.csv", data, groups)
     write_hard_clean_distribution(output_dir / "hard_clean_group_distribution.csv", data, groups)
-    write_visualization_index(output_dir / "visualization_index.csv", data, groups, args.neighbor_samples)
-    write_neighbor_html(output_dir / "figures" / "neighbors", data, groups, args.neighbor_samples)
-    write_class_visualizations(output_dir / "figures" / "classes", output_dir / "class_visualization_index.csv", data, groups, per_class_rows)
+    asset_context = AssetContext(output_dir / "figures" / "assets", copy_assets=args.copy_assets, path_maps=parse_path_maps(args.path_map))
+    write_visualization_index(output_dir / "visualization_index.csv", data, groups, args.neighbor_samples, asset_context)
+    write_neighbor_html(output_dir / "figures" / "neighbors", data, groups, args.neighbor_samples, asset_context)
+    write_class_visualizations(output_dir / "figures" / "classes", output_dir / "class_visualization_index.csv", data, groups, per_class_rows, asset_context)
     if not args.no_figures:
         write_distribution_figures(output_dir / "figures" / "distributions", data, groups)
     write_summary_md(output_dir / "analysis_summary.md", args.dataset, data, groups, per_class_rows, group_rows)
@@ -258,12 +331,14 @@ def write_hard_clean_distribution(path: Path, data: dict[str, Any], groups: np.n
     write_csv(path, rows, ["group", "count", "ratio", "note"])
 
 
-def write_visualization_index(path: Path, data: dict[str, Any], groups: np.ndarray, base_count: int) -> None:
+def write_visualization_index(path: Path, data: dict[str, Any], groups: np.ndarray, base_count: int, asset_context: AssetContext) -> None:
     rows = visualization_rows(data, groups, base_count)
+    for row in rows:
+        row["asset_path"] = asset_context.asset_path(str(row["path"]), int(row["index"]))
     write_csv(
         path,
         rows,
-        ["index", "path", "web_label", "group", "selection_rule", "S_clean", "centroid_score", "D_class", "R_class", "I_class_norm", "Q_same", "loss", "confidence"],
+        ["index", "path", "asset_path", "web_label", "group", "selection_rule", "S_clean", "centroid_score", "D_class", "R_class", "I_class_norm", "Q_same", "loss", "confidence"],
     )
 
 
@@ -325,18 +400,18 @@ def sample_row(data: dict[str, Any], groups: np.ndarray, idx: int, rule: str) ->
     }
 
 
-def write_neighbor_html(output_dir: Path, data: dict[str, Any], groups: np.ndarray, base_count: int) -> None:
+def write_neighbor_html(output_dir: Path, data: dict[str, Any], groups: np.ndarray, base_count: int, asset_context: AssetContext) -> None:
     rows = visualization_rows(data, groups, base_count)
     index_rows = []
     for row in rows:
         idx = int(row["index"])
         filename = f"{idx:06d}_{row['group']}_{row['selection_rule']}.html"
-        write_sample_html(output_dir / filename, data, groups, idx, row["selection_rule"])
+        write_sample_html(output_dir / filename, data, groups, idx, row["selection_rule"], asset_context)
         index_rows.append({"index": idx, "group": row["group"], "selection_rule": row["selection_rule"], "html": filename})
     write_csv(output_dir / "neighbor_html_index.csv", index_rows, ["index", "group", "selection_rule", "html"])
 
 
-def write_class_visualizations(output_dir: Path, index_path: Path, data: dict[str, Any], groups: np.ndarray, per_class_rows: list[dict[str, Any]]) -> None:
+def write_class_visualizations(output_dir: Path, index_path: Path, data: dict[str, Any], groups: np.ndarray, per_class_rows: list[dict[str, Any]], asset_context: AssetContext) -> None:
     ensure_dir(output_dir)
     selected_classes = select_classes_for_visualization(per_class_rows)
     index_rows = []
@@ -345,7 +420,7 @@ def write_class_visualizations(output_dir: Path, index_path: Path, data: dict[st
         ensure_dir(class_dir)
         for group in ["both", "gcdd_only", "centroid_only"]:
             filename = f"{group}_samples.html"
-            write_class_group_html(class_dir / filename, data, groups, class_id, group, reason)
+            write_class_group_html(class_dir / filename, data, groups, class_id, group, reason, asset_context)
             index_rows.append({"class_id": class_id, "selection_reason": reason, "group": group, "html": str(class_dir / filename)})
     write_csv(index_path, index_rows, ["class_id", "selection_reason", "group", "html"])
 
@@ -361,7 +436,7 @@ def select_classes_for_visualization(per_class_rows: list[dict[str, Any]]) -> li
     return sorted(selected.items())
 
 
-def write_class_group_html(path: Path, data: dict[str, Any], groups: np.ndarray, class_id: str, group: str, reason: str) -> None:
+def write_class_group_html(path: Path, data: dict[str, Any], groups: np.ndarray, class_id: str, group: str, reason: str, asset_context: AssetContext) -> None:
     class_idx = np.where(data["labels"] == class_id)[0]
     idx = class_idx[groups[class_idx] == group]
     if group == "centroid_only":
@@ -376,9 +451,10 @@ def write_class_group_html(path: Path, data: dict[str, Any], groups: np.ndarray,
         "<div style='display:flex;gap:14px;flex-wrap:wrap'>",
     ]
     for i in idx:
+        src = asset_context.html_src(str(data["path"][i]), path, int(data["index"][i]))
         body.append(
             "<div style='width:190px'>"
-            f"<img src=\"file://{html.escape(data['path'][i])}\" style=\"max-width:170px\"><br>"
+            f"<img src=\"{html.escape(src)}\" style=\"max-width:170px\"><br>"
             f"idx={int(data['index'][i])}<br>"
             f"S={data['S_clean'][i]:.3f}, C={data['centroid_score'][i]:.3f}<br>"
             f"R={data['R_class'][i]:.3f}, I={data['I_class_norm'][i]:.3f}, Q={data['Q_same'][i]:.3f}"
@@ -392,7 +468,14 @@ def safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
 
 
-def write_sample_html(path: Path, data: dict[str, Any], groups: np.ndarray, idx: int, rule: str) -> None:
+def same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def write_sample_html(path: Path, data: dict[str, Any], groups: np.ndarray, idx: int, rule: str, asset_context: AssetContext) -> None:
     class_neighbors = [j for j in data["class_knn"][idx, :5].tolist() if j >= 0]
     global_neighbors = [j for j in data["global_knn"][idx, :5].tolist() if j >= 0]
     body = [
@@ -405,25 +488,27 @@ def write_sample_html(path: Path, data: dict[str, Any], groups: np.ndarray, idx:
         f"<li>centroid_score: {data['centroid_score'][idx]:.4f}</li>",
         f"<li>D/R/I/Q: {data['D_class'][idx]:.4f} / {data['R_class'][idx]:.4f} / {data['I_class_norm'][idx]:.4f} / {data['Q_same'][idx]:.4f}</li>",
         "</ul>",
-        image_block("Query", data["path"][idx]),
-        neighbor_block("Top-5 Class Neighbors", class_neighbors, data),
-        neighbor_block("Top-5 Global Neighbors", global_neighbors, data),
+        image_block("Query", data["path"][idx], path, asset_context, int(data["index"][idx])),
+        neighbor_block("Top-5 Class Neighbors", class_neighbors, data, path, asset_context),
+        neighbor_block("Top-5 Global Neighbors", global_neighbors, data, path, asset_context),
         "</body></html>",
     ]
     path.write_text("\n".join(body), encoding="utf-8")
 
 
-def image_block(title: str, image_path: str) -> str:
+def image_block(title: str, image_path: str, html_file: Path, asset_context: AssetContext, index: int) -> str:
     escaped = html.escape(image_path)
-    return f"<h2>{html.escape(title)}</h2><div><img src=\"file://{escaped}\" style=\"max-width:240px\"><p>{escaped}</p></div>"
+    src = html.escape(asset_context.html_src(image_path, html_file, index))
+    return f"<h2>{html.escape(title)}</h2><div><img src=\"{src}\" style=\"max-width:240px\"><p>{escaped}</p></div>"
 
 
-def neighbor_block(title: str, indices: list[int], data: dict[str, Any]) -> str:
+def neighbor_block(title: str, indices: list[int], data: dict[str, Any], html_file: Path, asset_context: AssetContext) -> str:
     parts = [f"<h2>{html.escape(title)}</h2><div style='display:flex;gap:12px;flex-wrap:wrap'>"]
     for j in indices:
+        src = html.escape(asset_context.html_src(str(data["path"][j]), html_file, int(data["index"][j])))
         parts.append(
             "<div style='width:180px'>"
-            f"<img src=\"file://{html.escape(data['path'][j])}\" style=\"max-width:160px\"><br>"
+            f"<img src=\"{src}\" style=\"max-width:160px\"><br>"
             f"{j}<br>{html.escape(str(data['web_label'][j]))}<br>"
             f"S={data['S_clean'][j]:.3f}, Q={data['Q_same'][j]:.3f}"
             "</div>"

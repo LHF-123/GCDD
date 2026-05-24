@@ -75,3 +75,21 @@ V1 outputs are written to `outputs/<dataset>/v1_web_bird/`. Important files:
 - `baseline_compare_web_bird.csv`
 - `train_log.csv`
 - `run_summary.md`
+
+## V1.6 Gated Split Check
+
+V1.6 reads an existing V1 output directory and checks whether low `Q_same` / low `centroid_score` samples inside `Full GCDD-clean` should be gated out.
+
+Generate statistics and splits only:
+
+```bash
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird
+```
+
+Train the three no-supplement gated splits:
+
+```bash
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird --train
+```
+
+Outputs are written to `outputs/v1_web_bird/v1_6_gated_splits/`.
