@@ -413,3 +413,490 @@ combined_compare_web_bird.csv
 - 如果 `gcdd_qp_gate` 高于 `Full GCDD-clean`，说明原始 GCDD-clean 中确实有局部连通噪声。
 - 如果 `gcdd_qp_gate` 还能接近或超过 `Centroid filtering`，说明 GCDD 仍有继续改的价值。
 - 如果三个 gate 都不涨，先不要进入 V2，应重新检查 score 设计或承认 centroid 当前更强。
+
+## V1.6 QP-Gate 删除样本分析
+
+如果 `gcdd_qp_gate` 没有提升，下一步先分析它删除的样本，不继续补齐训练。该脚本只读已有 V1/V1.6 结果，不改 split、不训练。
+
+```powershell
+python tools/analyze_qp_gate_deleted.py --input-dir outputs/v1_web_bird
+```
+
+如果 V1 是在 AutoDL 跑的，且 CSV 中图片路径是 `/root/autodl-tmp/web-bird/...`，在本地生成可视化时加路径映射：
+
+```powershell
+python tools/analyze_qp_gate_deleted.py `
+  --input-dir outputs/v1_web_bird `
+  --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/v1_6_gated_splits/qp_gate_deleted_analysis/
+  deleted_by_qp_gate.csv
+  qp_gate_deleted_per_class.csv
+  qp_gate_deleted_top20_classes.csv
+  deleted_metric_summary.csv
+  visualization_index.csv
+  manual_qp_gate_review.csv
+  manual_review.html
+  analysis_summary.md
+  figures/neighbors/
+  figures/assets/
+```
+
+重点看：
+
+- `deleted_by_qp_gate.csv`：233 个被删样本的明细。
+- `qp_gate_deleted_per_class.csv`：是否集中在少数类别。
+- `analysis_summary.md`：loss、confidence、Q_same、centroid_score 是否相对 kept-GCDD 明显异常。
+- `figures/neighbors/*.html`：人工判断 hard clean、真实噪声、背景相似簇、类别边界样本。
+
+人工标注最便捷方式：
+
+1. 打开 `manual_review.html`。
+2. 左侧选择样本，右侧查看 query、top-5 class neighbors 和 top-5 global neighbors。
+3. 填 `manual_label`、`looks_like_class_neighbors`、`looks_like_global_neighbors`、`has_duplicate` 和 `note`。
+4. 点击 `Export CSV` 导出标注结果。
+
+字段含义：
+
+```text
+manual_label:
+  noise        明显不是有效鸟图，或是无关/错误图
+  clean_like   是有效鸟图，但不强行判断是否属于 web_label 的细粒度类别
+  uncertain    看不清、主体太小、遮挡严重，或无法判断是否是有效鸟图
+
+looks_like_class_neighbors:
+  query 是否更像 top-5 class neighbors
+
+looks_like_global_neighbors:
+  query 是否更像 top-5 global neighbors
+
+has_duplicate:
+  邻居中是否存在重复或近重复图片
+```
+
+当前 Web-Bird 人工检查不要求区分具体细粒度类别，所以不要强行标 `hard_clean` 或 `boundary`。只需要判断是否是有效鸟图，并记录它更像 class neighbors 还是 global neighbors。
+
+## V1.7 QP-Risk Soft Weighting
+
+V1.7 验证 `qp_gate` 命中的高风险样本是否应该硬删除，还是保留但降低 CE loss 权重。它复用 V1 和 V1.6 输出，不重新提特征、不重新筛样本。
+
+定义：
+
+```text
+qp_risk = Full GCDD-clean 中被 gcdd_qp_gate 删除的样本
+```
+
+默认实验：
+
+```text
+qp_soft_0.3
+qp_soft_0.5
+qp_soft_0.7
+```
+
+运行：
+
+```powershell
+python scripts/run_v1_7_qp_soft_weighting.py --input-dir outputs/v1_web_bird
+```
+
+可选指定 alpha：
+
+```powershell
+python scripts/run_v1_7_qp_soft_weighting.py `
+  --input-dir outputs/v1_web_bird `
+  --alphas 0.3,0.5,0.7
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/qp_soft_weighting/
+  qp_risk_indices.csv
+  sample_weight_alpha_0.3.csv
+  sample_weight_alpha_0.5.csv
+  sample_weight_alpha_0.7.csv
+  qp_soft_results.csv
+  combined_compare_web_bird.csv
+  train_log.csv
+  run_summary.md
+```
+
+`qp_soft_results.csv` 重点字段：
+
+```text
+method
+alpha
+train_samples
+effective_train_weight
+num_qp_risk
+qp_risk_ratio
+best_top1
+final_top1
+last10_mean
+last10_std
+best_epoch
+```
+
+判断：
+
+- 如果 `qp_soft_x > Full GCDD-clean`，说明 hard delete 太激进，soft weighting 有效。
+- 如果 `qp_gate delete < qp_soft_x < Full GCDD-clean`，说明降权比删除好，但这批样本整体仍有正贡献。
+- 如果 `qp_soft_x <= qp_gate delete`，说明保留这些风险样本即使降权也没有帮助。
+
+## V1.8 Partial-Label Recovery
+
+V1.8 验证：对 GCDD 判为 non-clean、但 global graph 指向其他候选类别的样本，不使用原 web label CE，而使用候选标签集合 partial-label loss。
+
+训练组成：
+
+```text
+Full GCDD-clean:
+  原 web label CE
+
+recoverable non-clean:
+  -log sum_{c in candidate_labels} p(c)
+```
+
+默认 recoverable 定义：
+
+```text
+recover_top_qalt:
+  non-clean
+  Q_alt >= 0.30
+  candidate_size in [2, 6]
+
+safe_recover:
+  recover_top_qalt
+  neighbor_entropy <= 0.70
+  D_global_percentile >= 50
+```
+
+候选标签集合：
+
+```text
+candidate_labels = {c | q_i(c) >= 0.10} union {original web label}
+```
+
+默认运行：
+
+```powershell
+python scripts/run_v1_8_recover_partial_label.py --input-dir outputs/v1_web_bird
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/recover_partial_label/
+  recover_candidate_stats.csv
+  recover_top_qalt_samples.csv
+  safe_recover_samples.csv
+  recover_results.csv
+  combined_compare_web_bird.csv
+  train_log.csv
+  run_summary.md
+```
+
+判断：
+
+- 如果 `recover_* > Full GCDD-clean`，说明 non-clean recovery 有价值。
+- 如果 `recover_* >= Centroid filtering`，说明 recovery 方向可以作为后续主线。
+- 如果低于 `Full GCDD-clean`，说明当前候选标签不够可靠，应暂停 recovery 方向。
+
+## Prototype-Aware GCDD
+
+该实验把 `centroid_score` 当作类别 prototype super-node 连接强度，只改 clean score，不改训练逻辑。训练仍然是：
+
+```text
+选 clean 样本 -> DINOv2 frozen feature -> linear classifier clean-only CE
+```
+
+一次运行会生成并训练 3 个 score 版本：
+
+```text
+Proto only (Otsu):     S_proto = P_proto
+GCDD + Proto:          S_gcdd_proto = (P_D * P_R * P_I * P_Q * P_proto)^(1/5)
+GCDD + Proto no-I:     S_gcdd_proto_noI = (P_D * P_R * P_Q * P_proto)^(1/4)
+```
+
+运行：
+
+```powershell
+python scripts/run_proto_gcdd_web_bird.py --input-dir outputs/v1_web_bird
+```
+
+只生成 score 表：
+
+```powershell
+python tools/build_proto_gcdd_scores.py --input-dir outputs/v1_web_bird
+```
+
+手动从任意 score 列生成 Adaptive-Otsu split：
+
+```powershell
+python tools/split_clean_otsu.py `
+  --scores outputs/v1_web_bird/proto_gcdd/proto_gcdd_scores.csv `
+  --score-col S_gcdd_proto `
+  --out outputs/v1_web_bird/proto_gcdd/splits/split_gcdd_proto.csv
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/proto_gcdd/
+  proto_gcdd_scores.csv
+  splits/split_full_gcdd_rebuilt.csv
+  splits/split_proto_only.csv
+  splits/split_gcdd_proto.csv
+  splits/split_gcdd_proto_noI.csv
+  proto_gcdd_split_summary.csv
+  proto_gcdd_results.csv
+  combined_compare_web_bird.csv
+  train_log.csv
+  run_summary.md
+```
+
+注意：`Proto only (Otsu)` 使用 Adaptive-Otsu 选样，不等同于 V1 中按 `Full GCDD-clean` 每类保留数量对齐的 `Centroid filtering` baseline。
+
+当前 Web-Bird 结果：
+
+```text
+Centroid filtering:  0.843286
+Full GCDD-clean:     0.842423
+GCDD + Proto:        0.843631
+GCDD + Proto no-I:   0.840525
+```
+
+结论：`GCDD + Proto` 略高于当前 centroid baseline，说明 prototype anchor 对图筛选有正收益；`no-I` 明显更低，说明加入 prototype 后暂时不应直接去掉 `I_class_norm`。
+
+## Multi-Seed Verification
+
+多 seed 验证只重复训练下面 3 个方法，不重新提特征、不重新筛样本：
+
+```text
+Centroid filtering
+Full GCDD-clean
+GCDD + Proto
+```
+
+默认 seeds：
+
+```text
+1,2,3
+```
+
+运行：
+
+```powershell
+python scripts/run_multiseed_web_bird.py --input-dir outputs/v1_web_bird
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/multiseed/
+  multiseed_summary.csv
+  multiseed_results.csv
+  train_log.csv
+  run_summary.md
+```
+
+当前 Web-Bird best Top-1 多 seed 结果：
+
+```text
+method              seed1     seed2     seed3     mean      std
+Centroid filtering  0.843977  0.843114  0.845530  0.844207  0.001224
+Full GCDD-clean     0.838799  0.838108  0.840525  0.839144  0.001245
+GCDD + Proto        0.843631  0.842423  0.844494  0.843516  0.001040
+```
+
+结论：`GCDD + Proto` 多 seed 下稳定高于 `Full GCDD-clean`，但均值仍略低于 `Centroid filtering`，差距约 `0.069 pp`。因此 prototype anchor 是有效修正，但 Web-Bird 上尚不能声称稳定超过 centroid baseline。
+
+## GCDD+Proto vs Centroid Difference Analysis
+
+该分析只比较 `GCDD + Proto` 和 `Centroid filtering` 的 clean 样本集合，不训练、不重新筛样本。目标是判断 `GCDD + Proto` 是否只是 centroid 的换皮版本。
+
+运行：
+
+```powershell
+python tools/analyze_proto_gcdd_centroid_diff.py --input-dir outputs/v1_web_bird
+```
+
+主要输出：
+
+```text
+outputs/v1_web_bird/proto_gcdd_vs_centroid_analysis/
+  proto_gcdd_vs_centroid_overlap.csv
+  group_metric_summary.csv
+  per_class_proto_gcdd_vs_centroid_overlap.csv
+  per_class_low_jaccard_top20.csv
+  per_class_gcdd_proto_only_top20.csv
+  per_class_centroid_only_top20.csv
+  sample_groups.csv
+  analysis_summary.md
+```
+
+当前 overlap：
+
+```text
+Centroid clean:      9305
+GCDD+Proto clean:    9260
+Overlap:             7665
+GCDD+Proto only:     1595
+Centroid only:       1640
+Neither:             7486
+Jaccard:             0.7032
+```
+
+当前四组均值：
+
+```text
+group            count  S_gcdd_proto  S_clean  centroid  R       I       Q       loss    confidence
+both             7665   0.6719        0.6532   0.7034    0.7987  0.9624  0.2870  0.5528  0.6910
+gcdd_proto_only  1595   0.5382        0.5938   0.4453    0.7500  0.9370  0.1767  1.3491  0.4412
+centroid_only    1640   0.3142        0.2706   0.6012    0.3719  0.6223  0.1631  0.9717  0.5409
+neither          7486   0.2224        0.2396   0.2750    0.3728  0.5279  0.0757  2.1655  0.2861
+```
+
+结论：Jaccard=0.7032，说明 `GCDD + Proto` 不是 centroid 的换皮。`gcdd_proto_only` 比 `centroid_only` 有明显更强的 `R_class` 和 `I_class_norm`，但 loss 更高、confidence 更低、centroid_score 更低；这符合“图结构保留较难样本，centroid 保留更典型 easy clean”的模式。
+
+## LoRA Route
+
+LoRA 路线用于验证一个新问题：`GCDD + Proto` 额外保留的 hard clean 样本，在 backbone 可以适配时是否能贡献收益。
+
+训练数据：
+
+```text
+DINOv2 LoRA all noisy samples:
+  使用全部 train 样本，不做筛选
+
+DINOv2 LoRA + GCDD+Proto-only added:
+  使用 both only + GCDD+Proto-only 样本，即 proto_gcdd/splits/split_gcdd_proto.csv 中 state=clean 的样本
+
+DINOv2 LoRA + Full GCDD-clean:
+  使用 full_gcdd_clean_split.csv 中 state=clean 的样本，即原 GCDD clean
+
+DINOv2 LoRA + both only:
+  使用 GCDD+Proto clean 与 centroid clean 的交集样本，即 easy clean 上限/保守集
+
+DINOv2 LoRA + Centroid filtering:
+  使用 centroid_filtering_split.csv 中 state=clean 的样本，即 centroid clean
+```
+
+当前新主方法：
+
+```text
+DINOv2 LoRA + GCDD+Proto-only added
+```
+
+最小对照应包含：
+
+```text
+DINOv2 LoRA all noisy samples
+DINOv2 LoRA + Full GCDD-clean
+DINOv2 LoRA + both only
+DINOv2 LoRA + Centroid filtering
+```
+
+作用：
+
+```text
+验证 GCDD+Proto-only 额外保留的 hard clean 是否在 LoRA 微调下有贡献。
+```
+
+最小运行当前主方法：
+
+```powershell
+python scripts/run_lora_web_bird.py `
+  --input-dir outputs/v1_web_bird `
+  --methods gcdd_proto `
+  --seeds 1
+```
+
+推荐运行完整最小表：
+
+```powershell
+python scripts/run_lora_web_bird.py `
+  --input-dir outputs/v1_web_bird `
+  --methods all,full_gcdd,both_only,gcdd_proto,centroid `
+  --seeds 1
+```
+
+如果 V1 输出里的图片路径来自 AutoDL，但你在本地跑，需要加路径映射：
+
+```powershell
+python scripts/run_lora_web_bird.py `
+  --input-dir outputs/v1_web_bird `
+  --methods all,full_gcdd,both_only,gcdd_proto,centroid `
+  --seeds 1 `
+  --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
+```
+
+默认 LoRA 配置：
+
+```text
+target_modules: qkv
+rank: 8
+alpha: 16
+dropout: 0.05
+epochs: 10
+batch_size: 32
+eval_batch_size: 64
+lora_lr: 1e-4
+head_lr: 1e-3
+weight_decay: 0.05
+scheduler: cosine
+warmup_ratio: 0.1
+amp: true
+```
+
+常用覆盖参数：
+
+```powershell
+python scripts/run_lora_web_bird.py `
+  --input-dir outputs/v1_web_bird `
+  --methods all,full_gcdd,both_only,gcdd_proto,centroid `
+  --epochs 20 `
+  --batch-size 48 `
+  --eval-batch-size 96 `
+  --rank 8 `
+  --alpha 16
+```
+
+输出：
+
+```text
+outputs/v1_web_bird/lora/
+  lora_results.csv
+  lora_summary.csv
+  train_log.csv
+  lora_modules.csv
+  run_summary.md
+  checkpoints/
+```
+
+判断标准：
+
+```text
+如果 DINOv2 LoRA + GCDD+Proto-only added > DINOv2 LoRA + Centroid filtering：
+  说明 GCDD+Proto-only 额外保留的 hard clean 在可微调 backbone 下有贡献。
+
+如果 DINOv2 LoRA + GCDD+Proto-only added > DINOv2 LoRA + Full GCDD-clean：
+  说明 prototype anchor 在 LoRA 场景下也优于原始 GCDD-clean。
+
+如果 DINOv2 LoRA + GCDD+Proto-only added > DINOv2 LoRA + both only：
+  说明 GCDD+Proto-only 额外样本不只是噪声，可能给 LoRA 提供了有效 hard clean。
+
+如果 DINOv2 LoRA + GCDD+Proto-only added > DINOv2 LoRA all noisy samples：
+  说明筛选后的 hard clean 训练优于直接使用全量噪声 web 数据。
+
+如果提升达到 0.3-0.5 pp：
+  这个结果很有价值，可以作为后续主线。
+
+如果 DINOv2 LoRA + GCDD+Proto-only added 仍低于 DINOv2 LoRA + Centroid filtering：
+  说明当前 hard clean 额外样本对 backbone 微调也没有明显正收益，应继续分析样本质量或改 score。
+```
