@@ -149,6 +149,8 @@ def train_dinov2_lora(
         alpha=float(lora_cfg.get("alpha", 16.0)),
         dropout=float(lora_cfg.get("dropout", 0.05)),
     )
+    # LoRA modules are injected after the backbone is moved, so move newly created layers too.
+    model.to(device)
     for param in model.head.parameters():
         param.requires_grad_(True)
 
