@@ -20,7 +20,7 @@ from gcdd.training import summarize_epoch_logs, train_linear_eval
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run V1.7 qp-risk soft weighting on existing V1 outputs.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--gate-dir", help="V1.6 gated split directory. Defaults to <input-dir>/v1_6_gated_splits.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/qp_soft_weighting.")
     parser.add_argument("--alphas", default="0.3,0.5,0.7", help="Comma-separated qp-risk weights.")
@@ -354,7 +354,7 @@ def write_summary(
         "We keep the original Full GCDD-clean training set unchanged and assign lower CE weights to qp-risk samples.",
         "This isolates whether hard deletion is too aggressive while avoiding changes to the clean selection rule.",
         "",
-        "中文总结：V1.7 用于验证 qp-risk 样本是否应被硬删除；实验保持原 GCDD-clean 训练集不变，只降低 qp-risk 样本的 CE 权重。",
+        "Chinese summary: V1.7 keeps the Full GCDD-clean training set and down-weights qp-risk samples instead of deleting them.",
         "",
         f"- Source V1 output: {input_dir}",
         f"- Source V1.6 gate output: {gate_dir}",

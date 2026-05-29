@@ -72,7 +72,7 @@ class AssetContext:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze samples removed by GCDD Q_same AND centroid gate.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--gate-dir", help="V1.6 gated split directory. Defaults to <input-dir>/v1_6_gated_splits.")
     parser.add_argument("--output-dir", help="Analysis output directory. Defaults to <gate-dir>/qp_gate_deleted_analysis.")
     parser.add_argument("--loss-samples", type=int, default=30, help="Neighbor HTML count for highest-loss deleted samples.")

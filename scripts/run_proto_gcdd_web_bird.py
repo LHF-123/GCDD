@@ -29,7 +29,7 @@ METHODS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run prototype-aware GCDD clean-score variants on existing V1 Web-Bird outputs.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/proto_gcdd.")
     parser.add_argument("--epsilon", type=float, default=1.0e-6, help="Score product epsilon.")
     parser.add_argument("--otsu-bins", type=int, default=256, help="Otsu histogram bins.")

@@ -92,10 +92,12 @@ def run_v1_web_bird(cfg: dict) -> None:
     confidence, loss = true_class_scores(all_train_logits, train_labels, all_model.classes)
     write_linear_all_scores(output_dir / "linear_all_train_scores.csv", train_records, confidence, loss)
     log_stage("[6/9] Building aligned baseline splits.")
+    centroid_score = centroid_scores(train_x, train_labels)
+    write_centroid_scores(output_dir / "centroid_scores.csv", train_records, centroid_score)
     baseline_masks = {
         "Confidence filtering": select_top_per_class(confidence, train_labels, keep_counts, largest=True),
         "Loss filtering": select_top_per_class(loss, train_labels, keep_counts, largest=False),
-        "Centroid filtering": select_top_per_class(centroid_scores(train_x, train_labels), train_labels, keep_counts, largest=True),
+        "Centroid filtering": select_top_per_class(centroid_score, train_labels, keep_counts, largest=True),
         "Full GCDD-clean": gcdd_mask,
     }
     write_baseline_splits(output_dir, train_records, baseline_masks)
@@ -320,6 +322,19 @@ def write_linear_all_scores(path: Path, records: list[ImageRecord], confidence: 
         for i, record in enumerate(records)
     ]
     write_csv(path, rows, ["index", "path", "web_label", "confidence", "loss"])
+
+
+def write_centroid_scores(path: Path, records: list[ImageRecord], scores: np.ndarray) -> None:
+    rows = [
+        {
+            "index": record.index,
+            "path": str(record.path),
+            "web_label": record.label,
+            "centroid_score": float(scores[i]),
+        }
+        for i, record in enumerate(records)
+    ]
+    write_csv(path, rows, ["index", "path", "web_label", "centroid_score"])
 
 
 def build_v1_summary(

@@ -82,7 +82,7 @@ class AssetContext:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze GCDD-clean vs centroid-clean split differences.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="Analysis output directory.")
     parser.add_argument("--dataset", default="Web-Bird", help="Dataset name written to summary tables.")
     parser.add_argument("--neighbor-samples", type=int, default=20, help="Base sample count for neighbor HTML pages.")

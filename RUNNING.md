@@ -286,7 +286,7 @@ V1.5 不训练、不重新筛样本，只分析 V1 已生成的 `Full GCDD-clean
 运行命令：
 
 ```powershell
-python tools/analyze_gcdd_centroid_diff.py --input-dir outputs/v1_web_bird
+python tools/analyze_gcdd_centroid_diff.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 默认会把 HTML 可视化涉及到的图片复制到：
@@ -301,7 +301,7 @@ HTML 使用相对路径引用这些 asset，所以下载整个 `gcdd_centroid_an
 
 ```powershell
 python tools/analyze_gcdd_centroid_diff.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
 ```
 
@@ -310,7 +310,7 @@ python tools/analyze_gcdd_centroid_diff.py `
 如果你的结果目录不同，替换 `--input-dir`：
 
 ```powershell
-python tools/analyze_gcdd_centroid_diff.py --input-dir output/v1_web_bird
+python tools/analyze_gcdd_centroid_diff.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 默认输出：
@@ -350,7 +350,7 @@ V1.6 用来验证一个更直接的问题：`Full GCDD-clean` 里是否存在一
 第一步只统计并生成 3 个 gated split，不训练：
 
 ```powershell
-python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 默认阈值定义：
@@ -371,7 +371,7 @@ gcdd_qp_gate_split.csv    # Full GCDD clean 中 low_Q_same 且 low_centroid 改�
 第一轮不补齐被删样本，目的是直接判断这些可疑样本是否有害。正式训练 3 个 gated split：
 
 ```powershell
-python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird --train
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/Web-Bird/v1_web_bird --train
 ```
 
 常用参数：
@@ -419,21 +419,21 @@ combined_compare_web_bird.csv
 如果 `gcdd_qp_gate` 没有提升，下一步先分析它删除的样本，不继续补齐训练。该脚本只读已有 V1/V1.6 结果，不改 split、不训练。
 
 ```powershell
-python tools/analyze_qp_gate_deleted.py --input-dir outputs/v1_web_bird
+python tools/analyze_qp_gate_deleted.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 如果 V1 是在 AutoDL 跑的，且 CSV 中图片路径是 `/root/autodl-tmp/web-bird/...`，在本地生成可视化时加路径映射：
 
 ```powershell
 python tools/analyze_qp_gate_deleted.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/v1_6_gated_splits/qp_gate_deleted_analysis/
+outputs/Web-Bird/v1_web_bird/v1_6_gated_splits/qp_gate_deleted_analysis/
   deleted_by_qp_gate.csv
   qp_gate_deleted_per_class.csv
   qp_gate_deleted_top20_classes.csv
@@ -501,21 +501,21 @@ qp_soft_0.7
 运行：
 
 ```powershell
-python scripts/run_v1_7_qp_soft_weighting.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_7_qp_soft_weighting.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 可选指定 alpha：
 
 ```powershell
 python scripts/run_v1_7_qp_soft_weighting.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --alphas 0.3,0.5,0.7
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/qp_soft_weighting/
+outputs/Web-Bird/v1_web_bird/qp_soft_weighting/
   qp_risk_indices.csv
   sample_weight_alpha_0.3.csv
   sample_weight_alpha_0.5.csv
@@ -585,13 +585,13 @@ candidate_labels = {c | q_i(c) >= 0.10} union {original web label}
 默认运行：
 
 ```powershell
-python scripts/run_v1_8_recover_partial_label.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_8_recover_partial_label.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/recover_partial_label/
+outputs/Web-Bird/v1_web_bird/recover_partial_label/
   recover_candidate_stats.csv
   recover_top_qalt_samples.csv
   safe_recover_samples.csv
@@ -626,28 +626,28 @@ GCDD + Proto no-I:     S_gcdd_proto_noI = (P_D * P_R * P_Q * P_proto)^(1/4)
 运行：
 
 ```powershell
-python scripts/run_proto_gcdd_web_bird.py --input-dir outputs/v1_web_bird
+python scripts/run_proto_gcdd_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 只生成 score 表：
 
 ```powershell
-python tools/build_proto_gcdd_scores.py --input-dir outputs/v1_web_bird
+python tools/build_proto_gcdd_scores.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 手动从任意 score 列生成 Adaptive-Otsu split：
 
 ```powershell
 python tools/split_clean_otsu.py `
-  --scores outputs/v1_web_bird/proto_gcdd/proto_gcdd_scores.csv `
+  --scores outputs/Web-Bird/v1_web_bird/proto_gcdd/proto_gcdd_scores.csv `
   --score-col S_gcdd_proto `
-  --out outputs/v1_web_bird/proto_gcdd/splits/split_gcdd_proto.csv
+  --out outputs/Web-Bird/v1_web_bird/proto_gcdd/splits/split_gcdd_proto.csv
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/proto_gcdd/
+outputs/Web-Bird/v1_web_bird/proto_gcdd/
   proto_gcdd_scores.csv
   splits/split_full_gcdd_rebuilt.csv
   splits/split_proto_only.csv
@@ -692,13 +692,13 @@ GCDD + Proto
 运行：
 
 ```powershell
-python scripts/run_multiseed_web_bird.py --input-dir outputs/v1_web_bird
+python scripts/run_multiseed_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/multiseed/
+outputs/Web-Bird/v1_web_bird/multiseed/
   multiseed_summary.csv
   multiseed_results.csv
   train_log.csv
@@ -723,13 +723,13 @@ GCDD + Proto        0.843631  0.842423  0.844494  0.843516  0.001040
 运行：
 
 ```powershell
-python tools/analyze_proto_gcdd_centroid_diff.py --input-dir outputs/v1_web_bird
+python tools/analyze_proto_gcdd_centroid_diff.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 主要输出：
 
 ```text
-outputs/v1_web_bird/proto_gcdd_vs_centroid_analysis/
+outputs/Web-Bird/v1_web_bird/proto_gcdd_vs_centroid_analysis/
   proto_gcdd_vs_centroid_overlap.csv
   group_metric_summary.csv
   per_class_proto_gcdd_vs_centroid_overlap.csv
@@ -812,7 +812,7 @@ DINOv2 LoRA + Centroid filtering
 
 ```powershell
 python scripts/run_lora_web_bird.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --methods gcdd_proto `
   --seeds 1
 ```
@@ -821,7 +821,7 @@ python scripts/run_lora_web_bird.py `
 
 ```powershell
 python scripts/run_lora_web_bird.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --methods all,full_gcdd,both_only,gcdd_proto,centroid `
   --seeds 1
 ```
@@ -830,7 +830,7 @@ python scripts/run_lora_web_bird.py `
 
 ```powershell
 python scripts/run_lora_web_bird.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --methods all,full_gcdd,both_only,gcdd_proto,centroid `
   --seeds 1 `
   --path-map "/root/autodl-tmp/web-bird=E:\下载\dataset\webfg496\web-bird"
@@ -858,7 +858,7 @@ amp: true
 
 ```powershell
 python scripts/run_lora_web_bird.py `
-  --input-dir outputs/v1_web_bird `
+  --input-dir outputs/Web-Bird/v1_web_bird `
   --methods all,full_gcdd,both_only,gcdd_proto,centroid `
   --epochs 20 `
   --batch-size 48 `
@@ -870,7 +870,7 @@ python scripts/run_lora_web_bird.py `
 输出：
 
 ```text
-outputs/v1_web_bird/lora/
+outputs/Web-Bird/v1_web_bird/lora/
   lora_results.csv
   lora_summary.csv
   train_log.csv

@@ -40,7 +40,7 @@ PROTO_SCORE_FIELDS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build prototype-aware GCDD score table from existing V1 outputs.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--out", help="Output CSV. Defaults to <input-dir>/proto_gcdd/proto_gcdd_scores.csv.")
     parser.add_argument("--epsilon", type=float, default=1.0e-6, help="Score product epsilon.")
     return parser.parse_args()

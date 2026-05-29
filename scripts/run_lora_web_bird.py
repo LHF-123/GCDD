@@ -50,7 +50,7 @@ METHODS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DINOv2 LoRA training on Web-Bird clean splits.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/lora.")
     parser.add_argument("--methods", default="all,full_gcdd,both_only,gcdd_proto,centroid", help="Comma-separated methods: all, full_gcdd, both_only, gcdd_proto, centroid.")
     parser.add_argument("--seeds", default="1", help="Comma-separated seeds.")

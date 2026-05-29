@@ -1,0 +1,14 @@
+dataset:
+  cub_root: dataset/CUB_200_2011/CUB_200_2011
+
+noise:
+  # Per clean class, randomly flip this ratio of train images to its asymmetric target class.
+  ratio: 0.4
+  seed: 42
+  # Class c is flipped to the next class id, and the last class is flipped to class 1.
+  target_strategy: adjacent_cyclic
+
+output:
+  dir: outputs/CUB_200_2011/noise_indices
+  # Empty prefix means the tool will use cub_asym_r{ratio}_s{seed}.
+  prefix: ""

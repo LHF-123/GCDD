@@ -27,7 +27,7 @@ GATE_METHODS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build and optionally train V1.6 gated GCDD splits.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="V1.6 output directory. Defaults to <input-dir>/v1_6_gated_splits.")
     parser.add_argument("--low-ratio", type=float, default=0.3, help="Per-class bottom ratio used for low Q_same and low centroid gates.")
     parser.add_argument("--train", action="store_true", help="Train the three gated splits after writing stats and split files.")

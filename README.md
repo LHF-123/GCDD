@@ -83,46 +83,46 @@ V1.6 reads an existing V1 output directory and checks whether low `Q_same` / low
 Generate statistics and splits only:
 
 ```bash
-python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
 Train the three no-supplement gated splits:
 
 ```bash
-python scripts/run_v1_6_gated_splits.py --input-dir outputs/v1_web_bird --train
+python scripts/run_v1_6_gated_splits.py --input-dir outputs/Web-Bird/v1_web_bird --train
 ```
 
-Outputs are written to `outputs/v1_web_bird/v1_6_gated_splits/`.
+Outputs are written to `outputs/Web-Bird/v1_web_bird/v1_6_gated_splits/`.
 
 ## V1.7 QP-Risk Soft Weighting
 
 V1.7 keeps the original `Full GCDD-clean` training set and down-weights the samples that `gcdd_qp_gate` would delete.
 
 ```bash
-python scripts/run_v1_7_qp_soft_weighting.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_7_qp_soft_weighting.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
-Outputs are written to `outputs/v1_web_bird/qp_soft_weighting/`.
+Outputs are written to `outputs/Web-Bird/v1_web_bird/qp_soft_weighting/`.
 
 ## V1.8 Partial-Label Recovery
 
 V1.8 keeps `Full GCDD-clean` CE training and adds partial-label loss for selected non-clean samples whose global neighbors indicate concentrated alternative labels.
 
 ```bash
-python scripts/run_v1_8_recover_partial_label.py --input-dir outputs/v1_web_bird
+python scripts/run_v1_8_recover_partial_label.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
-Outputs are written to `outputs/v1_web_bird/recover_partial_label/`.
+Outputs are written to `outputs/Web-Bird/v1_web_bird/recover_partial_label/`.
 
 ## Prototype-Aware GCDD
 
 This experiment changes only the clean score by adding the class prototype percentile as a virtual super-node signal. Training remains clean-only CE on frozen DINOv2 features.
 
 ```bash
-python scripts/run_proto_gcdd_web_bird.py --input-dir outputs/v1_web_bird
+python scripts/run_proto_gcdd_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
-Outputs are written to `outputs/v1_web_bird/proto_gcdd/`. The main score variants are:
+Outputs are written to `outputs/Web-Bird/v1_web_bird/proto_gcdd/`. The main score variants are:
 
 - `S_proto`: prototype percentile only with Adaptive-Otsu.
 - `S_gcdd_proto`: original GCDD score plus prototype percentile.
@@ -135,10 +135,10 @@ Current Web-Bird best Top-1: `GCDD + Proto = 0.843631`, slightly above `Centroid
 Run only the three key methods across seeds 1, 2, and 3:
 
 ```bash
-python scripts/run_multiseed_web_bird.py --input-dir outputs/v1_web_bird
+python scripts/run_multiseed_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird
 ```
 
-Outputs are written to `outputs/v1_web_bird/multiseed/`. Current Web-Bird mean best Top-1:
+Outputs are written to `outputs/Web-Bird/v1_web_bird/multiseed/`. Current Web-Bird mean best Top-1:
 
 - `Centroid filtering`: `0.844207`
 - `Full GCDD-clean`: `0.839144`
@@ -153,13 +153,13 @@ LoRA trains on image data instead of frozen `.npy` features. It tests whether `G
 Current main method:
 
 ```bash
-python scripts/run_lora_web_bird.py --input-dir outputs/v1_web_bird --methods gcdd_proto --seeds 1
+python scripts/run_lora_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird --methods gcdd_proto --seeds 1
 ```
 
 Recommended table:
 
 ```bash
-python scripts/run_lora_web_bird.py --input-dir outputs/v1_web_bird --methods all,full_gcdd,both_only,gcdd_proto,centroid --seeds 1
+python scripts/run_lora_web_bird.py --input-dir outputs/Web-Bird/v1_web_bird --methods all,full_gcdd,both_only,gcdd_proto,centroid --seeds 1
 ```
 
-Outputs are written to `outputs/v1_web_bird/lora/`. If `DINOv2 LoRA + GCDD+Proto-only added` exceeds `DINOv2 LoRA + Centroid filtering` by `0.3-0.5 pp`, the hard-clean contribution is meaningful.
+Outputs are written to `outputs/Web-Bird/v1_web_bird/lora/`. If `DINOv2 LoRA + GCDD+Proto-only added` exceeds `DINOv2 LoRA + Centroid filtering` by `0.3-0.5 pp`, the hard-clean contribution is meaningful.

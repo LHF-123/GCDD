@@ -32,7 +32,7 @@ METRIC_FIELDS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze GCDD+Proto clean split against centroid filtering.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--proto-dir", help="Prototype-aware output directory. Defaults to <input-dir>/proto_gcdd.")
     parser.add_argument("--output-dir", help="Analysis output directory. Defaults to <input-dir>/proto_gcdd_vs_centroid_analysis.")
     return parser.parse_args()

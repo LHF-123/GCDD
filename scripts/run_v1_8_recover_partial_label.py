@@ -21,7 +21,7 @@ from gcdd.training import summarize_epoch_logs, train_linear_partial_label_eval
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run V1.8 partial-label recovery from GCDD non-clean samples.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/recover_partial_label.")
     parser.add_argument("--lambda-rec", default="0.25,0.5", help="Comma-separated recovery loss weights.")
     parser.add_argument("--q-alt-min", type=float, default=0.30, help="Minimum top non-original global-neighbor label ratio.")

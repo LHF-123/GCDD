@@ -37,7 +37,7 @@ METHODS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run multi-seed verification for Web-Bird clean-selection methods.")
-    parser.add_argument("--input-dir", default="outputs/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/multiseed.")
     parser.add_argument("--seeds", default="1,2,3", help="Comma-separated random seeds.")
     parser.add_argument("--epochs", type=int, help="Override linear classifier epochs.")
