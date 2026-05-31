@@ -1,0 +1,19 @@
+dataset:
+  name: FGVC-Aircraft
+  # Expected format:
+  #   root/train/<class_name>/*.jpg
+  #   root/test/<class_name>/*.jpg
+  root: /root/autodl-tmp/FGVC_Aircraft
+  train_split: train
+  test_split: test
+
+noise:
+  # Per clean class, randomly flip this ratio of train images to its asymmetric target class.
+  ratio: 0.4
+  seed: 42
+  # Sorted class list: class i -> class i+1, last class -> first class.
+  target_strategy: adjacent_cyclic
+
+output:
+  dir: outputs/FGVC_Aircraft/noise_indices
+  prefix: fgvc_aircraft_asym_r0p4_s42
