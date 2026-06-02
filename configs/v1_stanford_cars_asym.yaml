@@ -1,6 +1,6 @@
 dataset:
   name: Stanford-Cars-asym40-s42
-  root: dataset/Stanford_Cars
+  root: /root/autodl-tmp/Stanford_Cars
   index_file: outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv
   train_split: train
   eval_split: test

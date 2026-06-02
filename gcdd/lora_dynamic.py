@@ -54,6 +54,8 @@ def train_dynamic_loss_lora(
     update_interval: int,
     path_maps: list[tuple[str, str]] | None = None,
     centroid_mask: np.ndarray | None = None,
+    proto_scores: np.ndarray | None = None,
+    proto_keep_ratio: float | None = None,
     checkpoint_path: Path | None = None,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection."""
@@ -61,7 +63,7 @@ def train_dynamic_loss_lora(
     from torch.utils.data import DataLoader
     from torchvision import transforms
 
-    validate_dynamic_args(retention_ratio, warmup_epochs, update_interval)
+    validate_dynamic_args(retention_ratio, warmup_epochs, update_interval, proto_keep_ratio)
     path_maps = path_maps or []
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
     if candidate_mask.shape != (len(train_labels),):
@@ -72,6 +74,12 @@ def train_dynamic_loss_lora(
         centroid_mask = np.asarray(centroid_mask, dtype=bool)
         if centroid_mask.shape != candidate_mask.shape:
             raise ValueError("centroid_mask must match candidate_mask shape.")
+    if proto_scores is not None:
+        proto_scores = np.asarray(proto_scores, dtype=np.float32)
+        if proto_scores.shape != candidate_mask.shape:
+            raise ValueError("proto_scores must match candidate_mask shape.")
+        if np.any(np.isnan(proto_scores[candidate_mask])):
+            raise ValueError("proto_scores contains NaN values for candidate samples.")
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -138,7 +146,7 @@ def train_dynamic_loss_lora(
         batch_size=batch_size,
         epochs=epochs,
         warmup_epochs=warmup_epochs,
-        retention_ratio=retention_ratio,
+        retention_ratio=estimate_selection_retention_ratio(retention_ratio, proto_keep_ratio),
     )
     warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.1)))
     scheduler = build_scheduler(torch, optimizer, total_steps, warmup_steps, str(train_cfg.get("scheduler", "cosine")))
@@ -156,7 +164,8 @@ def train_dynamic_loss_lora(
     total_params = count_total_params(model)
     log_stage(
         f"[dynamic-loss] {method} seed={seed}: candidates={int(candidate_mask.sum())}, "
-        f"eval_images={len(eval_idx)}, retention_ratio={retention_ratio:.3f}, trainable_params={trainable_params}"
+        f"eval_images={len(eval_idx)}, retention_ratio={retention_ratio:.3f}, "
+        f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, trainable_params={trainable_params}"
     )
 
     for epoch in range(1, epochs + 1):
@@ -219,22 +228,64 @@ def train_dynamic_loss_lora(
         if epoch < epochs and should_update_selection(epoch, warmup_epochs, update_interval):
             losses, confidence = compute_train_losses(torch, model, loss_loader, device, len(train_labels), bool(train_cfg.get("amp", True)))
             previous_mask = selected_mask.copy()
-            selected_mask = select_small_loss_classwise(losses, train_labels, candidate_mask, retention_ratio)
+            loss_selected_mask = select_small_loss_classwise(losses, train_labels, candidate_mask, retention_ratio)
+            proto_pass_mask = None
+            if proto_scores is not None and proto_keep_ratio is not None:
+                proto_pass_mask = select_top_proto_classwise(proto_scores, train_labels, candidate_mask, proto_keep_ratio)
+                selected_mask = combine_loss_and_proto_classwise(loss_selected_mask, proto_pass_mask, losses, train_labels, candidate_mask)
+            else:
+                selected_mask = loss_selected_mask
             update_rows.append(
                 build_update_row(
                     method,
                     seed,
                     retention_ratio,
+                    proto_keep_ratio,
                     epoch,
                     candidate_mask,
                     selected_mask,
                     previous_mask,
                     centroid_mask,
                     losses,
+                    loss_selected_mask=loss_selected_mask,
+                    proto_pass_mask=proto_pass_mask,
+                    proto_scores=proto_scores,
                 )
             )
-            selection_rows.extend(build_selection_rows(method, seed, retention_ratio, epoch, train_paths, train_labels, candidate_mask, selected_mask, losses, confidence))
-            per_class_rows.extend(build_per_class_rows(method, seed, retention_ratio, epoch, train_labels, candidate_mask, selected_mask, losses))
+            selection_rows.extend(
+                build_selection_rows(
+                    method,
+                    seed,
+                    retention_ratio,
+                    proto_keep_ratio,
+                    epoch,
+                    train_paths,
+                    train_labels,
+                    candidate_mask,
+                    selected_mask,
+                    losses,
+                    confidence,
+                    loss_selected_mask=loss_selected_mask,
+                    proto_pass_mask=proto_pass_mask,
+                    proto_scores=proto_scores,
+                )
+            )
+            per_class_rows.extend(
+                build_per_class_rows(
+                    method,
+                    seed,
+                    retention_ratio,
+                    proto_keep_ratio,
+                    epoch,
+                    train_labels,
+                    candidate_mask,
+                    selected_mask,
+                    losses,
+                    loss_selected_mask=loss_selected_mask,
+                    proto_pass_mask=proto_pass_mask,
+                    proto_scores=proto_scores,
+                )
+            )
             log_stage(
                 f"[dynamic-loss] selection update epoch={epoch}: "
                 f"selected={int(selected_mask.sum())}, prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}"
@@ -251,6 +302,7 @@ def train_dynamic_loss_lora(
                 "best_epoch": int(best_row["epoch"]) if best_row else None,
                 "best_top1": float(best_row["top1"]) if best_row else None,
                 "retention_ratio": float(retention_ratio),
+                "proto_keep_ratio": proto_keep_ratio,
                 "warmup_epochs": int(warmup_epochs),
                 "update_interval": int(update_interval),
             },
@@ -261,6 +313,7 @@ def train_dynamic_loss_lora(
     summary.update(
         {
             "retention_ratio": float(retention_ratio),
+            "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
             "warmup_epochs": int(warmup_epochs),
             "update_interval": int(update_interval),
             "candidate_samples": int(candidate_mask.sum()),
@@ -280,9 +333,11 @@ def train_dynamic_loss_lora(
     )
 
 
-def validate_dynamic_args(retention_ratio: float, warmup_epochs: int, update_interval: int) -> None:
+def validate_dynamic_args(retention_ratio: float, warmup_epochs: int, update_interval: int, proto_keep_ratio: float | None = None) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
+    if proto_keep_ratio is not None and not 0.0 < proto_keep_ratio <= 1.0:
+        raise ValueError("proto_keep_ratio must satisfy 0 < ratio <= 1.")
     if warmup_epochs < 0:
         raise ValueError("warmup_epochs must be non-negative.")
     if update_interval <= 0:
@@ -301,6 +356,17 @@ def estimate_dynamic_total_steps(candidate_count: int, batch_size: int, epochs: 
     warmup_epoch_count = min(max(warmup_epochs, 0), max(epochs, 0))
     filtered_epoch_count = max(0, epochs - warmup_epoch_count)
     return max(1, warmup_epoch_count * full_steps + filtered_epoch_count * retained_steps)
+
+
+def estimate_selection_retention_ratio(retention_ratio: float, proto_keep_ratio: float | None) -> float:
+    """Conservative LR-step estimate for optional loss/prototype intersection selection."""
+    if proto_keep_ratio is None:
+        return retention_ratio
+    return min(retention_ratio, proto_keep_ratio)
+
+
+def format_optional_ratio(value: float | None) -> str:
+    return "none" if value is None else f"{value:.3f}"
 
 
 def compute_train_losses(torch: Any, model: Any, loader: Any, device: str, total_train: int, amp: bool) -> tuple[np.ndarray, np.ndarray]:
@@ -336,30 +402,80 @@ def select_small_loss_classwise(losses: np.ndarray, labels: np.ndarray, candidat
     return selected
 
 
+def select_top_proto_classwise(proto_scores: np.ndarray, labels: np.ndarray, candidate_mask: np.ndarray, proto_keep_ratio: float) -> np.ndarray:
+    """Select class-wise high-prototype-score samples. Higher prototype score is safer."""
+    selected = np.zeros(len(labels), dtype=bool)
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        if len(idx) == 0:
+            continue
+        if np.any(np.isnan(proto_scores[idx])):
+            raise ValueError(f"Missing prototype scores for class {label}.")
+        keep = len(idx) if proto_keep_ratio >= 1.0 else max(1, int(math.floor(len(idx) * proto_keep_ratio)))
+        order = np.argsort(-proto_scores[idx], kind="mergesort")
+        selected[idx[order[:keep]]] = True
+    return selected
+
+
+def combine_loss_and_proto_classwise(
+    loss_selected_mask: np.ndarray,
+    proto_pass_mask: np.ndarray,
+    losses: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> np.ndarray:
+    """Intersect loss and prototype gates while preventing empty classes."""
+    selected = loss_selected_mask & proto_pass_mask
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        if len(idx) == 0 or np.any(selected[idx]):
+            continue
+        fallback_idx = idx[proto_pass_mask[idx]]
+        if len(fallback_idx) == 0:
+            fallback_idx = idx
+        best = fallback_idx[np.argmin(losses[fallback_idx])]
+        selected[int(best)] = True
+    return selected
+
+
 def build_update_row(
     method: str,
     seed: int,
     retention_ratio: float,
+    proto_keep_ratio: float | None,
     epoch: int,
     candidate_mask: np.ndarray,
     selected_mask: np.ndarray,
     previous_mask: np.ndarray,
     centroid_mask: np.ndarray | None,
     losses: np.ndarray,
+    loss_selected_mask: np.ndarray | None = None,
+    proto_pass_mask: np.ndarray | None = None,
+    proto_scores: np.ndarray | None = None,
 ) -> dict[str, Any]:
     selected_losses = losses[selected_mask]
     unselected_mask = candidate_mask & ~selected_mask
     unselected_losses = losses[unselected_mask]
+    loss_selected_mask = selected_mask if loss_selected_mask is None else loss_selected_mask
+    proto_pass_mask = candidate_mask if proto_pass_mask is None else proto_pass_mask
+    proto_rejected_mask = loss_selected_mask & ~selected_mask
     return {
         "method": method,
         "seed": int(seed),
         "retention_ratio": float(retention_ratio),
+        "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
         "epoch": int(epoch),
         "num_candidates": int(candidate_mask.sum()),
+        "num_loss_selected": int(loss_selected_mask.sum()),
+        "num_proto_pass": int(proto_pass_mask.sum()),
         "num_selected": int(selected_mask.sum()),
+        "proto_reject_count": int(proto_rejected_mask.sum()),
         "selected_ratio": safe_ratio(int(selected_mask.sum()), int(candidate_mask.sum())),
         "mean_loss_selected": float(np.nanmean(selected_losses)) if selected_losses.size else 0.0,
         "mean_loss_unselected": float(np.nanmean(unselected_losses)) if unselected_losses.size else 0.0,
+        "mean_loss_proto_rejected": float(np.nanmean(losses[proto_rejected_mask])) if np.any(proto_rejected_mask) else "",
+        "mean_proto_selected": float(np.nanmean(proto_scores[selected_mask])) if proto_scores is not None and np.any(selected_mask) else "",
+        "mean_proto_unselected": float(np.nanmean(proto_scores[unselected_mask])) if proto_scores is not None and np.any(unselected_mask) else "",
         "overlap_with_previous_selection": mask_jaccard(selected_mask, previous_mask),
         "overlap_with_centroid": mask_jaccard(selected_mask, centroid_mask) if centroid_mask is not None else "",
     }
@@ -369,6 +485,7 @@ def build_selection_rows(
     method: str,
     seed: int,
     retention_ratio: float,
+    proto_keep_ratio: float | None,
     epoch: int,
     paths: list[str],
     labels: np.ndarray,
@@ -376,20 +493,29 @@ def build_selection_rows(
     selected_mask: np.ndarray,
     losses: np.ndarray,
     confidence: np.ndarray,
+    loss_selected_mask: np.ndarray | None = None,
+    proto_pass_mask: np.ndarray | None = None,
+    proto_scores: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
+    loss_selected_mask = selected_mask if loss_selected_mask is None else loss_selected_mask
+    proto_pass_mask = candidate_mask if proto_pass_mask is None else proto_pass_mask
     for idx in np.where(candidate_mask)[0]:
         rows.append(
             {
                 "method": method,
                 "seed": int(seed),
                 "retention_ratio": float(retention_ratio),
+                "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
                 "epoch": int(epoch),
                 "index": int(idx),
                 "path": paths[int(idx)],
                 "web_label": str(labels[int(idx)]),
                 "loss": float(losses[int(idx)]),
                 "confidence": float(confidence[int(idx)]),
+                "proto_score": float(proto_scores[int(idx)]) if proto_scores is not None else "",
+                "loss_selected": "yes" if loss_selected_mask[int(idx)] else "no",
+                "proto_pass": "yes" if proto_pass_mask[int(idx)] else "no",
                 "state": "clean" if selected_mask[int(idx)] else "ignored",
             }
         )
@@ -400,29 +526,43 @@ def build_per_class_rows(
     method: str,
     seed: int,
     retention_ratio: float,
+    proto_keep_ratio: float | None,
     epoch: int,
     labels: np.ndarray,
     candidate_mask: np.ndarray,
     selected_mask: np.ndarray,
     losses: np.ndarray,
+    loss_selected_mask: np.ndarray | None = None,
+    proto_pass_mask: np.ndarray | None = None,
+    proto_scores: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
+    loss_selected_mask = selected_mask if loss_selected_mask is None else loss_selected_mask
+    proto_pass_mask = candidate_mask if proto_pass_mask is None else proto_pass_mask
     for label in sorted(set(labels[candidate_mask].tolist())):
         idx = np.where(candidate_mask & (labels == label))[0]
         selected_idx = idx[selected_mask[idx]]
         unselected_idx = idx[~selected_mask[idx]]
+        proto_rejected_idx = idx[loss_selected_mask[idx] & ~selected_mask[idx]]
         rows.append(
             {
                 "method": method,
                 "seed": int(seed),
                 "retention_ratio": float(retention_ratio),
+                "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
                 "epoch": int(epoch),
                 "web_label": str(label),
                 "total_count": int(len(idx)),
+                "loss_selected_count": int(np.sum(loss_selected_mask[idx])),
+                "proto_pass_count": int(np.sum(proto_pass_mask[idx])),
                 "selected_count": int(len(selected_idx)),
+                "proto_reject_count": int(len(proto_rejected_idx)),
                 "selected_ratio": safe_ratio(len(selected_idx), len(idx)),
                 "mean_loss_selected": float(np.nanmean(losses[selected_idx])) if len(selected_idx) else 0.0,
                 "mean_loss_unselected": float(np.nanmean(losses[unselected_idx])) if len(unselected_idx) else 0.0,
+                "mean_loss_proto_rejected": float(np.nanmean(losses[proto_rejected_idx])) if len(proto_rejected_idx) else "",
+                "mean_proto_selected": float(np.nanmean(proto_scores[selected_idx])) if proto_scores is not None and len(selected_idx) else "",
+                "mean_proto_unselected": float(np.nanmean(proto_scores[unselected_idx])) if proto_scores is not None and len(unselected_idx) else "",
             }
         )
     return rows
