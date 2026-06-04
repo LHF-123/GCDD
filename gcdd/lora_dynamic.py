@@ -390,7 +390,15 @@ def estimate_selection_retention_ratio(retention_ratio: float, proto_keep_ratio:
     """Conservative LR-step estimate for optional loss/prototype intersection selection."""
     if proto_keep_ratio is None:
         if auto_proto_keep is not None:
-            return min(retention_ratio, min(float(auto_proto_keep["p_high"]), float(auto_proto_keep["p_mid"]), float(auto_proto_keep["p_low"])))
+            return min(
+                retention_ratio,
+                min(
+                    float(auto_proto_keep["p_high"]),
+                    float(auto_proto_keep["p_mid"]),
+                    float(auto_proto_keep["p_low"]),
+                    float(auto_proto_keep["p_very_low"]),
+                ),
+            )
         return retention_ratio
     return min(retention_ratio, proto_keep_ratio)
 
@@ -400,17 +408,17 @@ def format_optional_ratio(value: float | None) -> str:
 
 
 def validate_auto_proto_keep(rule: dict[str, float]) -> None:
-    required = ["high_jaccard", "mid_jaccard", "p_high", "p_mid", "p_low"]
+    required = ["high_jaccard", "mid_jaccard", "low_jaccard", "p_high", "p_mid", "p_low", "p_very_low"]
     missing = [key for key in required if key not in rule]
     if missing:
         raise ValueError(f"auto_proto_keep is missing required keys: {missing}")
-    if float(rule["high_jaccard"]) < float(rule["mid_jaccard"]):
-        raise ValueError("auto_proto_keep high_jaccard must be >= mid_jaccard.")
-    for key in ["high_jaccard", "mid_jaccard", "p_high", "p_mid", "p_low"]:
+    if float(rule["high_jaccard"]) < float(rule["mid_jaccard"]) or float(rule["mid_jaccard"]) < float(rule["low_jaccard"]):
+        raise ValueError("auto_proto_keep thresholds must satisfy high_jaccard >= mid_jaccard >= low_jaccard.")
+    for key in ["high_jaccard", "mid_jaccard", "low_jaccard", "p_high", "p_mid", "p_low", "p_very_low"]:
         value = float(rule[key])
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"auto_proto_keep {key} must be in [0, 1], got {value}.")
-    for key in ["p_high", "p_mid", "p_low"]:
+    for key in ["p_high", "p_mid", "p_low", "p_very_low"]:
         if float(rule[key]) <= 0.0:
             raise ValueError(f"auto_proto_keep {key} must be > 0.")
 
@@ -420,7 +428,9 @@ def choose_auto_proto_keep_ratio(jaccard: float, rule: dict[str, float]) -> floa
         return float(rule["p_high"])
     if jaccard >= float(rule["mid_jaccard"]):
         return float(rule["p_mid"])
-    return float(rule["p_low"])
+    if jaccard >= float(rule["low_jaccard"]):
+        return float(rule["p_low"])
+    return float(rule["p_very_low"])
 
 
 def compute_train_losses(torch: Any, model: Any, loader: Any, device: str, total_train: int, amp: bool) -> tuple[np.ndarray, np.ndarray]:

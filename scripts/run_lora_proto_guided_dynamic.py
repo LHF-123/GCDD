@@ -27,10 +27,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proto-keep-ratios", default="0.9,0.8", help="Comma-separated class-wise prototype keep ratios.")
     parser.add_argument("--auto-proto-keep", action="store_true", help="Automatically choose prototype keep ratio from initial dynamic/prototype overlap.")
     parser.add_argument("--auto-high-jaccard", type=float, default=0.75, help="If Jaccard >= this value, use --auto-p-high.")
-    parser.add_argument("--auto-mid-jaccard", type=float, default=0.60, help="If Jaccard >= this value, use --auto-p-mid; otherwise use --auto-p-low.")
+    parser.add_argument("--auto-mid-jaccard", type=float, default=0.60, help="If Jaccard >= this value, use --auto-p-mid.")
+    parser.add_argument("--auto-low-jaccard", type=float, default=0.50, help="If Jaccard >= this value, use --auto-p-low; otherwise use --auto-p-very-low.")
     parser.add_argument("--auto-p-high", type=float, default=0.8, help="Auto-selected p for high dynamic/prototype agreement.")
     parser.add_argument("--auto-p-mid", type=float, default=0.6, help="Auto-selected p for medium dynamic/prototype agreement.")
     parser.add_argument("--auto-p-low", type=float, default=0.5, help="Auto-selected p for low dynamic/prototype agreement.")
+    parser.add_argument("--auto-p-very-low", type=float, default=0.4, help="Auto-selected p for very low dynamic/prototype agreement.")
     parser.add_argument("--proto-scores", default="proto_gcdd/proto_gcdd_scores.csv", help="Prototype score CSV relative to input-dir.")
     parser.add_argument("--proto-score-col", default="centroid_score", help="Column used as prototype score. Higher is safer.")
     parser.add_argument("--seeds", default="1", help="Comma-separated seeds.")
@@ -207,16 +209,18 @@ def build_auto_proto_rule(args: argparse.Namespace) -> dict[str, float]:
     rule = {
         "high_jaccard": float(args.auto_high_jaccard),
         "mid_jaccard": float(args.auto_mid_jaccard),
+        "low_jaccard": float(args.auto_low_jaccard),
         "p_high": float(args.auto_p_high),
         "p_mid": float(args.auto_p_mid),
         "p_low": float(args.auto_p_low),
+        "p_very_low": float(args.auto_p_very_low),
     }
-    if rule["high_jaccard"] < rule["mid_jaccard"]:
-        raise ValueError("--auto-high-jaccard must be >= --auto-mid-jaccard.")
+    if rule["high_jaccard"] < rule["mid_jaccard"] or rule["mid_jaccard"] < rule["low_jaccard"]:
+        raise ValueError("--auto-high-jaccard must be >= --auto-mid-jaccard >= --auto-low-jaccard.")
     for key, value in rule.items():
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{key} must be in [0, 1], got {value}.")
-    for key in ["p_high", "p_mid", "p_low"]:
+    for key in ["p_high", "p_mid", "p_low", "p_very_low"]:
         if rule[key] <= 0.0:
             raise ValueError(f"{key} must be > 0.")
     return rule
@@ -431,7 +435,9 @@ def write_summary(
         f"- Retention ratios: {args.retention_ratios}",
         f"- Prototype keep ratios: {'auto' if args.auto_proto_keep else args.proto_keep_ratios}",
         f"- Auto prototype keep: {args.auto_proto_keep}",
-        f"- Auto rule: J>={args.auto_high_jaccard} -> p={args.auto_p_high}; J>={args.auto_mid_jaccard} -> p={args.auto_p_mid}; else p={args.auto_p_low}",
+        f"- Auto rule: J>={args.auto_high_jaccard} -> p={args.auto_p_high}; "
+        f"J>={args.auto_mid_jaccard} -> p={args.auto_p_mid}; "
+        f"J>={args.auto_low_jaccard} -> p={args.auto_p_low}; else p={args.auto_p_very_low}",
         f"- Prototype scores: {args.proto_scores}",
         f"- Prototype score column: {args.proto_score_col}",
         f"- Seeds: {args.seeds}",
