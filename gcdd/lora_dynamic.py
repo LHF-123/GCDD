@@ -56,6 +56,7 @@ def train_dynamic_loss_lora(
     centroid_mask: np.ndarray | None = None,
     proto_scores: np.ndarray | None = None,
     proto_keep_ratio: float | None = None,
+    auto_proto_keep: dict[str, float] | None = None,
     checkpoint_path: Path | None = None,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection."""
@@ -63,7 +64,7 @@ def train_dynamic_loss_lora(
     from torch.utils.data import DataLoader
     from torchvision import transforms
 
-    validate_dynamic_args(retention_ratio, warmup_epochs, update_interval, proto_keep_ratio)
+    validate_dynamic_args(retention_ratio, warmup_epochs, update_interval, proto_keep_ratio, auto_proto_keep)
     path_maps = path_maps or []
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
     if candidate_mask.shape != (len(train_labels),):
@@ -80,6 +81,8 @@ def train_dynamic_loss_lora(
             raise ValueError("proto_scores must match candidate_mask shape.")
         if np.any(np.isnan(proto_scores[candidate_mask])):
             raise ValueError("proto_scores contains NaN values for candidate samples.")
+    if auto_proto_keep is not None and centroid_mask is None:
+        raise ValueError("auto_proto_keep requires centroid_mask to compute dynamic/prototype overlap.")
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -146,7 +149,7 @@ def train_dynamic_loss_lora(
         batch_size=batch_size,
         epochs=epochs,
         warmup_epochs=warmup_epochs,
-        retention_ratio=estimate_selection_retention_ratio(retention_ratio, proto_keep_ratio),
+        retention_ratio=estimate_selection_retention_ratio(retention_ratio, proto_keep_ratio, auto_proto_keep),
     )
     warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.1)))
     scheduler = build_scheduler(torch, optimizer, total_steps, warmup_steps, str(train_cfg.get("scheduler", "cosine")))
@@ -158,6 +161,8 @@ def train_dynamic_loss_lora(
     per_class_rows: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
+    selected_proto_keep_ratio = proto_keep_ratio
+    auto_proto_jaccard: float | None = None
 
     selected_mask = candidate_mask.copy()
     trainable_params = count_trainable_params(model)
@@ -165,7 +170,8 @@ def train_dynamic_loss_lora(
     log_stage(
         f"[dynamic-loss] {method} seed={seed}: candidates={int(candidate_mask.sum())}, "
         f"eval_images={len(eval_idx)}, retention_ratio={retention_ratio:.3f}, "
-        f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, trainable_params={trainable_params}"
+        f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
+        f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
     )
 
     for epoch in range(1, epochs + 1):
@@ -230,8 +236,15 @@ def train_dynamic_loss_lora(
             previous_mask = selected_mask.copy()
             loss_selected_mask = select_small_loss_classwise(losses, train_labels, candidate_mask, retention_ratio)
             proto_pass_mask = None
-            if proto_scores is not None and proto_keep_ratio is not None:
-                proto_pass_mask = select_top_proto_classwise(proto_scores, train_labels, candidate_mask, proto_keep_ratio)
+            if auto_proto_keep is not None and selected_proto_keep_ratio is None:
+                auto_proto_jaccard = mask_jaccard(loss_selected_mask, centroid_mask)
+                selected_proto_keep_ratio = choose_auto_proto_keep_ratio(auto_proto_jaccard, auto_proto_keep)
+                log_stage(
+                    f"[dynamic-loss] auto proto_keep_ratio selected: jaccard={auto_proto_jaccard:.4f}, "
+                    f"p={selected_proto_keep_ratio:.3f}"
+                )
+            if proto_scores is not None and selected_proto_keep_ratio is not None:
+                proto_pass_mask = select_top_proto_classwise(proto_scores, train_labels, candidate_mask, selected_proto_keep_ratio)
                 selected_mask = combine_loss_and_proto_classwise(loss_selected_mask, proto_pass_mask, losses, train_labels, candidate_mask)
             else:
                 selected_mask = loss_selected_mask
@@ -240,7 +253,7 @@ def train_dynamic_loss_lora(
                     method,
                     seed,
                     retention_ratio,
-                    proto_keep_ratio,
+                    selected_proto_keep_ratio,
                     epoch,
                     candidate_mask,
                     selected_mask,
@@ -250,6 +263,7 @@ def train_dynamic_loss_lora(
                     loss_selected_mask=loss_selected_mask,
                     proto_pass_mask=proto_pass_mask,
                     proto_scores=proto_scores,
+                    auto_proto_jaccard=auto_proto_jaccard,
                 )
             )
             selection_rows.extend(
@@ -257,7 +271,7 @@ def train_dynamic_loss_lora(
                     method,
                     seed,
                     retention_ratio,
-                    proto_keep_ratio,
+                    selected_proto_keep_ratio,
                     epoch,
                     train_paths,
                     train_labels,
@@ -275,7 +289,7 @@ def train_dynamic_loss_lora(
                     method,
                     seed,
                     retention_ratio,
-                    proto_keep_ratio,
+                    selected_proto_keep_ratio,
                     epoch,
                     train_labels,
                     candidate_mask,
@@ -302,7 +316,9 @@ def train_dynamic_loss_lora(
                 "best_epoch": int(best_row["epoch"]) if best_row else None,
                 "best_top1": float(best_row["top1"]) if best_row else None,
                 "retention_ratio": float(retention_ratio),
-                "proto_keep_ratio": proto_keep_ratio,
+                "proto_keep_ratio": selected_proto_keep_ratio,
+                "auto_proto_keep": auto_proto_keep is not None,
+                "auto_proto_jaccard": auto_proto_jaccard,
                 "warmup_epochs": int(warmup_epochs),
                 "update_interval": int(update_interval),
             },
@@ -313,7 +329,9 @@ def train_dynamic_loss_lora(
     summary.update(
         {
             "retention_ratio": float(retention_ratio),
-            "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
+            "proto_keep_ratio": selected_proto_keep_ratio if selected_proto_keep_ratio is not None else "",
+            "auto_proto_keep": "yes" if auto_proto_keep is not None else "no",
+            "auto_proto_jaccard": auto_proto_jaccard if auto_proto_jaccard is not None else "",
             "warmup_epochs": int(warmup_epochs),
             "update_interval": int(update_interval),
             "candidate_samples": int(candidate_mask.sum()),
@@ -333,11 +351,21 @@ def train_dynamic_loss_lora(
     )
 
 
-def validate_dynamic_args(retention_ratio: float, warmup_epochs: int, update_interval: int, proto_keep_ratio: float | None = None) -> None:
+def validate_dynamic_args(
+    retention_ratio: float,
+    warmup_epochs: int,
+    update_interval: int,
+    proto_keep_ratio: float | None = None,
+    auto_proto_keep: dict[str, float] | None = None,
+) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
     if proto_keep_ratio is not None and not 0.0 < proto_keep_ratio <= 1.0:
         raise ValueError("proto_keep_ratio must satisfy 0 < ratio <= 1.")
+    if proto_keep_ratio is not None and auto_proto_keep is not None:
+        raise ValueError("Use either proto_keep_ratio or auto_proto_keep, not both.")
+    if auto_proto_keep is not None:
+        validate_auto_proto_keep(auto_proto_keep)
     if warmup_epochs < 0:
         raise ValueError("warmup_epochs must be non-negative.")
     if update_interval <= 0:
@@ -358,15 +386,41 @@ def estimate_dynamic_total_steps(candidate_count: int, batch_size: int, epochs: 
     return max(1, warmup_epoch_count * full_steps + filtered_epoch_count * retained_steps)
 
 
-def estimate_selection_retention_ratio(retention_ratio: float, proto_keep_ratio: float | None) -> float:
+def estimate_selection_retention_ratio(retention_ratio: float, proto_keep_ratio: float | None, auto_proto_keep: dict[str, float] | None = None) -> float:
     """Conservative LR-step estimate for optional loss/prototype intersection selection."""
     if proto_keep_ratio is None:
+        if auto_proto_keep is not None:
+            return min(retention_ratio, min(float(auto_proto_keep["p_high"]), float(auto_proto_keep["p_mid"]), float(auto_proto_keep["p_low"])))
         return retention_ratio
     return min(retention_ratio, proto_keep_ratio)
 
 
 def format_optional_ratio(value: float | None) -> str:
     return "none" if value is None else f"{value:.3f}"
+
+
+def validate_auto_proto_keep(rule: dict[str, float]) -> None:
+    required = ["high_jaccard", "mid_jaccard", "p_high", "p_mid", "p_low"]
+    missing = [key for key in required if key not in rule]
+    if missing:
+        raise ValueError(f"auto_proto_keep is missing required keys: {missing}")
+    if float(rule["high_jaccard"]) < float(rule["mid_jaccard"]):
+        raise ValueError("auto_proto_keep high_jaccard must be >= mid_jaccard.")
+    for key in ["high_jaccard", "mid_jaccard", "p_high", "p_mid", "p_low"]:
+        value = float(rule[key])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"auto_proto_keep {key} must be in [0, 1], got {value}.")
+    for key in ["p_high", "p_mid", "p_low"]:
+        if float(rule[key]) <= 0.0:
+            raise ValueError(f"auto_proto_keep {key} must be > 0.")
+
+
+def choose_auto_proto_keep_ratio(jaccard: float, rule: dict[str, float]) -> float:
+    if jaccard >= float(rule["high_jaccard"]):
+        return float(rule["p_high"])
+    if jaccard >= float(rule["mid_jaccard"]):
+        return float(rule["p_mid"])
+    return float(rule["p_low"])
 
 
 def compute_train_losses(torch: Any, model: Any, loader: Any, device: str, total_train: int, amp: bool) -> tuple[np.ndarray, np.ndarray]:
@@ -452,6 +506,7 @@ def build_update_row(
     loss_selected_mask: np.ndarray | None = None,
     proto_pass_mask: np.ndarray | None = None,
     proto_scores: np.ndarray | None = None,
+    auto_proto_jaccard: float | None = None,
 ) -> dict[str, Any]:
     selected_losses = losses[selected_mask]
     unselected_mask = candidate_mask & ~selected_mask
@@ -464,6 +519,7 @@ def build_update_row(
         "seed": int(seed),
         "retention_ratio": float(retention_ratio),
         "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
+        "auto_proto_jaccard": auto_proto_jaccard if auto_proto_jaccard is not None else "",
         "epoch": int(epoch),
         "num_candidates": int(candidate_mask.sum()),
         "num_loss_selected": int(loss_selected_mask.sum()),

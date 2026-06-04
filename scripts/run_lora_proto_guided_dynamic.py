@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
-from gcdd.lora_dynamic import train_dynamic_loss_lora
+from gcdd.lora_dynamic import should_update_selection, train_dynamic_loss_lora
 from gcdd.progress import log_stage
 
 
@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/proto_guided_dynamic.")
     parser.add_argument("--retention-ratios", default="0.8", help="Comma-separated dynamic loss retention ratios.")
     parser.add_argument("--proto-keep-ratios", default="0.9,0.8", help="Comma-separated class-wise prototype keep ratios.")
+    parser.add_argument("--auto-proto-keep", action="store_true", help="Automatically choose prototype keep ratio from initial dynamic/prototype overlap.")
+    parser.add_argument("--auto-high-jaccard", type=float, default=0.75, help="If Jaccard >= this value, use --auto-p-high.")
+    parser.add_argument("--auto-mid-jaccard", type=float, default=0.60, help="If Jaccard >= this value, use --auto-p-mid; otherwise use --auto-p-low.")
+    parser.add_argument("--auto-p-high", type=float, default=0.8, help="Auto-selected p for high dynamic/prototype agreement.")
+    parser.add_argument("--auto-p-mid", type=float, default=0.6, help="Auto-selected p for medium dynamic/prototype agreement.")
+    parser.add_argument("--auto-p-low", type=float, default=0.5, help="Auto-selected p for low dynamic/prototype agreement.")
     parser.add_argument("--proto-scores", default="proto_gcdd/proto_gcdd_scores.csv", help="Prototype score CSV relative to input-dir.")
     parser.add_argument("--proto-score-col", default="centroid_score", help="Column used as prototype score. Higher is safer.")
     parser.add_argument("--seeds", default="1", help="Comma-separated seeds.")
@@ -63,13 +69,15 @@ def main() -> None:
         ensure_dir(checkpoint_dir)
 
     ratios = parse_float_list(args.retention_ratios, "--retention-ratios")
-    proto_ratios = parse_float_list(args.proto_keep_ratios, "--proto-keep-ratios")
+    proto_ratios = [] if args.auto_proto_keep else parse_float_list(args.proto_keep_ratios, "--proto-keep-ratios")
     seeds = parse_int_list(args.seeds, "--seeds")
     path_maps = parse_path_maps(args.path_map)
+    auto_proto_rule = build_auto_proto_rule(args) if args.auto_proto_keep else None
 
     cfg = load_config(input_dir)
     apply_lora_defaults(cfg)
     apply_overrides(cfg, args)
+    validate_auto_proto_update_schedule(args, cfg)
     write_yaml(output_dir / "resolved_config.yaml", cfg)
 
     log_stage("[1/4] Loading V1 paths, labels, centroid split, and prototype scores.")
@@ -83,11 +91,12 @@ def main() -> None:
     per_class_rows: list[dict[str, Any]] = []
     module_rows: list[dict[str, Any]] = []
     for ratio in ratios:
-        for proto_ratio in proto_ratios:
+        proto_items: list[float | None] = [None] if args.auto_proto_keep else list(proto_ratios)
+        for proto_ratio in proto_items:
             for seed in seeds:
                 ratio_text = ratio_to_text(ratio)
-                proto_text = ratio_to_text(proto_ratio)
-                method = f"DINOv2 LoRA PGDF r={ratio:g} p={proto_ratio:g}"
+                proto_text = "auto" if proto_ratio is None else ratio_to_text(proto_ratio)
+                method = f"DINOv2 LoRA PGDF-auto r={ratio:g}" if args.auto_proto_keep else f"DINOv2 LoRA PGDF r={ratio:g} p={proto_ratio:g}"
                 checkpoint_path = None
                 if not args.no_save_checkpoints:
                     checkpoint_path = checkpoint_dir / f"pgdf_r{ratio_text}_p{proto_text}_seed{seed}_best.pt"
@@ -109,20 +118,24 @@ def main() -> None:
                     centroid_mask=data["centroid_mask"],
                     proto_scores=proto_scores,
                     proto_keep_ratio=proto_ratio,
+                    auto_proto_keep=auto_proto_rule,
                     checkpoint_path=checkpoint_path,
                 )
                 train_logs.extend(result.logs)
                 result_rows.append(result.summary)
                 update_rows.extend(result.update_rows)
                 per_class_rows.extend(result.per_class_rows)
-                write_selection_files(output_dir, ratio_text, proto_text, seed, result.selection_rows)
+                selected_proto_text = ratio_to_text(float(result.summary["proto_keep_ratio"])) if result.summary["proto_keep_ratio"] != "" else proto_text
+                write_selection_files(output_dir, ratio_text, selected_proto_text, seed, result.selection_rows)
                 for name in result.trainable_modules:
                     module_rows.append(
                         {
                             "method": method,
                             "seed": seed,
                             "retention_ratio": ratio,
-                            "proto_keep_ratio": proto_ratio,
+                            "proto_keep_ratio": result.summary["proto_keep_ratio"],
+                            "auto_proto_keep": result.summary.get("auto_proto_keep", "no"),
+                            "auto_proto_jaccard": result.summary.get("auto_proto_jaccard", ""),
                             "module": name,
                             "trainable_params": result.trainable_params,
                             "total_params": result.total_params,
@@ -134,7 +147,7 @@ def main() -> None:
     write_csv(output_dir / "pgdf_results.csv", result_rows, result_fields())
     write_csv(output_dir / "pgdf_update_summary.csv", update_rows, update_fields())
     write_csv(output_dir / "pgdf_per_class_summary.csv", per_class_rows, per_class_fields())
-    write_csv(output_dir / "pgdf_modules.csv", module_rows, ["method", "seed", "retention_ratio", "proto_keep_ratio", "module", "trainable_params", "total_params"])
+    write_csv(output_dir / "pgdf_modules.csv", module_rows, ["method", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_keep", "auto_proto_jaccard", "module", "trainable_params", "total_params"])
     method_summary = build_method_summary(result_rows)
     write_csv(
         output_dir / "pgdf_summary.csv",
@@ -143,6 +156,10 @@ def main() -> None:
             "method",
             "retention_ratio",
             "proto_keep_ratio",
+            "min_proto_keep_ratio",
+            "max_proto_keep_ratio",
+            "auto_proto_keep",
+            "mean_auto_proto_jaccard",
             "num_seeds",
             "mean_best_top1",
             "std_best_top1",
@@ -163,6 +180,8 @@ def main() -> None:
             "output_dir": str(output_dir),
             "retention_ratios": ratios,
             "proto_keep_ratios": proto_ratios,
+            "auto_proto_keep": args.auto_proto_keep,
+            "auto_proto_rule": auto_proto_rule,
             "proto_scores": args.proto_scores,
             "proto_score_col": args.proto_score_col,
             "seeds": seeds,
@@ -182,6 +201,43 @@ def load_config(input_dir: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"V1 resolved config is missing: {path}")
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def build_auto_proto_rule(args: argparse.Namespace) -> dict[str, float]:
+    rule = {
+        "high_jaccard": float(args.auto_high_jaccard),
+        "mid_jaccard": float(args.auto_mid_jaccard),
+        "p_high": float(args.auto_p_high),
+        "p_mid": float(args.auto_p_mid),
+        "p_low": float(args.auto_p_low),
+    }
+    if rule["high_jaccard"] < rule["mid_jaccard"]:
+        raise ValueError("--auto-high-jaccard must be >= --auto-mid-jaccard.")
+    for key, value in rule.items():
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be in [0, 1], got {value}.")
+    for key in ["p_high", "p_mid", "p_low"]:
+        if rule[key] <= 0.0:
+            raise ValueError(f"{key} must be > 0.")
+    return rule
+
+
+def validate_auto_proto_update_schedule(args: argparse.Namespace, cfg: dict[str, Any]) -> None:
+    if not args.auto_proto_keep:
+        return
+    epochs = int(cfg["lora_train"]["epochs"])
+    warmup_epochs = int(args.warmup_epochs)
+    update_interval = int(args.update_interval)
+    has_update = any(
+        epoch < epochs and should_update_selection(epoch, warmup_epochs, update_interval)
+        for epoch in range(1, epochs + 1)
+    )
+    if not has_update:
+        raise ValueError(
+            "--auto-proto-keep requires at least one selection update because p is chosen from "
+            "the first dynamic/prototype overlap. Increase --epochs above --warmup-epochs, "
+            "or reduce --warmup-epochs."
+        )
 
 
 def apply_lora_defaults(cfg: dict[str, Any]) -> None:
@@ -320,19 +376,30 @@ def write_selection_files(output_dir: Path, ratio_text: str, proto_text: str, se
 
 
 def build_method_summary(result_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_key: dict[tuple[str, float, float], list[dict[str, Any]]] = {}
+    by_key: dict[tuple[str, float, str], list[dict[str, Any]]] = {}
     for row in result_rows:
-        by_key.setdefault((str(row["method"]), float(row["retention_ratio"]), float(row["proto_keep_ratio"])), []).append(row)
+        if row.get("proto_keep_ratio", "") == "":
+            raise ValueError(
+                "Missing proto_keep_ratio in PGDF result summary. In auto mode this usually means "
+                "no selection update occurred; ensure --epochs is greater than --warmup-epochs."
+            )
+        by_key.setdefault((str(row["method"]), float(row["retention_ratio"]), str(row.get("auto_proto_keep", "no"))), []).append(row)
     out = []
-    for (method, ratio, proto_ratio), rows in by_key.items():
+    for (method, ratio, auto_mode), rows in by_key.items():
         best = np.array([float(row["best_top1"]) for row in rows], dtype=np.float64)
         final = np.array([float(row["final_top1"]) for row in rows], dtype=np.float64)
         final_selected = np.array([int(row["final_selected_samples"]) for row in rows], dtype=np.int64)
+        proto_ratios = np.array([float(row["proto_keep_ratio"]) for row in rows], dtype=np.float64)
+        auto_jaccards = np.array([float(row["auto_proto_jaccard"]) for row in rows if row.get("auto_proto_jaccard", "") != ""], dtype=np.float64)
         out.append(
             {
                 "method": method,
                 "retention_ratio": float(ratio),
-                "proto_keep_ratio": float(proto_ratio),
+                "proto_keep_ratio": float(proto_ratios.mean()),
+                "min_proto_keep_ratio": float(proto_ratios.min()),
+                "max_proto_keep_ratio": float(proto_ratios.max()),
+                "auto_proto_keep": auto_mode,
+                "mean_auto_proto_jaccard": float(auto_jaccards.mean()) if len(auto_jaccards) else "",
                 "num_seeds": int(len(rows)),
                 "mean_best_top1": float(best.mean()),
                 "std_best_top1": float(best.std(ddof=1)) if len(best) > 1 else 0.0,
@@ -362,7 +429,9 @@ def write_summary(
         "",
         f"- Source V1 output: {input_dir}",
         f"- Retention ratios: {args.retention_ratios}",
-        f"- Prototype keep ratios: {args.proto_keep_ratios}",
+        f"- Prototype keep ratios: {'auto' if args.auto_proto_keep else args.proto_keep_ratios}",
+        f"- Auto prototype keep: {args.auto_proto_keep}",
+        f"- Auto rule: J>={args.auto_high_jaccard} -> p={args.auto_p_high}; J>={args.auto_mid_jaccard} -> p={args.auto_p_mid}; else p={args.auto_p_low}",
         f"- Prototype scores: {args.proto_scores}",
         f"- Prototype score column: {args.proto_score_col}",
         f"- Seeds: {args.seeds}",
@@ -371,26 +440,31 @@ def write_summary(
         f"- Total epochs: {resolved_epochs}",
         "",
         "## Method Summary",
-        "| method | r | p | seeds | mean_best_top1 | std_best_top1 | mean_final_top1 | mean_selected | min_selected | max_selected |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| method | r | p_mean | p_min | p_max | auto | J_auto | seeds | mean_best_top1 | std_best_top1 | mean_final_top1 | mean_selected | min_selected | max_selected |",
+        "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in summary_rows:
+        auto_j = row["mean_auto_proto_jaccard"]
+        auto_j_text = f"{float(auto_j):.6f}" if auto_j != "" else ""
         lines.append(
             f"| {row['method']} | {float(row['retention_ratio']):.3f} | {float(row['proto_keep_ratio']):.3f} | "
-            f"{int(row['num_seeds'])} | {float(row['mean_best_top1']):.6f} | "
+            f"{float(row['min_proto_keep_ratio']):.3f} | {float(row['max_proto_keep_ratio']):.3f} | "
+            f"{row['auto_proto_keep']} | {auto_j_text} | {int(row['num_seeds'])} | {float(row['mean_best_top1']):.6f} | "
             f"{float(row['std_best_top1']):.6f} | {float(row['mean_final_top1']):.6f} | "
             f"{float(row['mean_final_selected_samples']):.1f} | {int(row['min_final_selected_samples'])} | "
             f"{int(row['max_final_selected_samples'])} |"
         )
 
     if update_rows:
-        lines.extend(["", "## Selection Updates", "| method | seed | r | p | epoch | loss_selected | proto_pass | selected | proto_reject | prev_jaccard | centroid_jaccard |", "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
+        lines.extend(["", "## Selection Updates", "| method | seed | r | p | J_auto | epoch | loss_selected | proto_pass | selected | proto_reject | prev_jaccard | centroid_jaccard |", "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
         for row in update_rows:
             centroid = row["overlap_with_centroid"]
             centroid_text = f"{float(centroid):.6f}" if centroid != "" else ""
+            auto_j = row.get("auto_proto_jaccard", "")
+            auto_j_text = f"{float(auto_j):.6f}" if auto_j != "" else ""
             lines.append(
                 f"| {row['method']} | {int(row['seed'])} | {float(row['retention_ratio']):.3f} | "
-                f"{float(row['proto_keep_ratio']):.3f} | {int(row['epoch'])} | "
+                f"{float(row['proto_keep_ratio']):.3f} | {auto_j_text} | {int(row['epoch'])} | "
                 f"{int(row['num_loss_selected'])} | {int(row['num_proto_pass'])} | {int(row['num_selected'])} | "
                 f"{int(row['proto_reject_count'])} | {float(row['overlap_with_previous_selection']):.6f} | {centroid_text} |"
             )
@@ -461,6 +535,8 @@ def result_fields() -> list[str]:
         "seed",
         "retention_ratio",
         "proto_keep_ratio",
+        "auto_proto_keep",
+        "auto_proto_jaccard",
         "warmup_epochs",
         "update_interval",
         "candidate_samples",
@@ -486,6 +562,7 @@ def update_fields() -> list[str]:
         "seed",
         "retention_ratio",
         "proto_keep_ratio",
+        "auto_proto_jaccard",
         "epoch",
         "num_candidates",
         "num_loss_selected",
