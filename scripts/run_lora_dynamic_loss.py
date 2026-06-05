@@ -22,7 +22,7 @@ from gcdd.progress import log_stage
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DINOv2-LoRA with dynamic class-wise small-loss filtering.")
     parser.add_argument("--input-dir", default="outputs/Web-Car/v1_web_car_0.9_448", help="V1 output directory.")
-    parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/dynamic_loss.")
+    parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/dynamic_loss_42.")
     parser.add_argument("--retention-ratios", default="0.9", help="Comma-separated class-wise retention ratios, e.g. 0.8,0.9.")
     parser.add_argument("--seeds", default="1", help="Comma-separated seeds.")
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Epochs trained on all candidates before first selection update.")
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     input_dir = Path(args.input_dir)
-    output_dir = Path(args.output_dir) if args.output_dir else input_dir / "dynamic_loss"
+    output_dir = Path(args.output_dir) if args.output_dir else input_dir / "dynamic_loss_42"
     ensure_dir(output_dir)
     checkpoint_dir = output_dir / "checkpoints"
     if not args.no_save_checkpoints:
