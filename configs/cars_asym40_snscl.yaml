@@ -22,6 +22,7 @@ snscl:
   projection_lr: 1.0e-4
   stochastic_lr: 1.0e-4
   max_grad_norm: 1.0
+  amp_overflow_patience: 5
   reliability_save_interval: 5
   fail_on_health_check: true
   health_check_epoch: 7

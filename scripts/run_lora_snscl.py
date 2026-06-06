@@ -52,6 +52,7 @@ DEFAULT_SNSCL_CONFIG: dict[str, Any] = {
         "projection_lr": 1.0e-4,
         "stochastic_lr": 1.0e-4,
         "max_grad_norm": 1.0,
+        "amp_overflow_patience": 5,
         "reliability_save_interval": 5,
         "fail_on_health_check": True,
         "health_check_epoch": 7,
@@ -103,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projection-lr", type=float)
     parser.add_argument("--stochastic-lr", type=float)
     parser.add_argument("--max-grad-norm", type=float)
+    parser.add_argument("--amp-overflow-patience", type=int)
     parser.add_argument("--reliability-save-interval", type=int)
     parser.add_argument("--health-check-epoch", type=int)
     parser.add_argument("--gmm-failure-patience", type=int)
@@ -244,6 +246,7 @@ def apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             "projection_lr",
             "stochastic_lr",
             "max_grad_norm",
+            "amp_overflow_patience",
             "reliability_save_interval",
             "health_check_epoch",
             "gmm_failure_patience",
@@ -422,7 +425,8 @@ def train_log_fields() -> list[str]:
     return [
         "method", "seed", "epoch", "lr_lora", "lr_head", "lr_projection", "lr_stochastic", "loss_total", "loss_cls", "loss_ntcl", "loss_kl",
         "mean_gamma", "gamma_std", "mean_omega", "queue_fill_ratio", "num_valid_ntcl_anchors", "valid_anchor_ratio",
-        "mean_positive_count", "mean_negative_count", "mean_grad_norm", "max_mu_abs", "min_logvar", "max_logvar",
+        "mean_positive_count", "mean_negative_count", "mean_grad_norm", "amp_skipped_steps", "max_consecutive_amp_skips",
+        "amp_scale_final", "amp_scale_min", "amp_scale_max", "amp_overflow_groups", "max_mu_abs", "min_logvar", "max_logvar",
         "max_model_param_abs", "max_projection_param_abs", "max_stochastic_param_abs", "corrected_label_changes",
         "corrected_label_change_ratio", "val_top1", "val_top5", "best_top1", "train_samples",
         "eval_samples", "trainable_params", "total_params", "gmm_success", "consecutive_gmm_failures", "health_status",

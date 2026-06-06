@@ -8,7 +8,7 @@
 python scripts/run_lora_snscl.py \
   --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 \
   --config configs/cub_asym40_snscl.yaml \
-  --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/snscl_smoke_stable \
+  --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/snscl_smoke_ampfix \
   --noise-index outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv \
   --path-map /root/autodl-tmp/CUB_200_2011=dataset/CUB_200_2011/CUB_200_2011 \
   --seeds 42 \
@@ -26,9 +26,9 @@ python scripts/run_lora_snscl.py \
 ## 正式训练
 
 ```bash
-python scripts/run_lora_snscl.py --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 --config configs/cub_asym40_snscl.yaml --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/snscl_seed42_stable --noise-index outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv --seeds 42
-python scripts/run_lora_snscl.py --input-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42 --config configs/cars_asym40_snscl.yaml --output-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42/snscl_seed42_stable --noise-index outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv --seeds 42
-python scripts/run_lora_snscl.py --input-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42 --config configs/aircraft_asym40_snscl.yaml --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/snscl_seed42_stable --noise-index outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv --seeds 42
+python scripts/run_lora_snscl.py --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 --config configs/cub_asym40_snscl.yaml --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/snscl_seed42_ampfix --noise-index outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv --seeds 42
+python scripts/run_lora_snscl.py --input-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42 --config configs/cars_asym40_snscl.yaml --output-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42/snscl_seed42_ampfix --noise-index outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv --seeds 42
+python scripts/run_lora_snscl.py --input-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42 --config configs/aircraft_asym40_snscl.yaml --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/snscl_seed42_ampfix --noise-index outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv --seeds 42
 ```
 
 配置优先级固定为：
@@ -60,9 +60,11 @@ CLI > SNSCL method YAML > V1 resolved_config.yaml > code defaults
 
 - DINOv2 主干和分类分支保留 AMP；projection、stochastic sampling、NTCL 和 KL 强制使用 FP32。
 - optimizer step 前检查并裁剪梯度，默认 `max_grad_norm=1.0`。
+- AMP 出现单次非有限梯度时自动跳过该 optimizer step、降低 loss scale，并且不推进 scheduler 或 queue；连续 5 次溢出才终止。
 - projection 和 stochastic head 使用独立的 `1e-4` 学习率。
 - `label_ma_alpha=0.9`，允许低可靠样本在 30 epochs 内实际改变 corrected hard label。
 - `checkpoints/snscl_seed{seed}_latest.pt` 每个健康 epoch 覆盖保存，供失败定位；best checkpoint 仍独立保存。
 - 实时训练日志记录梯度范数、`mu/logvar` 范围、参数最大绝对值以及 corrected label 变化数量。
+- 实时训练日志同时记录 `amp_skipped_steps`、连续跳步峰值、AMP scale 范围和发生溢出的参数组。
 
 调试时可使用 `--warn-only-health-checks` 只记录失败而不停止；正式实验不建议使用该参数。

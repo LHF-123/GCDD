@@ -27,12 +27,14 @@ from gcdd.lora_snscl import (
     check_and_clip_gradients,
     compute_noise_metrics,
     evaluate_snscl_health,
+    find_non_finite_gradient_groups,
     fit_gmm_reliability,
     forward_stochastic_fp32,
     gaussian_kl_loss,
     is_better_healthy_checkpoint,
     paper_ntcl_loss,
     reliability_weights,
+    raise_if_amp_overflow_persistent,
     soft_cross_entropy,
     update_soft_labels,
 )
@@ -183,6 +185,7 @@ class SNSCLComponentsTest(unittest.TestCase):
         self.assertEqual(cfg["snscl"]["projection_lr"], 1.0e-4)
         self.assertEqual(cfg["snscl"]["stochastic_lr"], 1.0e-4)
         self.assertEqual(cfg["snscl"]["max_grad_norm"], 1.0)
+        self.assertEqual(cfg["snscl"]["amp_overflow_patience"], 5)
 
     def test_noise_metrics_are_analysis_only_and_do_not_mutate_state(self) -> None:
         gamma = np.array([0.9, 0.8, 0.2, 0.1], dtype=np.float32)
@@ -210,8 +213,14 @@ class SNSCLComponentsTest(unittest.TestCase):
         self.assertAlmostEqual(norm, 5.0, places=5)
         self.assertLessEqual(float(parameter.grad.norm()), 1.00001)
         parameter.grad = torch.tensor([float("nan"), 0.0])
+        self.assertEqual(find_non_finite_gradient_groups(torch, optimizer), ["test"])
         with self.assertRaisesRegex(SNSCLHealthError, "test"):
             check_and_clip_gradients(torch, optimizer, max_grad_norm=1.0, epoch_id=1, batch_id=3)
+
+    def test_amp_overflow_only_stops_after_consecutive_patience(self) -> None:
+        raise_if_amp_overflow_persistent(["lora"], consecutive_amp_skips=1, patience=5, epoch_id=1, batch_id=2)
+        with self.assertRaisesRegex(SNSCLHealthError, "5 consecutive"):
+            raise_if_amp_overflow_persistent(["lora"], consecutive_amp_skips=5, patience=5, epoch_id=1, batch_id=6)
 
     def test_parameter_check_detects_optimizer_pollution(self) -> None:
         module = torch.nn.Linear(2, 2)
