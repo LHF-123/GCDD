@@ -23,9 +23,12 @@ from gcdd.lora_snscl import (
     SNSCLHealthError,
     StochasticHead,
     assert_finite_tensors,
+    assert_finite_parameters,
+    check_and_clip_gradients,
     compute_noise_metrics,
     evaluate_snscl_health,
     fit_gmm_reliability,
+    forward_stochastic_fp32,
     gaussian_kl_loss,
     is_better_healthy_checkpoint,
     paper_ntcl_loss,
@@ -54,6 +57,19 @@ class SNSCLComponentsTest(unittest.TestCase):
         self.assertTrue(torch.allclose(sampled.norm(dim=1), torch.ones(4), atol=1.0e-5))
         self.assertGreaterEqual(float(loss.detach()), 0.0)
         self.assertIsNotNone(stochastic.mu.weight.grad)
+
+    def test_stochastic_branch_forces_fp32(self) -> None:
+        projection = ProjectionHead(4, 3)
+        stochastic = StochasticHead(3, hidden_dim=8, output_dim=3)
+
+        projected, sampled, mu, logvar = forward_stochastic_fp32(
+            projection,
+            stochastic,
+            torch.randn(2, 4, dtype=torch.bfloat16),
+        )
+
+        for tensor in [projected, sampled, mu, logvar]:
+            self.assertEqual(tensor.dtype, torch.float32)
 
     def test_gmm_reliability_direction_and_fallback(self) -> None:
         losses = np.array([0.05, 0.10, 0.15, 2.0, 2.2, 2.4], dtype=np.float32)
@@ -85,6 +101,17 @@ class SNSCLComponentsTest(unittest.TestCase):
         loss.backward()
         self.assertTrue(math.isfinite(float(loss.detach())))
         self.assertIsNotNone(logits.grad)
+
+    def test_soft_label_alpha_point_nine_can_change_corrected_label(self) -> None:
+        soft_label = torch.tensor([[1.0, 0.0]])
+        probabilities = torch.tensor([[0.05, 0.95]])
+        noisy = torch.tensor([[1.0, 0.0]])
+        omega = torch.tensor([0.0])
+
+        for _ in range(10):
+            soft_label = update_soft_labels(soft_label, probabilities, noisy, omega, alpha=0.9)
+
+        self.assertEqual(int(soft_label.argmax(dim=1).item()), 1)
 
     def test_queue_weighted_update_fifo_and_state_restore(self) -> None:
         queue = ClassWiseQueue(num_classes=2, queue_size=2, embedding_dim=2)
@@ -152,6 +179,10 @@ class SNSCLComponentsTest(unittest.TestCase):
         self.assertEqual(cfg["lora_train"]["epochs"], 7)
         self.assertEqual(cfg["lora_train"]["batch_size"], 8)
         self.assertEqual(cfg["snscl"]["queue_size"], 32)
+        self.assertEqual(cfg["snscl"]["label_ma_alpha"], 0.9)
+        self.assertEqual(cfg["snscl"]["projection_lr"], 1.0e-4)
+        self.assertEqual(cfg["snscl"]["stochastic_lr"], 1.0e-4)
+        self.assertEqual(cfg["snscl"]["max_grad_norm"], 1.0)
 
     def test_noise_metrics_are_analysis_only_and_do_not_mutate_state(self) -> None:
         gamma = np.array([0.9, 0.8, 0.2, 0.1], dtype=np.float32)
@@ -169,6 +200,27 @@ class SNSCLComponentsTest(unittest.TestCase):
         with self.assertRaisesRegex(SNSCLHealthError, "loss_total"):
             assert_finite_tensors(3, 4, loss_total=torch.tensor(float("nan")), logits=torch.ones(2))
 
+    def test_gradient_check_rejects_non_finite_and_clips_finite_norm(self) -> None:
+        parameter = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
+        optimizer = torch.optim.SGD([{"name": "test", "params": [parameter]}], lr=0.1)
+        parameter.grad = torch.tensor([3.0, 4.0])
+
+        norm = check_and_clip_gradients(torch, optimizer, max_grad_norm=1.0, epoch_id=1, batch_id=2)
+
+        self.assertAlmostEqual(norm, 5.0, places=5)
+        self.assertLessEqual(float(parameter.grad.norm()), 1.00001)
+        parameter.grad = torch.tensor([float("nan"), 0.0])
+        with self.assertRaisesRegex(SNSCLHealthError, "test"):
+            check_and_clip_gradients(torch, optimizer, max_grad_norm=1.0, epoch_id=1, batch_id=3)
+
+    def test_parameter_check_detects_optimizer_pollution(self) -> None:
+        module = torch.nn.Linear(2, 2)
+        assert_finite_parameters(1, 1, classifier=module)
+        with torch.no_grad():
+            module.weight[0, 0] = float("nan")
+        with self.assertRaisesRegex(SNSCLHealthError, "classifier"):
+            assert_finite_parameters(1, 2, classifier=module)
+
     def test_health_check_detects_silent_mechanism_failures(self) -> None:
         row = {
             "epoch": 7,
@@ -181,6 +233,13 @@ class SNSCLComponentsTest(unittest.TestCase):
             "mean_omega": 1.0,
             "queue_fill_ratio": 0.0,
             "num_valid_ntcl_anchors": 0,
+            "mean_grad_norm": 1.0,
+            "max_mu_abs": 1.0,
+            "min_logvar": -1.0,
+            "max_logvar": 1.0,
+            "max_model_param_abs": 1.0,
+            "max_projection_param_abs": 1.0,
+            "max_stochastic_param_abs": 1.0,
             "val_top1": 0.5,
             "val_top5": 0.8,
         }

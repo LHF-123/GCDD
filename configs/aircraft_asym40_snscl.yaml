@@ -18,7 +18,10 @@ snscl:
   queue_size: 32
   queue_start_epoch: 6
   reliability_threshold: 0.5
-  label_ma_alpha: 0.99
+  label_ma_alpha: 0.9
+  projection_lr: 1.0e-4
+  stochastic_lr: 1.0e-4
+  max_grad_norm: 1.0
   reliability_save_interval: 5
   fail_on_health_check: true
   health_check_epoch: 7

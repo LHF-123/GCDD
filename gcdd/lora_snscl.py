@@ -140,6 +140,18 @@ def gaussian_kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=1).mean()
 
 
+def forward_stochastic_fp32(
+    projection: ProjectionHead,
+    stochastic: StochasticHead,
+    cls_features: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the numerically sensitive SNSCL embedding branch in FP32."""
+    with torch.autocast(device_type=cls_features.device.type, enabled=False):
+        projected = projection(cls_features.float())
+        sampled, mu, logvar = stochastic(projected)
+    return projected, sampled, mu, logvar
+
+
 def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return -(targets * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
 
@@ -268,6 +280,7 @@ def train_snscl_lora(
     path_maps: list[tuple[str, str]] | None = None,
     gt_clean_mask: np.ndarray | None = None,
     checkpoint_path: Path | None = None,
+    latest_checkpoint_path: Path | None = None,
     epoch_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> SNSCLRunResult:
     """Train the standalone SNSCL-DINOv2+LoRA adapted baseline."""
@@ -338,10 +351,10 @@ def train_snscl_lora(
     queue = ClassWiseQueue(num_classes, int(snscl_cfg["queue_size"]), int(snscl_cfg["proj_dim"])).to(device)
     optimizer = torch.optim.AdamW(
         [
-            {"params": lora_parameters(model), "lr": float(train_cfg["lora_lr"])},
-            {"params": model.head.parameters(), "lr": float(train_cfg["head_lr"])},
-            {"params": projection.parameters(), "lr": float(train_cfg["head_lr"])},
-            {"params": stochastic.parameters(), "lr": float(train_cfg["head_lr"])},
+            {"name": "lora", "params": lora_parameters(model), "lr": float(train_cfg["lora_lr"])},
+            {"name": "classifier", "params": model.head.parameters(), "lr": float(train_cfg["head_lr"])},
+            {"name": "projection", "params": projection.parameters(), "lr": float(snscl_cfg["projection_lr"])},
+            {"name": "stochastic", "params": stochastic.parameters(), "lr": float(snscl_cfg["stochastic_lr"])},
         ],
         weight_decay=float(train_cfg.get("weight_decay", 0.05)),
     )
@@ -370,7 +383,19 @@ def train_snscl_lora(
         model.train()
         projection.train()
         stochastic.train()
-        sums = {"total": 0.0, "cls": 0.0, "ntcl": 0.0, "kl": 0.0, "valid": 0.0, "pos": 0.0, "neg": 0.0}
+        sums = {
+            "total": 0.0,
+            "cls": 0.0,
+            "ntcl": 0.0,
+            "kl": 0.0,
+            "valid": 0.0,
+            "pos": 0.0,
+            "neg": 0.0,
+            "grad_norm": 0.0,
+            "mu_abs": 0.0,
+            "logvar_min": float("inf"),
+            "logvar_max": float("-inf"),
+        }
         seen = 0
         for batch_id, (images, noisy_labels, indices) in enumerate(
             progress_iter(train_loader, total=len(train_loader), desc=f"SNSCL seed={seed} epoch {epoch_id}/{epochs}"),
@@ -381,32 +406,48 @@ def train_snscl_lora(
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 logits, cls_features = model(images, return_features=True)
-                projected = projection(cls_features)
-                sampled, mu, logvar = stochastic(projected)
                 if epoch_id <= int(snscl_cfg["warmup_epochs"]):
                     loss_cls = F.cross_entropy(logits, noisy_labels)
-                    loss_ntcl = logits.sum() * 0.0
-                    loss_kl = logits.sum() * 0.0
-                    ntcl_stats = _empty_ntcl_stats()
                 else:
                     batch_soft = soft_labels[indices].to(device)
-                    corrected = batch_soft.argmax(dim=1)
                     loss_cls = soft_cross_entropy(logits, batch_soft)
+            projected, sampled, mu, logvar = forward_stochastic_fp32(projection, stochastic, cls_features)
+            with torch.autocast(device_type=logits.device.type, enabled=False):
+                if epoch_id <= int(snscl_cfg["warmup_epochs"]):
+                    loss_ntcl = logits.float().sum() * 0.0
+                    loss_kl = logits.float().sum() * 0.0
+                    ntcl_stats = _empty_ntcl_stats()
+                else:
+                    corrected = batch_soft.argmax(dim=1)
                     loss_ntcl, ntcl_stats = paper_ntcl_loss(sampled, corrected, queue, float(snscl_cfg["temperature"]))
                     loss_kl = gaussian_kl_loss(mu, logvar)
-                loss = loss_cls + float(snscl_cfg["lambda_ntcl"]) * loss_ntcl + float(snscl_cfg["lambda_kl"]) * loss_kl
+                loss = loss_cls.float() + float(snscl_cfg["lambda_ntcl"]) * loss_ntcl + float(snscl_cfg["lambda_kl"]) * loss_kl
             assert_finite_tensors(
                 epoch_id,
                 batch_id,
                 logits=logits,
+                cls_features=cls_features,
+                projected=projected,
+                sampled=sampled,
+                mu=mu,
+                logvar=logvar,
                 loss_total=loss,
                 loss_cls=loss_cls,
                 loss_ntcl=loss_ntcl,
                 loss_kl=loss_kl,
             )
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = check_and_clip_gradients(
+                torch,
+                optimizer,
+                max_grad_norm=float(snscl_cfg["max_grad_norm"]),
+                epoch_id=epoch_id,
+                batch_id=batch_id,
+            )
             scaler.step(optimizer)
             scaler.update()
+            assert_finite_parameters(epoch_id, batch_id, model=model, projection=projection, stochastic=stochastic)
             scheduler.step()
 
             if epoch_id >= int(snscl_cfg["queue_start_epoch"]):
@@ -423,6 +464,10 @@ def train_snscl_lora(
             sums["valid"] += ntcl_stats["num_valid_ntcl_anchors"]
             sums["pos"] += ntcl_stats["mean_positive_count"] * ntcl_stats["num_valid_ntcl_anchors"]
             sums["neg"] += ntcl_stats["mean_negative_count"] * ntcl_stats["num_valid_ntcl_anchors"]
+            sums["grad_norm"] += grad_norm * batch_size
+            sums["mu_abs"] = max(sums["mu_abs"], float(mu.detach().abs().max().cpu()))
+            sums["logvar_min"] = min(sums["logvar_min"], float(logvar.detach().min().cpu()))
+            sums["logvar_max"] = max(sums["logvar_max"], float(logvar.detach().max().cpu()))
 
         top1, top5 = evaluate_lora(torch, model, eval_loader, device, num_classes, amp)
         valid_anchors = sums["valid"]
@@ -432,6 +477,8 @@ def train_snscl_lora(
             "epoch": int(epoch_id),
             "lr_lora": float(optimizer.param_groups[0]["lr"]),
             "lr_head": float(optimizer.param_groups[1]["lr"]),
+            "lr_projection": float(optimizer.param_groups[2]["lr"]),
+            "lr_stochastic": float(optimizer.param_groups[3]["lr"]),
             "loss_total": safe_ratio(sums["total"], seen),
             "loss_cls": safe_ratio(sums["cls"], seen),
             "loss_ntcl": safe_ratio(sums["ntcl"], seen),
@@ -444,6 +491,13 @@ def train_snscl_lora(
             "valid_anchor_ratio": safe_ratio(valid_anchors, seen),
             "mean_positive_count": safe_ratio(sums["pos"], valid_anchors),
             "mean_negative_count": safe_ratio(sums["neg"], valid_anchors),
+            "mean_grad_norm": safe_ratio(sums["grad_norm"], seen),
+            "max_mu_abs": float(sums["mu_abs"]),
+            "min_logvar": float(sums["logvar_min"]),
+            "max_logvar": float(sums["logvar_max"]),
+            "max_model_param_abs": max_floating_parameter_abs(model),
+            "max_projection_param_abs": max_floating_parameter_abs(projection),
+            "max_stochastic_param_abs": max_floating_parameter_abs(stochastic),
             "val_top1": float(top1),
             "val_top5": float(top5),
             "best_top1": max([float(item["val_top1"]) for item in logs] + [float(top1)]),
@@ -455,6 +509,11 @@ def train_snscl_lora(
             "consecutive_gmm_failures": int(consecutive_gmm_failures),
             "health_status": "ok",
             "health_reasons": "",
+            "corrected_label_changes": int(np.sum(soft_labels.argmax(dim=1).numpy()[train_idx] != noisy_ids[train_idx])),
+            "corrected_label_change_ratio": safe_ratio(
+                int(np.sum(soft_labels.argmax(dim=1).numpy()[train_idx] != noisy_ids[train_idx])),
+                len(train_idx),
+            ),
         }
         queue_rows.append(build_queue_row(queue, method, seed, epoch_id))
 
@@ -502,6 +561,9 @@ def train_snscl_lora(
             row["mean_omega"] = float(omega[train_idx].mean())
             row["gmm_success"] = "yes" if gmm.success else "no"
             row["consecutive_gmm_failures"] = int(consecutive_gmm_failures)
+            corrected_ids = soft_labels.argmax(dim=1).numpy()
+            row["corrected_label_changes"] = int(np.sum(corrected_ids[train_idx] != noisy_ids[train_idx]))
+            row["corrected_label_change_ratio"] = safe_ratio(row["corrected_label_changes"], len(train_idx))
 
         health_reasons = evaluate_snscl_health(row, reliability_summary, snscl_cfg, consecutive_gmm_failures)
         if health_reasons:
@@ -510,7 +572,10 @@ def train_snscl_lora(
         if is_better_healthy_checkpoint(row, best_row):
             best_row = row
             best_state = build_snscl_checkpoint_state(model, projection, stochastic, queue, gamma, omega, soft_labels)
-            save_snscl_checkpoint(torch, checkpoint_path, method, seed, classes, best_row, best_state)
+            save_snscl_checkpoint(torch, checkpoint_path, method, seed, classes, best_row, best_state, checkpoint_kind="best")
+        if row["health_status"] == "ok":
+            latest_state = build_snscl_checkpoint_state(model, projection, stochastic, queue, gamma, omega, soft_labels)
+            save_snscl_checkpoint(torch, latest_checkpoint_path, method, seed, classes, row, latest_state, checkpoint_kind="latest")
         if best_row is not None:
             row["best_top1"] = float(best_row["val_top1"])
         logs.append(row)
@@ -601,24 +666,28 @@ def save_snscl_checkpoint(
     method: str,
     seed: int,
     classes: list[str],
-    best_row: dict[str, Any],
-    best_state: dict[str, Any],
+    row: dict[str, Any],
+    state: dict[str, Any],
+    checkpoint_kind: str,
 ) -> None:
-    """Persist a new best checkpoint immediately so later failures do not erase progress."""
+    """Persist a healthy checkpoint immediately so later failures do not erase progress."""
     if checkpoint_path is None:
         return
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch_module.save(
-        {
-            "method": method,
-            "seed": int(seed),
-            "classes": classes,
-            "best_epoch": int(best_row["epoch"]),
-            "best_top1": float(best_row["val_top1"]),
-            **best_state,
-        },
-        checkpoint_path,
-    )
+    payload = {
+        "method": method,
+        "seed": int(seed),
+        "classes": classes,
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_epoch": int(row["epoch"]),
+        "checkpoint_top1": float(row["val_top1"]),
+        **state,
+    }
+    if checkpoint_kind == "best":
+        payload.update({"best_epoch": int(row["epoch"]), "best_top1": float(row["val_top1"])})
+    else:
+        payload.update({"latest_epoch": int(row["epoch"]), "latest_top1": float(row["val_top1"])})
+    torch_module.save(payload, checkpoint_path)
 
 
 def assert_finite_tensors(epoch_id: int, batch_id: int, **tensors: torch.Tensor) -> None:
@@ -627,6 +696,62 @@ def assert_finite_tensors(epoch_id: int, batch_id: int, **tensors: torch.Tensor)
         raise SNSCLHealthError(
             f"Non-finite tensors at epoch {epoch_id}, batch {batch_id}: {', '.join(non_finite)}."
         )
+
+
+def check_and_clip_gradients(
+    torch_module: Any,
+    optimizer: Any,
+    max_grad_norm: float,
+    epoch_id: int,
+    batch_id: int,
+) -> float:
+    """Reject non-finite gradients, then clip the finite global norm."""
+    parameters = []
+    non_finite_groups = []
+    for group_id, group in enumerate(optimizer.param_groups):
+        group_name = str(group.get("name", group_id))
+        group_has_non_finite = False
+        for parameter in group["params"]:
+            if parameter.grad is None:
+                continue
+            parameters.append(parameter)
+            if not bool(torch_module.isfinite(parameter.grad).all().item()):
+                group_has_non_finite = True
+        if group_has_non_finite:
+            non_finite_groups.append(group_name)
+    if non_finite_groups:
+        raise SNSCLHealthError(
+            f"Non-finite gradients at epoch {epoch_id}, batch {batch_id}: {', '.join(non_finite_groups)}."
+        )
+    if not parameters:
+        raise SNSCLHealthError(f"No gradients at epoch {epoch_id}, batch {batch_id}.")
+    total_norm = torch_module.nn.utils.clip_grad_norm_(
+        parameters,
+        max_norm=float(max_grad_norm),
+        error_if_nonfinite=True,
+    )
+    return float(total_norm.detach().cpu())
+
+
+def assert_finite_parameters(epoch_id: int, batch_id: int, **modules: Any) -> None:
+    non_finite = []
+    for module_name, module in modules.items():
+        trainable = [parameter for parameter in module.parameters() if parameter.requires_grad]
+        if any(not bool(torch.isfinite(parameter).all().item()) for parameter in trainable):
+            non_finite.append(module_name)
+    if non_finite:
+        raise SNSCLHealthError(
+            f"Non-finite parameters after optimizer step at epoch {epoch_id}, batch {batch_id}: "
+            f"{', '.join(non_finite)}."
+        )
+
+
+def max_floating_parameter_abs(module: Any) -> float:
+    parameters = [parameter.detach() for parameter in module.parameters() if parameter.requires_grad and parameter.numel()]
+    if any(not bool(torch.isfinite(parameter).all().item()) for parameter in parameters):
+        return float("nan")
+    values = [float(parameter.abs().max().cpu()) for parameter in parameters]
+    return max(values) if values else 0.0
 
 
 def evaluate_snscl_health(
@@ -646,6 +771,13 @@ def evaluate_snscl_health(
         "gamma_std",
         "mean_omega",
         "queue_fill_ratio",
+        "mean_grad_norm",
+        "max_mu_abs",
+        "min_logvar",
+        "max_logvar",
+        "max_model_param_abs",
+        "max_projection_param_abs",
+        "max_stochastic_param_abs",
         "val_top1",
         "val_top5",
     ]
@@ -800,6 +932,9 @@ def validate_snscl_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"snscl.{key} must be in [0, 1].")
     if float(cfg["temperature"]) <= 0.0:
         raise ValueError("snscl.temperature must be positive.")
+    for key in ["projection_lr", "stochastic_lr", "max_grad_norm"]:
+        if float(cfg[key]) <= 0.0:
+            raise ValueError(f"snscl.{key} must be positive.")
     if int(cfg.get("gmm_failure_patience", 2)) <= 0:
         raise ValueError("snscl.gmm_failure_patience must be positive.")
     if int(cfg.get("health_check_epoch", 7)) <= 0:

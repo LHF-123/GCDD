@@ -48,7 +48,10 @@ DEFAULT_SNSCL_CONFIG: dict[str, Any] = {
         "queue_size": 32,
         "queue_start_epoch": 6,
         "reliability_threshold": 0.5,
-        "label_ma_alpha": 0.99,
+        "label_ma_alpha": 0.9,
+        "projection_lr": 1.0e-4,
+        "stochastic_lr": 1.0e-4,
+        "max_grad_norm": 1.0,
         "reliability_save_interval": 5,
         "fail_on_health_check": True,
         "health_check_epoch": 7,
@@ -97,6 +100,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--queue-start-epoch", type=int)
     parser.add_argument("--reliability-threshold", type=float)
     parser.add_argument("--label-ma-alpha", type=float)
+    parser.add_argument("--projection-lr", type=float)
+    parser.add_argument("--stochastic-lr", type=float)
+    parser.add_argument("--max-grad-norm", type=float)
     parser.add_argument("--reliability-save-interval", type=int)
     parser.add_argument("--health-check-epoch", type=int)
     parser.add_argument("--gmm-failure-patience", type=int)
@@ -132,6 +138,7 @@ def main() -> None:
     results: list[SNSCLRunResult] = []
     for seed in seeds:
         checkpoint_path = None if args.no_save_checkpoints else output_dir / "checkpoints" / f"snscl_seed{seed}_best.pt"
+        latest_checkpoint_path = None if args.no_save_checkpoints else output_dir / "checkpoints" / f"snscl_seed{seed}_latest.pt"
         run_cfg = copy.deepcopy(cfg)
         run_cfg["lora_train"]["seed"] = int(seed)
         epoch_callback = build_epoch_callback(output_dir)
@@ -149,6 +156,7 @@ def main() -> None:
                 path_maps=path_maps,
                 gt_clean_mask=gt_clean_mask,
                 checkpoint_path=checkpoint_path,
+                latest_checkpoint_path=latest_checkpoint_path,
                 epoch_callback=epoch_callback,
             )
         except Exception as exc:
@@ -233,6 +241,9 @@ def apply_cli_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
             "queue_start_epoch",
             "reliability_threshold",
             "label_ma_alpha",
+            "projection_lr",
+            "stochastic_lr",
+            "max_grad_norm",
             "reliability_save_interval",
             "health_check_epoch",
             "gmm_failure_patience",
@@ -409,9 +420,11 @@ def parse_path_maps(items: list[str]) -> list[tuple[str, str]]:
 
 def train_log_fields() -> list[str]:
     return [
-        "method", "seed", "epoch", "lr_lora", "lr_head", "loss_total", "loss_cls", "loss_ntcl", "loss_kl",
+        "method", "seed", "epoch", "lr_lora", "lr_head", "lr_projection", "lr_stochastic", "loss_total", "loss_cls", "loss_ntcl", "loss_kl",
         "mean_gamma", "gamma_std", "mean_omega", "queue_fill_ratio", "num_valid_ntcl_anchors", "valid_anchor_ratio",
-        "mean_positive_count", "mean_negative_count", "val_top1", "val_top5", "best_top1", "train_samples",
+        "mean_positive_count", "mean_negative_count", "mean_grad_norm", "max_mu_abs", "min_logvar", "max_logvar",
+        "max_model_param_abs", "max_projection_param_abs", "max_stochastic_param_abs", "corrected_label_changes",
+        "corrected_label_change_ratio", "val_top1", "val_top5", "best_top1", "train_samples",
         "eval_samples", "trainable_params", "total_params", "gmm_success", "consecutive_gmm_failures", "health_status",
         "health_reasons",
     ]
