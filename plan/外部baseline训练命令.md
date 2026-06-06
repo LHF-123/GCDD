@@ -69,6 +69,24 @@ JoCoR:       直接训练两个 DINOv2-LoRA 网络，joint loss small-loss 选�
 
 主表第一版建议不显式写 LR 参数，默认继承当前 DINOv2-LoRA 配置；如果后续为了稳定性改 LR，需要在结果表备注。
 
+## 0.3 当前结果状态
+
+截至 2026-06-05，当前 workspace 中已找到以下训练结果：
+
+| 数据集 | FINE static LoRA | Co-teaching | JoCoR |
+| --- | --- | --- | --- |
+| CUB asym40 | 已完成，best Top-1 77.93 | 已完成，best Top-1 61.51 | 已完成，best Top-1 63.42 |
+| Stanford Cars asym40 | 已完成，best Top-1 58.21 | 已完成，best Top-1 60.92 | 已完成，best Top-1 62.32 |
+| FGVC-Aircraft asym40 | 已完成，best Top-1 60.22 | 已完成，best Top-1 59.77 | 已完成，best Top-1 59.44 |
+
+对应汇总文件：
+
+```text
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.csv
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.md
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.json
+```
+
 ## 1. FINE-DINOv2 两步流程
 
 ### 1.1 第一步：FINE-DINOv2 Selector
@@ -231,8 +249,6 @@ LoRA 训练超参：
 
 ## 5. 建议执行顺序
 
-1. 先跑 FINE selector，如果已有 `fine_dinov2/` 可以跳过。
-2. 跑 FINE `nocenter p=0.6` 三个数据集 seed42。
-3. 跑 Co-teaching 三个数据集 seed42。
-4. 跑 JoCoR 三个数据集 seed42。
-5. 根据 seed42 结果决定谁补 3seed。
+1. 三个数据集的 FINE `nocenter p=0.6`、Co-teaching、JoCoR seed42 均已完成。
+2. 当前最强外部 baseline 是 FINE，但其结果具有明显数据集依赖性。
+3. 如果论文要求外部 baseline 多 seed，优先补 FINE；Co-teaching / JoCoR 当前不优先。

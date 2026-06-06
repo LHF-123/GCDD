@@ -1,0 +1,28 @@
+feature:
+  input_size: 448
+
+lora_train:
+  epochs: 30
+  batch_size: 16
+  eval_batch_size: 64
+  lora_lr: 1.0e-4
+  head_lr: 1.0e-3
+
+snscl:
+  warmup_epochs: 5
+  proj_dim: 512
+  stochastic_hidden_dim: 2048
+  lambda_kl: 0.001
+  lambda_ntcl: 1.0
+  temperature: 0.07
+  queue_size: 32
+  queue_start_epoch: 6
+  reliability_threshold: 0.5
+  label_ma_alpha: 0.99
+  reliability_save_interval: 5
+  fail_on_health_check: true
+  health_check_epoch: 7
+  gmm_failure_patience: 2
+  min_queue_fill_ratio: 1.0e-6
+  min_valid_ntcl_anchors: 1
+  min_gamma_std: 1.0e-6

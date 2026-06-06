@@ -76,10 +76,13 @@ class DINOv2LoRAClassifier:
                 self.embed_dim = infer_embed_dim(self.backbone)
                 self.head = torch.nn.Linear(self.embed_dim, num_classes)
 
-            def forward(self, images: Any) -> Any:
+            def forward(self, images: Any, return_features: bool = False) -> Any:
                 features = self.backbone.forward_features(images)
                 cls = features["x_norm_clstoken"]
-                return self.head(cls)
+                logits = self.head(cls)
+                if return_features:
+                    return logits, cls
+                return logits
 
         return _DINOv2LoRAClassifier()
 

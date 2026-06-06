@@ -5,3 +5,4 @@ torch>=2.1
 torchvision>=0.16
 tqdm>=4.66
 matplotlib>=3.7
+scikit-learn>=1.3

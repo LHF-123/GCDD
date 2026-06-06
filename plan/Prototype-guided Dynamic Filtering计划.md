@@ -295,7 +295,8 @@ Web-Aircraft 是当前主要反例：J 很高且 p=0.8 选择合理，但 PGDF �
 ```text
 CUB asym40: PGDF r=0.8 p=0.3（可选）
 Web-Car: 暂停继续扫低 p，当前 p=0.8 为最佳候选
-Auto p: 优先补 CUB / Web-Bird / Stanford Cars / FGVC-Aircraft seed1 和 seed88
+Synthetic asym40: Dynamic r=0.8 与 PGDF auto 的 seed1/42/88 已完成
+External baselines: 三个 synthetic asym40 的 FINE、Co-teaching、JoCoR seed42 已完成
 Method-level routing: 增加 PGDF vs centroid 的数据集级选择规则
 ```
 
@@ -311,8 +312,8 @@ Web-Car 已显示 p=0.7/0.6 低于 p=0.8，不建议继续向更低 p 扫描。
 ```text
 PGDF 方向成立，但固定 proto_keep_ratio 不通用。
 CUB 当前最优 p=0.4，Web-Car 当前最优 p=0.8。
-Auto p 的 Jaccard 路由已初步成立，但还不能作为最终主结果。
-下一步需要验证 adaptive proto gate 的多 seed 稳定性，并增加 PGDF vs centroid 的 method-level routing。
+Auto p 的 Jaccard 路由已在 synthetic asym40 上完成 3seed 验证，并稳定优于 Dynamic r=0.8。
+下一步需要根据论文篇幅决定是否给最强外部 baseline FINE 补 3seed，并增加 PGDF vs centroid 的 method-level routing。
 ```
 
 如果 adaptive 规则初步成立，再扩展：
@@ -322,4 +323,56 @@ Web-Bird 448
 Web-Aircraft 448
 Stanford Cars asym40
 FGVC-Aircraft asym40
+```
+
+## 11. 外部 Baseline 结果更新
+
+本节记录同一 DINOv2-LoRA 框架下适配的代表性 noisy-label baseline，用来回答 PGDF 是否只是在内部 baseline 上有效。
+
+三个 synthetic asym40 数据集的 seed42 结果均已完成：
+
+| 数据集 | 方法 | best Top-1 | purity | clean recall | 判断 |
+| --- | --- | ---: | ---: | ---: | --- |
+| CUB asym40 | FINE-DINOv2 feature nocenter p=0.6 | 77.93 | 82.50 | 82.50 | 强 feature-filtering baseline |
+| CUB asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 61.51 | 64.56 | 80.76 | 低于 Dynamic |
+| CUB asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 63.42 | 65.50 | 81.94 | 低于 Dynamic |
+| Stanford Cars asym40 | FINE-DINOv2 feature nocenter p=0.6 | 58.21 | 71.43 | 70.28 | purity 较高但 Top-1 偏低 |
+| Stanford Cars asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 60.92 | 65.33 | 81.72 | 低于 Dynamic |
+| Stanford Cars asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 62.32 | 65.62 | 82.08 | 最强外部 baseline，但仍低于 Dynamic |
+| FGVC-Aircraft asym40 | FINE-DINOv2 feature nocenter p=0.6 | 60.22 | 71.39 | 70.80 | 最强外部 baseline，略高于 Dynamic |
+| FGVC-Aircraft asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 59.77 | 65.96 | 82.45 | 略高于 Dynamic |
+| FGVC-Aircraft asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 59.44 | 65.50 | 81.88 | 略高于 Dynamic |
+
+参考：
+
+| 方法 | CUB | Stanford Cars | FGVC-Aircraft | Avg |
+| --- | ---: | ---: | ---: | ---: |
+| Dynamic r=0.8 seed42 | 64.50 | 62.99 | 59.14 | 62.21 |
+| FINE-DINOv2 p=0.6 seed42 | 77.93 | 58.21 | 60.22 | 65.45 |
+| Co-teaching r=0.8 seed42 | 61.51 | 60.92 | 59.77 | 60.73 |
+| JoCoR r=0.8 lambda=0.1 seed42 | 63.42 | 62.32 | 59.44 | 61.72 |
+| PGDF auto seed42 | 80.08 | 71.57 | 65.14 | 72.26 |
+
+判断：
+
+```text
+FINE-DINOv2 feature filtering 是有竞争力但数据集依赖明显的外部强基线。
+它在 CUB 上强、Aircraft 上略高于 Dynamic，但 Cars 上明显偏弱。
+
+Co-teaching / JoCoR 没有稳定超过 Dynamic，也均明显低于 PGDF。
+
+PGDF auto 在三个数据集上均超过最强外部 baseline，
+说明 PGDF 的提升不是只相对内部 baseline 成立。
+
+这支持 PGDF 的论文叙事：
+PGDF 不是单纯 loss-based small-loss，
+而是 loss-view 与 prototype/feature geometry view 的交集。
+```
+
+外部 baseline 汇总文件：
+
+```text
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.csv
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.md
+outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.json
 ```
