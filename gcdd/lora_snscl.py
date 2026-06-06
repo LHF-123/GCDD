@@ -375,6 +375,7 @@ def train_snscl_lora(
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
     consecutive_gmm_failures = 0
+    consecutive_amp_skips = 0
     trainable_params = count_trainable_params(model) + count_trainable_params(projection) + count_trainable_params(stochastic)
     total_params = count_total_params(model) + count_total_params(projection) + count_total_params(stochastic)
     log_stage(f"[snscl] seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, trainable_params={trainable_params}")
@@ -392,10 +393,16 @@ def train_snscl_lora(
             "pos": 0.0,
             "neg": 0.0,
             "grad_norm": 0.0,
+            "grad_seen": 0.0,
+            "amp_skipped": 0.0,
+            "max_consecutive_amp_skips": 0.0,
+            "amp_scale_min": float(scaler.get_scale()),
+            "amp_scale_max": float(scaler.get_scale()),
             "mu_abs": 0.0,
             "logvar_min": float("inf"),
             "logvar_max": float("-inf"),
         }
+        amp_overflow_groups: set[str] = set()
         seen = 0
         for batch_id, (images, noisy_labels, indices) in enumerate(
             progress_iter(train_loader, total=len(train_loader), desc=f"SNSCL seed={seed} epoch {epoch_id}/{epochs}"),
@@ -438,19 +445,42 @@ def train_snscl_lora(
             )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            grad_norm = check_and_clip_gradients(
-                torch,
-                optimizer,
-                max_grad_norm=float(snscl_cfg["max_grad_norm"]),
-                epoch_id=epoch_id,
-                batch_id=batch_id,
-            )
-            scaler.step(optimizer)
-            scaler.update()
-            assert_finite_parameters(epoch_id, batch_id, model=model, projection=projection, stochastic=stochastic)
-            scheduler.step()
+            non_finite_groups = find_non_finite_gradient_groups(torch, optimizer)
+            optimizer_step_applied = not non_finite_groups
+            if non_finite_groups and scaler.is_enabled():
+                amp_overflow_groups.update(non_finite_groups)
+                consecutive_amp_skips += 1
+                sums["amp_skipped"] += 1
+                sums["max_consecutive_amp_skips"] = max(sums["max_consecutive_amp_skips"], consecutive_amp_skips)
+                # GradScaler observes the recorded inf values and skips this optimizer step.
+                scaler.step(optimizer)
+                scaler.update()
+                grad_norm = 0.0
+                raise_if_amp_overflow_persistent(
+                    non_finite_groups,
+                    consecutive_amp_skips,
+                    int(snscl_cfg["amp_overflow_patience"]),
+                    epoch_id,
+                    batch_id,
+                )
+            else:
+                grad_norm = check_and_clip_gradients(
+                    torch,
+                    optimizer,
+                    max_grad_norm=float(snscl_cfg["max_grad_norm"]),
+                    epoch_id=epoch_id,
+                    batch_id=batch_id,
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                assert_finite_parameters(epoch_id, batch_id, model=model, projection=projection, stochastic=stochastic)
+                scheduler.step()
+                consecutive_amp_skips = 0
+            current_amp_scale = float(scaler.get_scale())
+            sums["amp_scale_min"] = min(sums["amp_scale_min"], current_amp_scale)
+            sums["amp_scale_max"] = max(sums["amp_scale_max"], current_amp_scale)
 
-            if epoch_id >= int(snscl_cfg["queue_start_epoch"]):
+            if optimizer_step_applied and epoch_id >= int(snscl_cfg["queue_start_epoch"]):
                 corrected = soft_labels[indices].argmax(dim=1).to(device)
                 batch_omega = torch.from_numpy(omega[indices.numpy()]).to(device)
                 queue.enqueue(sampled.detach(), corrected, batch_omega)
@@ -464,7 +494,9 @@ def train_snscl_lora(
             sums["valid"] += ntcl_stats["num_valid_ntcl_anchors"]
             sums["pos"] += ntcl_stats["mean_positive_count"] * ntcl_stats["num_valid_ntcl_anchors"]
             sums["neg"] += ntcl_stats["mean_negative_count"] * ntcl_stats["num_valid_ntcl_anchors"]
-            sums["grad_norm"] += grad_norm * batch_size
+            if optimizer_step_applied:
+                sums["grad_norm"] += grad_norm * batch_size
+                sums["grad_seen"] += batch_size
             sums["mu_abs"] = max(sums["mu_abs"], float(mu.detach().abs().max().cpu()))
             sums["logvar_min"] = min(sums["logvar_min"], float(logvar.detach().min().cpu()))
             sums["logvar_max"] = max(sums["logvar_max"], float(logvar.detach().max().cpu()))
@@ -491,7 +523,13 @@ def train_snscl_lora(
             "valid_anchor_ratio": safe_ratio(valid_anchors, seen),
             "mean_positive_count": safe_ratio(sums["pos"], valid_anchors),
             "mean_negative_count": safe_ratio(sums["neg"], valid_anchors),
-            "mean_grad_norm": safe_ratio(sums["grad_norm"], seen),
+            "mean_grad_norm": safe_ratio(sums["grad_norm"], sums["grad_seen"]),
+            "amp_skipped_steps": int(sums["amp_skipped"]),
+            "max_consecutive_amp_skips": int(sums["max_consecutive_amp_skips"]),
+            "amp_scale_final": float(scaler.get_scale()),
+            "amp_scale_min": float(sums["amp_scale_min"]),
+            "amp_scale_max": float(sums["amp_scale_max"]),
+            "amp_overflow_groups": ",".join(sorted(amp_overflow_groups)),
             "max_mu_abs": float(sums["mu_abs"]),
             "min_logvar": float(sums["logvar_min"]),
             "max_logvar": float(sums["logvar_max"]),
@@ -707,18 +745,12 @@ def check_and_clip_gradients(
 ) -> float:
     """Reject non-finite gradients, then clip the finite global norm."""
     parameters = []
-    non_finite_groups = []
+    non_finite_groups = find_non_finite_gradient_groups(torch_module, optimizer)
     for group_id, group in enumerate(optimizer.param_groups):
-        group_name = str(group.get("name", group_id))
-        group_has_non_finite = False
         for parameter in group["params"]:
             if parameter.grad is None:
                 continue
             parameters.append(parameter)
-            if not bool(torch_module.isfinite(parameter.grad).all().item()):
-                group_has_non_finite = True
-        if group_has_non_finite:
-            non_finite_groups.append(group_name)
     if non_finite_groups:
         raise SNSCLHealthError(
             f"Non-finite gradients at epoch {epoch_id}, batch {batch_id}: {', '.join(non_finite_groups)}."
@@ -731,6 +763,32 @@ def check_and_clip_gradients(
         error_if_nonfinite=True,
     )
     return float(total_norm.detach().cpu())
+
+
+def find_non_finite_gradient_groups(torch_module: Any, optimizer: Any) -> list[str]:
+    non_finite_groups = []
+    for group_id, group in enumerate(optimizer.param_groups):
+        group_name = str(group.get("name", group_id))
+        if any(
+            parameter.grad is not None and not bool(torch_module.isfinite(parameter.grad).all().item())
+            for parameter in group["params"]
+        ):
+            non_finite_groups.append(group_name)
+    return non_finite_groups
+
+
+def raise_if_amp_overflow_persistent(
+    non_finite_groups: list[str],
+    consecutive_amp_skips: int,
+    patience: int,
+    epoch_id: int,
+    batch_id: int,
+) -> None:
+    if non_finite_groups and consecutive_amp_skips >= patience:
+        raise SNSCLHealthError(
+            f"AMP gradient overflow for {consecutive_amp_skips} consecutive steps at "
+            f"epoch {epoch_id}, batch {batch_id}: {', '.join(non_finite_groups)}."
+        )
 
 
 def assert_finite_parameters(epoch_id: int, batch_id: int, **modules: Any) -> None:
@@ -944,6 +1002,8 @@ def validate_snscl_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"snscl.{key} must be non-negative.")
     if int(cfg.get("min_valid_ntcl_anchors", 1)) < 0:
         raise ValueError("snscl.min_valid_ntcl_anchors must be non-negative.")
+    if int(cfg.get("amp_overflow_patience", 5)) <= 0:
+        raise ValueError("snscl.amp_overflow_patience must be positive.")
 
 
 def _empty_ntcl_stats() -> dict[str, float]:
