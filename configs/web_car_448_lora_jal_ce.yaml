@@ -1,0 +1,38 @@
+method: jal_ce
+loss_type: jal_ce
+jal_alpha: 1.0
+jal_beta: 1.0
+jal_a: 30.0
+jal_eps: 1.0e-8
+
+jal_baseline:
+  selection: full_noisy
+  use_filter: false
+  filter_type: none
+  dynamic_selection: false
+  prototype_gate: false
+  use_pgdf: false
+  use_centroid_filter: false
+  use_gcdd_budget: false
+
+feature:
+  input_size: 448
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules: qkv
+
+lora_train:
+  epochs: 30
+  batch_size: 48
+  eval_batch_size: 96
+  num_workers: 4
+  pin_memory: true
+  lora_lr: 1.0e-4
+  head_lr: 1.0e-3
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_ratio: 0.1
+  amp: true

@@ -14,8 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
-from gcdd.lora_training import train_dinov2_lora
+from gcdd.lora_training import resolve_loss_config, train_dinov2_lora
 from gcdd.progress import log_stage
 
 
@@ -51,6 +52,7 @@ METHODS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run DINOv2 LoRA training on Web-Bird clean splits.")
     parser.add_argument("--input-dir", default="outputs/Web-Bird/v1_web_bird", help="V1 output directory.")
+    parser.add_argument("--config", help="Optional method YAML merged over <input-dir>/resolved_config.yaml.")
     parser.add_argument("--output-dir", help="Output directory. Defaults to <input-dir>/lora.")
     parser.add_argument("--methods", default="all,full_gcdd,both_only,gcdd_proto,centroid", help="Comma-separated methods: all, full_gcdd, both_only, gcdd_proto, centroid.")
     parser.add_argument("--seeds", default="1", help="Comma-separated seeds.")
@@ -73,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], help="Override device.")
     parser.add_argument("--local-repo", help="Override DINOv2 local torch hub repo path.")
     parser.add_argument("--input-size", type=int, help="Override image input size.")
+    parser.add_argument("--loss-type", "--loss_type", choices=["ce", "jal_ce"], help="Override training loss. Default remains CE.")
+    parser.add_argument("--jal-alpha", "--jal_alpha", type=float, help="JAL-CE NCE weight.")
+    parser.add_argument("--jal-beta", "--jal_beta", type=float, help="JAL-CE AMSE weight.")
+    parser.add_argument("--jal-a", "--jal_a", type=float, help="JAL-CE AMSE target scale.")
+    parser.add_argument("--jal-eps", "--jal_eps", type=float, help="JAL-CE NCE denominator epsilon.")
     return parser.parse_args()
 
 
@@ -89,9 +96,10 @@ def main() -> None:
     seeds = parse_seeds(args.seeds)
     path_maps = parse_path_maps(args.path_map)
 
-    cfg = load_config(input_dir)
+    cfg = load_config(input_dir, Path(args.config) if args.config else None)
     apply_lora_defaults(cfg)
     apply_overrides(cfg, args)
+    validate_loss_method_combination(cfg, methods)
     write_yaml(output_dir / "resolved_config.yaml", cfg)
 
     log_stage("[1/4] Loading paths, labels, and split masks.")
@@ -110,6 +118,7 @@ def main() -> None:
                 checkpoint_path = checkpoint_dir / f"{key}_seed{seed}_best.pt"
             run_cfg = copy.deepcopy(cfg)
             run_cfg["lora_train"]["seed"] = int(seed)
+            method_name = "JAL-CE-DINOv2+LoRA (full noisy)" if cfg["loss_type"] == "jal_ce" else method_info["method"]
             result = train_dinov2_lora(
                 data["train_paths"],
                 data["train_labels"],
@@ -117,7 +126,7 @@ def main() -> None:
                 data["eval_labels"],
                 train_mask,
                 run_cfg,
-                method=method_info["method"],
+                method=method_name,
                 seed=seed,
                 path_maps=path_maps,
                 checkpoint_path=checkpoint_path,
@@ -127,7 +136,7 @@ def main() -> None:
             for name in result.trainable_modules:
                 module_rows.append(
                     {
-                        "method": method_info["method"],
+                        "method": method_name,
                         "seed": seed,
                         "module": name,
                         "trainable_params": result.trainable_params,
@@ -146,8 +155,19 @@ def main() -> None:
             "lr_lora",
             "lr_head",
             "loss",
+            "train_loss",
+            "loss_type",
+            "jal_alpha",
+            "jal_beta",
+            "jal_a",
+            "jal_eps",
+            "selection_mode",
             "top1",
             "top5",
+            "val_top1",
+            "val_top5",
+            "best_top1",
+            "best_epoch",
             "train_samples",
             "eval_samples",
             "trainable_params",
@@ -171,6 +191,12 @@ def main() -> None:
             "last5_std",
             "trainable_params",
             "total_params",
+            "loss_type",
+            "jal_alpha",
+            "jal_beta",
+            "jal_a",
+            "jal_eps",
+            "selection_mode",
         ],
     )
     write_csv(output_dir / "lora_modules.csv", module_rows, ["method", "seed", "module", "trainable_params", "total_params"])
@@ -185,6 +211,9 @@ def main() -> None:
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
             "methods": methods,
+            "method_config": str(args.config or ""),
+            "loss": resolve_loss_config(cfg),
+            "selection_mode": "full_noisy" if cfg["loss_type"] == "jal_ce" else "method_defined",
             "seeds": seeds,
             "results": result_rows,
             "summary": summary_rows,
@@ -220,12 +249,18 @@ def parse_path_maps(items: list[str]) -> list[tuple[str, str]]:
     return maps
 
 
-def load_config(input_dir: Path) -> dict[str, Any]:
+def load_config(input_dir: Path, method_config: Path | None = None) -> dict[str, Any]:
     path = input_dir / "resolved_config.yaml"
     if not path.exists():
         raise FileNotFoundError(f"V1 resolved config is missing: {path}")
     with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+    if method_config is not None:
+        if not method_config.exists():
+            raise FileNotFoundError(f"Method config is missing: {method_config}")
+        with method_config.open("r", encoding="utf-8") as f:
+            deep_update(cfg, yaml.safe_load(f) or {})
+    return cfg
 
 
 def apply_lora_defaults(cfg: dict[str, Any]) -> None:
@@ -243,6 +278,11 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
             "target_modules": "qkv",
         },
     )
+    cfg.setdefault("loss_type", "ce")
+    cfg.setdefault("jal_alpha", 1.0)
+    cfg.setdefault("jal_beta", 1.0)
+    cfg.setdefault("jal_a", 30.0)
+    cfg.setdefault("jal_eps", 1.0e-8)
     cfg.setdefault(
         "lora_train",
         {
@@ -298,6 +338,25 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         lora_cfg["dropout"] = args.dropout
     if args.target_modules is not None:
         lora_cfg["target_modules"] = args.target_modules
+    for attr in ["loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps"]:
+        value = getattr(args, attr)
+        if value is not None:
+            cfg[attr] = value
+
+
+def validate_loss_method_combination(cfg: dict[str, Any], methods: list[str]) -> None:
+    loss_cfg = resolve_loss_config(cfg)
+    if loss_cfg["loss_type"] != "jal_ce":
+        return
+    if methods != ["all"]:
+        raise ValueError("JAL-CE must run independently on the full noisy set; use --methods all only.")
+    baseline_cfg = cfg.get("jal_baseline", {})
+    if baseline_cfg and str(baseline_cfg.get("selection", "full_noisy")).lower() != "full_noisy":
+        raise ValueError("JAL-CE requires jal_baseline.selection=full_noisy.")
+    forbidden = ["use_filter", "dynamic_selection", "prototype_gate", "use_pgdf", "use_centroid_filter", "use_gcdd_budget"]
+    enabled = [key for key in forbidden if bool(baseline_cfg.get(key, False))]
+    if enabled:
+        raise ValueError(f"JAL-CE full-noisy baseline cannot enable filtering flags: {enabled}")
 
 
 def load_data(input_dir: Path, methods: list[str]) -> dict[str, Any]:
@@ -380,14 +439,18 @@ def build_method_summary(result_rows: list[dict[str, Any]]) -> list[dict[str, An
 def write_summary(path: Path, input_dir: Path, methods: list[str], seeds: list[int], summary_rows: list[dict[str, Any]], result_rows: list[dict[str, Any]]) -> None:
     summary_map = {row["method"]: row for row in summary_rows}
     lines = [
-        "# LoRA Web-Bird Summary",
+        "# DINOv2+LoRA Summary",
         "",
-        "This route trains DINOv2 with LoRA on image data instead of using frozen-feature linear CE.",
-        "The main purpose is to test whether GCDD+Proto-only hard-clean samples become useful when the backbone can adapt.",
+        "This route trains DINOv2 with LoRA on image data. The selected loss and training-set mode are recorded below.",
         "",
         f"- Source V1 output: {input_dir}",
-        f"- Methods: {', '.join(METHODS[key]['method'] for key in methods)}",
+        f"- Methods: {', '.join(sorted({str(row['method']) for row in result_rows}))}",
         f"- Seeds: {', '.join(str(seed) for seed in seeds)}",
+        f"- Loss type: {result_rows[0]['loss_type'] if result_rows else ''}",
+        f"- Selection mode: {result_rows[0]['selection_mode'] if result_rows else ''}",
+        f"- JAL alpha / beta / a / eps: {result_rows[0]['jal_alpha'] if result_rows else ''} / "
+        f"{result_rows[0]['jal_beta'] if result_rows else ''} / {result_rows[0]['jal_a'] if result_rows else ''} / "
+        f"{result_rows[0]['jal_eps'] if result_rows else ''}",
         "",
         "## Method Summary",
         "| method | seeds | mean_best_top1 | std_best_top1 | max_best_top1 | mean_final_top1 | train_samples |",

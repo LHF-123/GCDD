@@ -105,9 +105,15 @@ def train_dinov2_lora(
     from torchvision import transforms
 
     path_maps = path_maps or []
+    train_mask = np.asarray(train_mask, dtype=bool)
+    if train_mask.shape != (len(train_labels),):
+        raise ValueError(f"train_mask must have shape ({len(train_labels)},), got {train_mask.shape}.")
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
     feature_cfg = cfg["feature"]
+    loss_cfg = resolve_loss_config(cfg)
+    if loss_cfg["loss_type"] == "jal_ce" and not np.all(train_mask):
+        raise ValueError("JAL-CE is a full-noisy robust-loss baseline and requires all training samples.")
     device = resolve_device(torch, feature_cfg.get("device", "auto"))
     set_torch_seed(torch, seed)
 
@@ -169,14 +175,25 @@ def train_dinov2_lora(
     warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.1)))
     scheduler = build_scheduler(torch, optimizer, total_steps, warmup_steps, str(train_cfg.get("scheduler", "cosine")))
     scaler = torch.cuda.amp.GradScaler(enabled=bool(train_cfg.get("amp", True)) and device.startswith("cuda"))
-    criterion = torch.nn.CrossEntropyLoss()
+    criterion = build_criterion(torch, cfg)
     logs: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
 
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
-    log_stage(f"[lora] {method} seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, trainable_params={trainable_params}")
+    log_stage(
+        f"[lora] {method} seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, "
+        f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}, selection=full_noisy"
+        if loss_cfg["loss_type"] == "jal_ce"
+        else f"[lora] {method} seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, "
+        f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}"
+    )
+    if loss_cfg["loss_type"] == "jal_ce":
+        log_stage(
+            f"[lora] JAL-CE parameters: alpha={loss_cfg['jal_alpha']}, beta={loss_cfg['jal_beta']}, "
+            f"a={loss_cfg['jal_a']}, eps={loss_cfg['jal_eps']}, selection=full_noisy"
+        )
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -189,7 +206,10 @@ def train_dinov2_lora(
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 logits = model(images)
-                loss = criterion(logits, labels)
+                if loss_cfg["loss_type"] == "ce":
+                    loss = criterion(logits, labels)
+            if loss_cfg["loss_type"] == "jal_ce":
+                loss = criterion(logits.float(), labels)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -206,17 +226,23 @@ def train_dinov2_lora(
             "lr_lora": float(optimizer.param_groups[0]["lr"]),
             "lr_head": float(optimizer.param_groups[1]["lr"]),
             "loss": safe_ratio(loss_sum, seen),
+            "train_loss": safe_ratio(loss_sum, seen),
             "top1": float(top1),
             "top5": float(top5),
+            "val_top1": float(top1),
+            "val_top5": float(top5),
             "train_samples": int(len(train_idx)),
             "eval_samples": int(len(eval_idx)),
             "trainable_params": int(trainable_params),
             "total_params": int(total_params),
+            **loss_log_fields(loss_cfg),
         }
-        logs.append(row)
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
             best_row = row
             best_state = trainable_state_dict(model)
+        row["best_top1"] = float(best_row["top1"])
+        row["best_epoch"] = int(best_row["epoch"])
+        logs.append(row)
         log_stage(
             f"[lora] {method} seed={seed} epoch {epoch}/{epochs}: "
             f"loss={row['loss']:.4f}, top1={top1:.4f}, top5={top5:.4f}"
@@ -232,6 +258,8 @@ def train_dinov2_lora(
                 "state_dict": best_state,
                 "best_epoch": int(best_row["epoch"]) if best_row else None,
                 "best_top1": float(best_row["top1"]) if best_row else None,
+                "loss": loss_cfg,
+                "selection": "full_noisy" if loss_cfg["loss_type"] == "jal_ce" else "provided_train_mask",
             },
             checkpoint_path,
         )
@@ -375,6 +403,53 @@ def summarize_lora_logs(method: str, seed: int, logs: list[dict[str, Any]]) -> d
         "last5_std": float(last5_top1.std()),
         "trainable_params": int(final["trainable_params"]),
         "total_params": int(final["total_params"]),
+        "loss_type": str(final["loss_type"]),
+        "jal_alpha": final["jal_alpha"],
+        "jal_beta": final["jal_beta"],
+        "jal_a": final["jal_a"],
+        "jal_eps": final["jal_eps"],
+        "selection_mode": str(final["selection_mode"]),
+    }
+
+
+def resolve_loss_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    loss_type = str(cfg.get("loss_type", "ce")).lower()
+    if loss_type not in {"ce", "jal_ce"}:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+    return {
+        "loss_type": loss_type,
+        "jal_alpha": float(cfg.get("jal_alpha", 1.0)),
+        "jal_beta": float(cfg.get("jal_beta", 1.0)),
+        "jal_a": float(cfg.get("jal_a", 30.0)),
+        "jal_eps": float(cfg.get("jal_eps", 1.0e-8)),
+    }
+
+
+def build_criterion(torch: Any, cfg: dict[str, Any]) -> Any:
+    loss_cfg = resolve_loss_config(cfg)
+    if loss_cfg["loss_type"] == "ce":
+        return torch.nn.CrossEntropyLoss()
+    if loss_cfg["loss_type"] == "jal_ce":
+        from losses.jal import JALCELoss
+
+        return JALCELoss(
+            alpha=loss_cfg["jal_alpha"],
+            beta=loss_cfg["jal_beta"],
+            a=loss_cfg["jal_a"],
+            eps=loss_cfg["jal_eps"],
+        )
+    raise ValueError(f"Unknown loss_type: {loss_cfg['loss_type']}")
+
+
+def loss_log_fields(loss_cfg: dict[str, Any]) -> dict[str, Any]:
+    jal_enabled = loss_cfg["loss_type"] == "jal_ce"
+    return {
+        "loss_type": loss_cfg["loss_type"],
+        "jal_alpha": loss_cfg["jal_alpha"] if jal_enabled else "",
+        "jal_beta": loss_cfg["jal_beta"] if jal_enabled else "",
+        "jal_a": loss_cfg["jal_a"] if jal_enabled else "",
+        "jal_eps": loss_cfg["jal_eps"] if jal_enabled else "",
+        "selection_mode": "full_noisy" if jal_enabled else "provided_train_mask",
     }
 
 

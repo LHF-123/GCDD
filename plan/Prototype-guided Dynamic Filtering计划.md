@@ -1,6 +1,6 @@
 # Prototype-guided Dynamic Filtering 实验计划
 
-记录日期：2026-06-02
+记录日期：2026-06-07
 
 ## 1. 当前动机
 
@@ -296,7 +296,7 @@ Web-Aircraft 是当前主要反例：J 很高且 p=0.8 选择合理，但 PGDF �
 CUB asym40: PGDF r=0.8 p=0.3（可选）
 Web-Car: 暂停继续扫低 p，当前 p=0.8 为最佳候选
 Synthetic asym40: Dynamic r=0.8 与 PGDF auto 的 seed1/42/88 已完成
-External baselines: 三个 synthetic asym40 的 FINE、Co-teaching、JoCoR seed42 已完成
+External baselines: 三个 synthetic asym40 的 FINE 3seed 已完成；Co-teaching、JoCoR seed42 已完成
 Method-level routing: 增加 PGDF vs centroid 的数据集级选择规则
 ```
 
@@ -313,7 +313,7 @@ Web-Car 已显示 p=0.7/0.6 低于 p=0.8，不建议继续向更低 p 扫描。
 PGDF 方向成立，但固定 proto_keep_ratio 不通用。
 CUB 当前最优 p=0.4，Web-Car 当前最优 p=0.8。
 Auto p 的 Jaccard 路由已在 synthetic asym40 上完成 3seed 验证，并稳定优于 Dynamic r=0.8。
-下一步需要根据论文篇幅决定是否给最强外部 baseline FINE 补 3seed，并增加 PGDF vs centroid 的 method-level routing。
+FINE 3seed 已完成并确认数据集依赖性。下一步增加 PGDF vs centroid 的 method-level routing；Co-teaching / JoCoR 暂不优先补多 seed。
 ```
 
 如果 adaptive 规则初步成立，再扩展：
@@ -329,17 +329,17 @@ FGVC-Aircraft asym40
 
 本节记录同一 DINOv2-LoRA 框架下适配的代表性 noisy-label baseline，用来回答 PGDF 是否只是在内部 baseline 上有效。
 
-三个 synthetic asym40 数据集的 seed42 结果均已完成：
+三个 synthetic asym40 数据集的 FINE seed 1/42/88 已完成；Co-teaching 和 JoCoR 当前完成 seed42：
 
 | 数据集 | 方法 | best Top-1 | purity | clean recall | 判断 |
 | --- | --- | ---: | ---: | ---: | --- |
-| CUB asym40 | FINE-DINOv2 feature nocenter p=0.6 | 77.93 | 82.50 | 82.50 | 强 feature-filtering baseline |
+| CUB asym40 | FINE-DINOv2 feature nocenter p=0.6 | 77.87 ± 0.15 | 82.50 | 82.50 | 3seed 强 feature-filtering baseline |
 | CUB asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 61.51 | 64.56 | 80.76 | 低于 Dynamic |
 | CUB asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 63.42 | 65.50 | 81.94 | 低于 Dynamic |
-| Stanford Cars asym40 | FINE-DINOv2 feature nocenter p=0.6 | 58.21 | 71.43 | 70.28 | purity 较高但 Top-1 偏低 |
+| Stanford Cars asym40 | FINE-DINOv2 feature nocenter p=0.6 | 58.26 ± 0.20 | 71.43 | 70.28 | 3seed 稳定但 Top-1 偏低 |
 | Stanford Cars asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 60.92 | 65.33 | 81.72 | 低于 Dynamic |
 | Stanford Cars asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 62.32 | 65.62 | 82.08 | 最强外部 baseline，但仍低于 Dynamic |
-| FGVC-Aircraft asym40 | FINE-DINOv2 feature nocenter p=0.6 | 60.22 | 71.39 | 70.80 | 最强外部 baseline，略高于 Dynamic |
+| FGVC-Aircraft asym40 | FINE-DINOv2 feature nocenter p=0.6 | 60.31 ± 0.13 | 71.39 | 70.80 | 3seed best 稳定，final 方差较大 |
 | FGVC-Aircraft asym40 | Co-teaching-DINOv2+LoRA fixed r=0.8 | 59.77 | 65.96 | 82.45 | 略高于 Dynamic |
 | FGVC-Aircraft asym40 | JoCoR-DINOv2+LoRA r=0.8 lambda=0.1 | 59.44 | 65.50 | 81.88 | 略高于 Dynamic |
 
@@ -347,21 +347,21 @@ FGVC-Aircraft asym40
 
 | 方法 | CUB | Stanford Cars | FGVC-Aircraft | Avg |
 | --- | ---: | ---: | ---: | ---: |
-| Dynamic r=0.8 seed42 | 64.50 | 62.99 | 59.14 | 62.21 |
-| FINE-DINOv2 p=0.6 seed42 | 77.93 | 58.21 | 60.22 | 65.45 |
+| Dynamic r=0.8 3seed | 62.78 ± 1.92 | 63.44 ± 0.69 | 59.33 ± 0.49 | 61.85 |
+| FINE-DINOv2 p=0.6 3seed | 77.87 ± 0.15 | 58.26 ± 0.20 | 60.31 ± 0.13 | 65.48 |
 | Co-teaching r=0.8 seed42 | 61.51 | 60.92 | 59.77 | 60.73 |
 | JoCoR r=0.8 lambda=0.1 seed42 | 63.42 | 62.32 | 59.44 | 61.72 |
-| PGDF auto seed42 | 80.08 | 71.57 | 65.14 | 72.26 |
+| PGDF auto 3seed | 80.27 ± 0.20 | 71.25 ± 0.80 | 65.08 ± 0.48 | 72.20 |
 
 判断：
 
 ```text
 FINE-DINOv2 feature filtering 是有竞争力但数据集依赖明显的外部强基线。
-它在 CUB 上强、Aircraft 上略高于 Dynamic，但 Cars 上明显偏弱。
+3seed 结果确认它在 CUB 上强、Aircraft 居中，但 Cars 上稳定偏弱。
 
 Co-teaching / JoCoR 没有稳定超过 Dynamic，也均明显低于 PGDF。
 
-PGDF auto 在三个数据集上均超过最强外部 baseline，
+按同为 3seed 的口径，PGDF auto 在 CUB、Cars、Aircraft 上分别超过 FINE `2.40`、`12.99`、`4.77 pp`，
 说明 PGDF 的提升不是只相对内部 baseline 成立。
 
 这支持 PGDF 的论文叙事：
@@ -375,4 +375,8 @@ PGDF 不是单纯 loss-based small-loss，
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.csv
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.md
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.json
+outputs/analysis/fine_3seed_summary/fine_3seed_per_seed.csv
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.csv
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.md
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.json
 ```

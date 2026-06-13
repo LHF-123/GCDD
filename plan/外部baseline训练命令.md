@@ -9,7 +9,7 @@
 - 主输入尺寸：`448`
 - 主训练 epoch：`30`
 - Co-teaching / JoCoR 双模型默认用 `--batch-size 16 --grad-accum-steps 2`，降低 OOM 风险。
-- FINE 第一优先训练 `nocenter p=0.6`，因为当前 selector purity 明显强于 `center p=0.6`。
+- FINE 主配置使用 `nocenter p=0.6`，因为当前 selector purity 明显强于 `center p=0.6`。
 
 ## 0.1 流程总览
 
@@ -71,13 +71,13 @@ JoCoR:       直接训练两个 DINOv2-LoRA 网络，joint loss small-loss 选�
 
 ## 0.3 当前结果状态
 
-截至 2026-06-05，当前 workspace 中已找到以下训练结果：
+截至 2026-06-07，当前 workspace 中已找到以下训练结果：
 
 | 数据集 | FINE static LoRA | Co-teaching | JoCoR |
 | --- | --- | --- | --- |
-| CUB asym40 | 已完成，best Top-1 77.93 | 已完成，best Top-1 61.51 | 已完成，best Top-1 63.42 |
-| Stanford Cars asym40 | 已完成，best Top-1 58.21 | 已完成，best Top-1 60.92 | 已完成，best Top-1 62.32 |
-| FGVC-Aircraft asym40 | 已完成，best Top-1 60.22 | 已完成，best Top-1 59.77 | 已完成，best Top-1 59.44 |
+| CUB asym40 | 3seed 已完成，best Top-1 77.87 ± 0.15 | seed42 已完成，best Top-1 61.51 | seed42 已完成，best Top-1 63.42 |
+| Stanford Cars asym40 | 3seed 已完成，best Top-1 58.26 ± 0.20 | seed42 已完成，best Top-1 60.92 | seed42 已完成，best Top-1 62.32 |
+| FGVC-Aircraft asym40 | 3seed 已完成，best Top-1 60.31 ± 0.13 | seed42 已完成，best Top-1 59.77 | seed42 已完成，best Top-1 59.44 |
 
 对应汇总文件：
 
@@ -85,6 +85,10 @@ JoCoR:       直接训练两个 DINOv2-LoRA 网络，joint loss small-loss 选�
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.csv
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.md
 outputs/analysis/external_baselines_seed42/external_baseline_seed42_summary.json
+outputs/analysis/fine_3seed_summary/fine_3seed_per_seed.csv
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.csv
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.md
+outputs/analysis/fine_3seed_summary/fine_3seed_summary.json
 ```
 
 ## 1. FINE-DINOv2 两步流程
@@ -107,7 +111,7 @@ python tools/run_fine_dinov2_selector.py --input-dir outputs/FGVC_Aircraft/FGVC-
 
 ### 1.2 第二步：FINE-DINOv2 Feature Static Training
 
-优先跑 `nocenter p=0.6`。
+主配置为 `nocenter p=0.6`。
 
 ```bash
 python scripts/run_lora_static_selection.py --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 --selection-file outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/fine_dinov2/fine_selection_nocenter_p0p6.csv --method-name "FINE-DINOv2 feature nocenter p=0.6" --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/fine_lora_nocenter_p0p6_seed42 --seeds 42 --epochs 30 --input-size 448
@@ -121,7 +125,7 @@ python scripts/run_lora_static_selection.py --input-dir outputs/Stanford_Cars/St
 python scripts/run_lora_static_selection.py --input-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42 --selection-file outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/fine_dinov2/fine_selection_nocenter_p0p6.csv --method-name "FINE-DINOv2 feature nocenter p=0.6" --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/fine_lora_nocenter_p0p6_seed42 --seeds 42 --epochs 30 --input-size 448
 ```
 
-如果 `nocenter p=0.6` 结果有竞争力，再补 3seed：
+`nocenter p=0.6` 的 seed 1/42/88 已完成。以下命令可用于一次性复现 3seed；当前原始结果分别保存在 `fine_lora_nocenter_p0p6_seed1`、`fine_lora_nocenter_p0p6_seed42` 和 `fine_lora_nocenter_p0p6_seed88`：
 
 ```bash
 python scripts/run_lora_static_selection.py --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 --selection-file outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/fine_dinov2/fine_selection_nocenter_p0p6.csv --method-name "FINE-DINOv2 feature nocenter p=0.6" --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/fine_lora_nocenter_p0p6_3seed --seeds 1,42,88 --epochs 30 --input-size 448
@@ -249,6 +253,6 @@ LoRA 训练超参：
 
 ## 5. 建议执行顺序
 
-1. 三个数据集的 FINE `nocenter p=0.6`、Co-teaching、JoCoR seed42 均已完成。
-2. 当前最强外部 baseline 是 FINE，但其结果具有明显数据集依赖性。
-3. 如果论文要求外部 baseline 多 seed，优先补 FINE；Co-teaching / JoCoR 当前不优先。
+1. 三个数据集的 FINE `nocenter p=0.6` seed 1/42/88 已完成；Co-teaching、JoCoR seed42 已完成。
+2. FINE 3seed 确认了明显的数据集依赖性：CUB 为 77.87 ± 0.15，Cars 为 58.26 ± 0.20，Aircraft 为 60.31 ± 0.13。
+3. PGDF auto 3seed 在 CUB、Cars、Aircraft 上分别领先 FINE 3seed `2.40`、`12.99`、`4.77 pp`；Co-teaching / JoCoR 暂不优先补多 seed。
