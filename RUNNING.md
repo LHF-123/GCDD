@@ -1,5 +1,68 @@
 # 运行说明
 
+## Validation-Selected Checkpoint Protocol
+
+以下命令运行固定 clean-validation checkpoint 协议。每条命令会依次完成：Dynamic small-loss、JAL-CE、PGDF auto、fixed-p PGDF，并对每种方法运行 seed `1,42,88`。
+
+- checkpoint 只按训练集划出的固定 clean validation Top-1 选择；官方 test 不参与训练期选择。
+- `--fixed-p 0.4` 是预先固定的全局值，不能根据本轮 test 结果调整。
+- 默认启用 post-hoc oracle test curve，仅用于补充报告；正式主指标使用 `validation_selected_test_top1`。
+- 任一运行报错会直接退出，不会跳过失败 seed 继续写完整结果。
+
+### CUB-200-2011 asym40
+
+```bash
+python scripts/run_lora_checkpoint_validation.py \
+  --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 \
+  --noise-index outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv \
+  --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/checkpoint_validation_s20250726 \
+  --seeds 1,42,88 \
+  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --validation-ratio 0.10 --validation-seed 20250726 \
+  --dynamic-ratio 0.8 --fixed-p 0.4 \
+  --warmup-epochs 5 --update-interval 5 \
+  --posthoc-oracle-test
+```
+
+### Stanford Cars asym40
+
+```bash
+python scripts/run_lora_checkpoint_validation.py \
+  --input-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42 \
+  --noise-index outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv \
+  --output-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42/checkpoint_validation_s20250726 \
+  --seeds 1,42,88 \
+  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --validation-ratio 0.10 --validation-seed 20250726 \
+  --dynamic-ratio 0.8 --fixed-p 0.4 \
+  --warmup-epochs 5 --update-interval 5 \
+  --posthoc-oracle-test
+```
+
+### FGVC-Aircraft asym40
+
+```bash
+python scripts/run_lora_checkpoint_validation.py \
+  --input-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42 \
+  --noise-index outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv \
+  --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/checkpoint_validation_s20250726 \
+  --seeds 1,42,88 \
+  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --validation-ratio 0.10 --validation-seed 20250726 \
+  --dynamic-ratio 0.8 --fixed-p 0.4 \
+  --warmup-epochs 5 --update-interval 5 \
+  --posthoc-oracle-test
+```
+
+每个输出目录优先查看：
+
+```text
+validation_manifest.csv
+checkpoint_validation_results.csv
+checkpoint_validation_summary.csv
+run_summary.md
+<method>/seed<seed>/checkpoints/best_val.pt
+```
 ## 参数优先级
 
 所有运行脚本统一使用：

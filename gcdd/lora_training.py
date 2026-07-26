@@ -98,8 +98,19 @@ def train_dinov2_lora(
     seed: int,
     path_maps: list[tuple[str, str]] | None = None,
     checkpoint_path: Path | None = None,
+    test_paths: list[str] | None = None,
+    test_labels: np.ndarray | None = None,
+    final_checkpoint_path: Path | None = None,
+    last5_checkpoint_dir: Path | None = None,
+    full_noisy_candidate_mask: np.ndarray | None = None,
+    checkpoint_protocol: str = "legacy_test_selected",
+    posthoc_oracle_test: bool = False,
 ) -> LoRARunResult:
-    """Train DINOv2 with LoRA on image data for one method and seed."""
+    """Train DINOv2 with LoRA on image data for one method and seed.
+
+    With an explicit test split, ``eval_paths`` is used only for validation-based
+    checkpoint selection; test metrics are evaluated after all epochs finish.
+    """
     import torch
     from torch.utils.data import DataLoader
     from torchvision import transforms
@@ -112,8 +123,13 @@ def train_dinov2_lora(
     train_cfg = cfg["lora_train"]
     feature_cfg = cfg["feature"]
     loss_cfg = resolve_loss_config(cfg)
-    if loss_cfg["loss_type"] == "jal_ce" and not np.all(train_mask):
-        raise ValueError("JAL-CE is a full-noisy robust-loss baseline and requires all training samples.")
+    if (test_paths is None) != (test_labels is None):
+        raise ValueError("test_paths and test_labels must be provided together.")
+    expected_jal_mask = np.ones(len(train_labels), dtype=bool) if full_noisy_candidate_mask is None else np.asarray(full_noisy_candidate_mask, dtype=bool)
+    if expected_jal_mask.shape != train_mask.shape:
+        raise ValueError("full_noisy_candidate_mask must match train_mask shape.")
+    if loss_cfg["loss_type"] == "jal_ce" and not np.array_equal(train_mask, expected_jal_mask):
+        raise ValueError("JAL-CE must use every sample in its declared full-noisy training pool.")
     device = resolve_device(torch, feature_cfg.get("device", "auto"))
     set_torch_seed(torch, seed)
 
@@ -147,6 +163,22 @@ def train_dinov2_lora(
         pin_memory=bool(train_cfg.get("pin_memory", True)),
         drop_last=False,
     )
+    test_loader = None
+    test_idx = np.array([], dtype=np.int64)
+    if test_paths is not None and test_labels is not None:
+        test_known = np.array([label in label_to_id for label in test_labels], dtype=bool)
+        test_idx = np.where(test_known)[0]
+        if len(test_idx) == 0:
+            raise ValueError("Test split has no labels that appear in the train split.")
+        test_dataset = ImageSplitDataset(test_paths, test_labels, test_idx, label_to_id, eval_transform, path_maps)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=int(train_cfg.get("eval_batch_size", train_cfg["batch_size"])),
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            pin_memory=bool(train_cfg.get("pin_memory", True)),
+            drop_last=False,
+        )
 
     model = DINOv2LoRAClassifier.make(torch, cfg, len(classes)).to(device)
     freeze_all(model.backbone)
@@ -179,14 +211,17 @@ def train_dinov2_lora(
     logs: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
+    last5_states: list[tuple[int, dict[str, Any]]] = []
+    oracle_states: list[tuple[int, dict[str, Any]]] = []
 
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
+    selection_split_name = "validation" if test_loader is not None else "eval"
     log_stage(
-        f"[lora] {method} seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, "
+        f"[lora] {method} seed={seed}: train_images={len(train_idx)}, {selection_split_name}_images={len(eval_idx)}, "
         f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}, selection=full_noisy"
         if loss_cfg["loss_type"] == "jal_ce"
-        else f"[lora] {method} seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, "
+        else f"[lora] {method} seed={seed}: train_images={len(train_idx)}, {selection_split_name}_images={len(eval_idx)}, "
         f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}"
     )
     if loss_cfg["loss_type"] == "jal_ce":
@@ -243,11 +278,68 @@ def train_dinov2_lora(
         row["best_top1"] = float(best_row["top1"])
         row["best_epoch"] = int(best_row["epoch"])
         logs.append(row)
+        epoch_state = trainable_state_dict(model)
+        last5_states.append((epoch, epoch_state))
+        if len(last5_states) > 5:
+            last5_states.pop(0)
+        if posthoc_oracle_test and test_loader is not None:
+            oracle_states.append((epoch, epoch_state))
         log_stage(
             f"[lora] {method} seed={seed} epoch {epoch}/{epochs}: "
             f"loss={row['loss']:.4f}, top1={top1:.4f}, top5={top5:.4f}"
         )
 
+    final_state = trainable_state_dict(model)
+    protocol_metrics: dict[str, Any] = {}
+    if test_loader is not None and best_state is not None and best_row is not None:
+        epoch_test_metrics: dict[int, tuple[float, float]] = {}
+        if posthoc_oracle_test:
+            epoch_test_metrics = {
+                epoch: evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))
+                for epoch, state in oracle_states
+            }
+            validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
+            final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
+            last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
+        else:
+            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            final_test_top1, final_test_top5 = evaluate_state_lora(
+                torch, model, final_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            last5_test_top1 = np.array(
+                [
+                    evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))[0]
+                    for _, state in last5_states
+                ],
+                dtype=np.float32,
+            )
+        protocol_metrics = {
+            "checkpoint_protocol": checkpoint_protocol,
+            "validation_samples": int(len(eval_idx)),
+            "test_samples": int(len(test_idx)),
+            "best_val_epoch": int(best_row["epoch"]),
+            "best_val_top1": float(best_row["top1"]),
+            "best_val_top5": float(best_row["top5"]),
+            "validation_selected_test_top1": float(validation_selected_test_top1),
+            "validation_selected_test_top5": float(validation_selected_test_top5),
+            "final_test_top1": float(final_test_top1),
+            "final_test_top5": float(final_test_top5),
+            "last5_test_mean": float(last5_test_top1.mean()),
+            "last5_test_std": float(last5_test_top1.std()),
+        }
+        if posthoc_oracle_test:
+            oracle_rows = [(epoch, *metrics) for epoch, metrics in epoch_test_metrics.items()]
+            oracle_epoch, oracle_top1, oracle_top5 = max(oracle_rows, key=lambda item: item[1])
+            protocol_metrics.update(
+                {
+                    "oracle_best_test_epoch": int(oracle_epoch),
+                    "oracle_best_test_top1": float(oracle_top1),
+                    "oracle_best_test_top5": float(oracle_top5),
+                    "oracle_best_to_final_drop": float(oracle_top1 - final_test_top1),
+                }
+            )
     if checkpoint_path is not None and best_state is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -260,13 +352,39 @@ def train_dinov2_lora(
                 "best_top1": float(best_row["top1"]) if best_row else None,
                 "loss": loss_cfg,
                 "selection": "full_noisy" if loss_cfg["loss_type"] == "jal_ce" else "provided_train_mask",
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
             },
             checkpoint_path,
         )
+    if final_checkpoint_path is not None:
+        final_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "method": method,
+                "seed": int(seed),
+                "classes": classes,
+                "state_dict": final_state,
+                "final_epoch": int(epochs),
+                "loss": loss_cfg,
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
+            },
+            final_checkpoint_path,
+        )
+    if last5_checkpoint_dir is not None:
+        last5_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        for epoch, state in last5_states:
+            torch.save(
+                {"method": method, "seed": int(seed), "classes": classes, "state_dict": state, "epoch": int(epoch), "checkpoint_protocol": checkpoint_protocol},
+                last5_checkpoint_dir / f"epoch_{epoch:03d}.pt",
+            )
 
+    summary = summarize_lora_logs(method, seed, logs)
+    summary.update(protocol_metrics)
     return LoRARunResult(
         logs=logs,
-        summary=summarize_lora_logs(method, seed, logs),
+        summary=summary,
         trainable_modules=trainable_modules,
         trainable_params=trainable_params,
         total_params=total_params,
@@ -364,6 +482,21 @@ def evaluate_lora(torch: Any, model: Any, loader: Any, device: str, num_classes:
     return safe_ratio(top1, total), safe_ratio(top5, total)
 
 
+def evaluate_state_lora(
+    torch: Any,
+    model: Any,
+    state_dict: dict[str, Any],
+    loader: Any,
+    device: str,
+    num_classes: int,
+    amp: bool,
+) -> tuple[float, float]:
+    """Evaluate a trainable-only LoRA/head state without rebuilding the frozen backbone."""
+    model.load_state_dict(state_dict, strict=False)
+    model.to(device)
+    return evaluate_lora(torch, model, loader, device, num_classes, amp)
+
+
 def build_scheduler(torch: Any, optimizer: Any, total_steps: int, warmup_steps: int, scheduler: str) -> Any:
     if scheduler == "none":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
@@ -403,12 +536,12 @@ def summarize_lora_logs(method: str, seed: int, logs: list[dict[str, Any]]) -> d
         "last5_std": float(last5_top1.std()),
         "trainable_params": int(final["trainable_params"]),
         "total_params": int(final["total_params"]),
-        "loss_type": str(final["loss_type"]),
-        "jal_alpha": final["jal_alpha"],
-        "jal_beta": final["jal_beta"],
-        "jal_a": final["jal_a"],
-        "jal_eps": final["jal_eps"],
-        "selection_mode": str(final["selection_mode"]),
+        "loss_type": str(final.get("loss_type", "ce")),
+        "jal_alpha": final.get("jal_alpha", ""),
+        "jal_beta": final.get("jal_beta", ""),
+        "jal_a": final.get("jal_a", ""),
+        "jal_eps": final.get("jal_eps", ""),
+        "selection_mode": str(final.get("selection_mode", "dynamic_or_provided_mask")),
     }
 
 

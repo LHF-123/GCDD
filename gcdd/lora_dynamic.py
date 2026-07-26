@@ -16,6 +16,7 @@ from .lora_training import (
     count_total_params,
     count_trainable_params,
     evaluate_lora,
+    evaluate_state_lora,
     freeze_all,
     inject_lora,
     lora_parameters,
@@ -58,13 +59,25 @@ def train_dynamic_loss_lora(
     proto_keep_ratio: float | None = None,
     auto_proto_keep: dict[str, float] | None = None,
     checkpoint_path: Path | None = None,
+    test_paths: list[str] | None = None,
+    test_labels: np.ndarray | None = None,
+    final_checkpoint_path: Path | None = None,
+    last5_checkpoint_dir: Path | None = None,
+    checkpoint_protocol: str = "legacy_test_selected",
+    posthoc_oracle_test: bool = False,
 ) -> DynamicLossRunResult:
-    """Train DINOv2-LoRA with periodically updated class-wise small-loss selection."""
+    """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
+
+    With an explicit test split, ``eval_paths`` is reserved for validation-only
+    checkpoint selection and test metrics are evaluated after fitting.
+    """
     import torch
     from torch.utils.data import DataLoader
     from torchvision import transforms
 
     validate_dynamic_args(retention_ratio, warmup_epochs, update_interval, proto_keep_ratio, auto_proto_keep)
+    if (test_paths is None) != (test_labels is None):
+        raise ValueError("test_paths and test_labels must be provided together.")
     path_maps = path_maps or []
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
     if candidate_mask.shape != (len(train_labels),):
@@ -108,6 +121,22 @@ def train_dynamic_loss_lora(
         pin_memory=bool(train_cfg.get("pin_memory", True)),
         drop_last=False,
     )
+    test_loader = None
+    test_idx = np.array([], dtype=np.int64)
+    if test_paths is not None and test_labels is not None:
+        test_known = np.array([label in label_to_id for label in test_labels], dtype=bool)
+        test_idx = np.where(test_known)[0]
+        if len(test_idx) == 0:
+            raise ValueError("Test split has no labels that appear in the train split.")
+        test_dataset = ImageSplitDataset(test_paths, test_labels, test_idx, label_to_id, eval_transform, path_maps)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=int(train_cfg.get("eval_batch_size", train_cfg["batch_size"])),
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            pin_memory=bool(train_cfg.get("pin_memory", True)),
+            drop_last=False,
+        )
 
     candidate_idx = np.where(candidate_mask)[0]
     loss_dataset = ImageSplitDataset(train_paths, train_labels, candidate_idx, label_to_id, eval_transform, path_maps)
@@ -161,15 +190,18 @@ def train_dynamic_loss_lora(
     per_class_rows: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
+    last5_states: list[tuple[int, dict[str, Any]]] = []
+    oracle_states: list[tuple[int, dict[str, Any]]] = []
     selected_proto_keep_ratio = proto_keep_ratio
     auto_proto_jaccard: float | None = None
 
     selected_mask = candidate_mask.copy()
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
+    selection_split_name = "validation" if test_loader is not None else "eval"
     log_stage(
         f"[dynamic-loss] {method} seed={seed}: candidates={int(candidate_mask.sum())}, "
-        f"eval_images={len(eval_idx)}, retention_ratio={retention_ratio:.3f}, "
+        f"{selection_split_name}_images={len(eval_idx)}, retention_ratio={retention_ratio:.3f}, "
         f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
         f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
     )
@@ -226,6 +258,12 @@ def train_dynamic_loss_lora(
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
             best_row = row
             best_state = trainable_state_dict(model)
+        epoch_state = trainable_state_dict(model)
+        last5_states.append((epoch, epoch_state))
+        if len(last5_states) > 5:
+            last5_states.pop(0)
+        if posthoc_oracle_test and test_loader is not None:
+            oracle_states.append((epoch, epoch_state))
         log_stage(
             f"[dynamic-loss] {method} seed={seed} epoch {epoch}/{epochs}: "
             f"loss={row['loss']:.4f}, top1={top1:.4f}, selected={len(epoch_train_idx)}"
@@ -305,6 +343,57 @@ def train_dynamic_loss_lora(
                 f"selected={int(selected_mask.sum())}, prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}"
             )
 
+    final_state = trainable_state_dict(model)
+    protocol_metrics: dict[str, Any] = {}
+    if test_loader is not None and best_state is not None and best_row is not None:
+        epoch_test_metrics: dict[int, tuple[float, float]] = {}
+        if posthoc_oracle_test:
+            epoch_test_metrics = {
+                epoch: evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))
+                for epoch, state in oracle_states
+            }
+            validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
+            final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
+            last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
+        else:
+            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            final_test_top1, final_test_top5 = evaluate_state_lora(
+                torch, model, final_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            last5_test_top1 = np.array(
+                [
+                    evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))[0]
+                    for _, state in last5_states
+                ],
+                dtype=np.float32,
+            )
+        protocol_metrics = {
+            "checkpoint_protocol": checkpoint_protocol,
+            "validation_samples": int(len(eval_idx)),
+            "test_samples": int(len(test_idx)),
+            "best_val_epoch": int(best_row["epoch"]),
+            "best_val_top1": float(best_row["top1"]),
+            "best_val_top5": float(best_row["top5"]),
+            "validation_selected_test_top1": float(validation_selected_test_top1),
+            "validation_selected_test_top5": float(validation_selected_test_top5),
+            "final_test_top1": float(final_test_top1),
+            "final_test_top5": float(final_test_top5),
+            "last5_test_mean": float(last5_test_top1.mean()),
+            "last5_test_std": float(last5_test_top1.std()),
+        }
+        if posthoc_oracle_test:
+            oracle_rows = [(epoch, *metrics) for epoch, metrics in epoch_test_metrics.items()]
+            oracle_epoch, oracle_top1, oracle_top5 = max(oracle_rows, key=lambda item: item[1])
+            protocol_metrics.update(
+                {
+                    "oracle_best_test_epoch": int(oracle_epoch),
+                    "oracle_best_test_top1": float(oracle_top1),
+                    "oracle_best_test_top5": float(oracle_top5),
+                    "oracle_best_to_final_drop": float(oracle_top1 - final_test_top1),
+                }
+            )
     if checkpoint_path is not None and best_state is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -321,11 +410,41 @@ def train_dynamic_loss_lora(
                 "auto_proto_jaccard": auto_proto_jaccard,
                 "warmup_epochs": int(warmup_epochs),
                 "update_interval": int(update_interval),
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
             },
             checkpoint_path,
         )
+    if final_checkpoint_path is not None:
+        final_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "method": method,
+                "seed": int(seed),
+                "classes": classes,
+                "state_dict": final_state,
+                "final_epoch": int(epochs),
+                "retention_ratio": float(retention_ratio),
+                "proto_keep_ratio": selected_proto_keep_ratio,
+                "auto_proto_keep": auto_proto_keep is not None,
+                "auto_proto_jaccard": auto_proto_jaccard,
+                "warmup_epochs": int(warmup_epochs),
+                "update_interval": int(update_interval),
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
+            },
+            final_checkpoint_path,
+        )
+    if last5_checkpoint_dir is not None:
+        last5_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        for epoch, state in last5_states:
+            torch.save(
+                {"method": method, "seed": int(seed), "classes": classes, "state_dict": state, "epoch": int(epoch), "checkpoint_protocol": checkpoint_protocol},
+                last5_checkpoint_dir / f"epoch_{epoch:03d}.pt",
+            )
 
     summary = summarize_lora_logs(method, seed, logs)
+    summary.update(protocol_metrics)
     summary.update(
         {
             "retention_ratio": float(retention_ratio),
