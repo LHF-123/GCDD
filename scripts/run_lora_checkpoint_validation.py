@@ -34,18 +34,18 @@ from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
 
 
-METHODS = ("dynamic", "jal_ce", "pgdf_auto", "pgdf_fixed")
+METHODS = ("all_noisy", "dynamic", "jal_ce", "pgdf_auto", "pgdf_fixed")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Dynamic, JAL-CE, PGDF-auto, and fixed-p PGDF with fixed clean validation checkpoint selection."
+        description="Run all-noisy CE, Dynamic, JAL-CE, PGDF-auto, and fixed-p PGDF with fixed clean validation checkpoint selection."
     )
     parser.add_argument("--input-dir", required=True, help="V1 directory containing paths.txt, labels.npy, features_*.npy, and official test files.")
     parser.add_argument("--noise-index", required=True, help="Synthetic-noise index CSV containing clean_label for the original train split.")
     parser.add_argument("--config", help="Optional YAML merged over <input-dir>/resolved_config.yaml for all methods.")
     parser.add_argument("--output-dir", help="Defaults to <input-dir>/checkpoint_validation_s<validation-seed>.")
-    parser.add_argument("--methods", default=",".join(METHODS), help="Comma-separated methods: dynamic,jal_ce,pgdf_auto,pgdf_fixed.")
+    parser.add_argument("--methods", default=",".join(METHODS), help="Comma-separated methods: all_noisy,dynamic,jal_ce,pgdf_auto,pgdf_fixed.")
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
     parser.add_argument("--validation-ratio", type=float, default=0.10, help="Fixed clean validation fraction per clean class.")
     parser.add_argument("--validation-seed", type=int, default=20250726, help="Dataset-level seed used once to create the shared validation manifest.")
@@ -156,8 +156,13 @@ def main() -> None:
             checkpoints = run_dir / "checkpoints"
             run_cfg = copy.deepcopy(cfg)
             run_cfg["lora_train"]["seed"] = int(seed)
-            if method_key == "jal_ce":
-                configure_jal(run_cfg, args)
+            if method_key in {"all_noisy", "jal_ce"}:
+                if method_key == "jal_ce":
+                    configure_jal(run_cfg, args)
+                    method_name = "JAL-CE-DINOv2+LoRA (full noisy training pool)"
+                else:
+                    run_cfg["loss_type"] = "ce"
+                    method_name = "DINOv2+LoRA all noisy CE (full noisy training pool)"
                 result = train_dinov2_lora(
                     data["train_paths"],
                     data["train_labels"],
@@ -165,7 +170,7 @@ def main() -> None:
                     validation_labels,
                     split.train_mask,
                     run_cfg,
-                    method="JAL-CE-DINOv2+LoRA (full noisy training pool)",
+                    method=method_name,
                     seed=seed,
                     path_maps=path_maps,
                     checkpoint_path=checkpoints / "best_val.pt",

@@ -16,9 +16,16 @@ from gcdd.checkpoint_validation import (
 from gcdd.lora_training import summarize_lora_logs
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.lora_dynamic import train_dynamic_loss_lora
+from scripts.run_lora_checkpoint_validation import METHODS, parse_methods
 
 
 class CheckpointValidationTests(unittest.TestCase):
+    def test_all_noisy_is_an_explicit_checkpoint_validation_method(self) -> None:
+        methods = parse_methods("all_noisy,dynamic,jal_ce,pgdf_auto,pgdf_fixed")
+
+        self.assertEqual(list(METHODS), methods)
+        self.assertEqual("all_noisy", methods[0])
+
     def test_fixed_validation_manifest_is_reused_and_class_stratified(self) -> None:
         paths = [f"/dataset/images/{label}/{index}.jpg" for label in ("A", "B") for index in range(10)]
         clean_labels = np.array(["A"] * 10 + ["B"] * 10)

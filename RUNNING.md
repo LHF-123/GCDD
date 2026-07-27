@@ -2,7 +2,7 @@
 
 ## Validation-Selected Checkpoint Protocol
 
-以下命令运行固定 clean-validation checkpoint 协议。每条命令会依次完成：Dynamic small-loss、JAL-CE、PGDF auto、fixed-p PGDF，并对每种方法运行 seed `1,42,88`。
+以下命令运行固定 clean-validation checkpoint 协议。入口支持 LoRA all noisy CE、Dynamic small-loss、JAL-CE、PGDF auto、fixed-p PGDF，并对每种方法运行 seed `1,42,88`。下方现有 asym40 命令显式保留了当时已完成的四方法；要运行完整五方法，请使用 `--methods all_noisy,dynamic,jal_ce,pgdf_auto,pgdf_fixed`。
 
 - checkpoint 只按训练集划出的固定 clean validation Top-1 选择；官方 test 不参与训练期选择。
 - `--fixed-p 0.4` 是预先固定的全局值，不能根据本轮 test 结果调整。
