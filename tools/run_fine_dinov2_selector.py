@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,12 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json
+from gcdd.baselines import compute_fine_scores, select_fine_classwise
 from gcdd.selection_utils import build_gt_clean_mask_from_noise_rows
+
+
+# Backward-compatible public name used by existing tests and analysis code.
+select_classwise = select_fine_classwise
 
 
 SCORE_FIELDS = ["index", "path", "web_label", "score_mode", "fine_score", "class_size", "small_class"]
@@ -87,50 +91,6 @@ def main() -> None:
         },
     )
     print(f"FINE-style DINOv2 selections written to {output_dir}", flush=True)
-
-
-def compute_fine_scores(features: np.ndarray, labels: np.ndarray, *, center: bool, min_class_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    normalized = l2_normalize(features.astype(np.float32))
-    scores = np.zeros(len(labels), dtype=np.float32)
-    class_size = np.zeros(len(labels), dtype=np.int32)
-    small_class = np.zeros(len(labels), dtype=bool)
-    for label in sorted(set(labels.tolist())):
-        idx = np.where(labels == label)[0]
-        class_size[idx] = len(idx)
-        if len(idx) < min_class_size:
-            small_class[idx] = True
-            scores[idx] = 0.0
-            continue
-        x = normalized[idx]
-        if center:
-            mu = x.mean(axis=0, keepdims=True)
-            x_svd = x - mu
-        else:
-            mu = None
-            x_svd = x
-        try:
-            _, _, vt = np.linalg.svd(x_svd, full_matrices=False)
-        except np.linalg.LinAlgError as exc:
-            raise RuntimeError(f"SVD failed for class {label} with {len(idx)} samples.") from exc
-        v1 = vt[0]
-        class_scores = np.abs((x - mu) @ v1) if center and mu is not None else np.abs(x @ v1)
-        scores[idx] = class_scores.astype(np.float32)
-    return scores, class_size, small_class
-
-
-def select_classwise(scores: np.ndarray, labels: np.ndarray, keep_ratio: float, small_class: np.ndarray) -> np.ndarray:
-    selected = np.zeros(len(labels), dtype=bool)
-    for label in sorted(set(labels.tolist())):
-        idx = np.where(labels == label)[0]
-        if len(idx) == 0:
-            continue
-        if np.all(small_class[idx]):
-            selected[idx] = True
-            continue
-        keep = len(idx) if keep_ratio >= 1.0 else max(1, int(math.floor(len(idx) * keep_ratio)))
-        order = np.argsort(-scores[idx], kind="mergesort")
-        selected[idx[order[:keep]]] = True
-    return selected
 
 
 def build_score_rows(paths: list[str], labels: np.ndarray, scores: np.ndarray, class_size: np.ndarray, small_class: np.ndarray, mode: str) -> list[dict[str, Any]]:

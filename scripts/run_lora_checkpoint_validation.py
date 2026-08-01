@@ -25,27 +25,46 @@ from gcdd.checkpoint_validation import (
     PROTOCOL_NAME,
     build_or_load_fixed_validation_split,
     build_validation_safe_pgdf_reference,
+    build_validation_safe_static_selections,
     load_clean_labels_from_noise_index,
 )
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, write_csv, write_json, write_yaml
 from gcdd.lora_dynamic import train_dynamic_loss_lora
+from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
 
 
-METHODS = ("all_noisy", "dynamic", "jal_ce", "pgdf_auto", "pgdf_fixed")
+METHODS = (
+    "all_noisy",
+    "full_gcdd",
+    "centroid",
+    "both_only",
+    "gcdd_proto",
+    "fine",
+    "dynamic_r08",
+    "dynamic_r09",
+    "jal_ce",
+    "coteaching",
+    "jocor",
+    "pgdf_auto",
+    "pgdf_fixed",
+)
+STATIC_METHODS = ("full_gcdd", "centroid", "both_only", "gcdd_proto", "fine")
+DYNAMIC_METHODS = ("dynamic", "dynamic_r08", "dynamic_r09", "pgdf_auto", "pgdf_fixed")
+LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run all-noisy CE, Dynamic, JAL-CE, PGDF-auto, and fixed-p PGDF with fixed clean validation checkpoint selection."
+        description="Run all 13 comparison methods with fixed clean validation checkpoint selection."
     )
     parser.add_argument("--input-dir", required=True, help="V1 directory containing paths.txt, labels.npy, features_*.npy, and official test files.")
     parser.add_argument("--noise-index", required=True, help="Synthetic-noise index CSV containing clean_label for the original train split.")
     parser.add_argument("--config", help="Optional YAML merged over <input-dir>/resolved_config.yaml for all methods.")
-    parser.add_argument("--output-dir", help="Defaults to <input-dir>/checkpoint_validation_s<validation-seed>.")
-    parser.add_argument("--methods", default=",".join(METHODS), help="Comma-separated methods: all_noisy,dynamic,jal_ce,pgdf_auto,pgdf_fixed.")
+    parser.add_argument("--output-dir", help="Defaults to <input-dir>/checkpoint_validation_all_methods_s<validation-seed>.")
+    parser.add_argument("--methods", default="all", help="Use 'all' for all 13 methods, or a comma-separated subset. Legacy key dynamic aliases dynamic_r08.")
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
     parser.add_argument("--validation-ratio", type=float, default=0.10, help="Fixed clean validation fraction per clean class.")
     parser.add_argument("--validation-seed", type=int, default=20250726, help="Dataset-level seed used once to create the shared validation manifest.")
@@ -61,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-p-low", type=float, default=0.5)
     parser.add_argument("--auto-p-very-low", type=float, default=0.4)
     parser.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW", help="Map stored image root to local image root.")
-    parser.add_argument("--posthoc-oracle-test", dest="posthoc_oracle_test", action="store_true", default=True, help="After fitting, evaluate every epoch state on test only for a clearly labelled oracle supplement.")
+    parser.add_argument("--posthoc-oracle-test", dest="posthoc_oracle_test", action="store_true", default=False, help="After fitting, evaluate every epoch state on test only for a clearly labelled oracle supplement.")
     parser.add_argument("--no-posthoc-oracle-test", dest="posthoc_oracle_test", action="store_false", help="Skip the optional oracle test curve; main validation-selected and final metrics remain available.")
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
     parser.add_argument("--batch-size", type=int, help="Override LoRA training batch size.")
@@ -83,6 +102,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jal-beta", type=float, help="Override JAL-CE beta. Defaults to YAML, then 1.0.")
     parser.add_argument("--jal-a", type=float, help="Override JAL-CE AMSE scale. Defaults to YAML, then 30.0.")
     parser.add_argument("--jal-eps", type=float, help="Override JAL-CE epsilon. Defaults to YAML, then 1e-8.")
+    parser.add_argument("--dual-batch-size", type=int, default=16, help="Per-device batch size for two-branch Co-teaching/JoCoR runs.")
+    parser.add_argument("--dual-grad-accum-steps", type=int, default=2, help="Gradient accumulation steps for two-branch runs.")
+    parser.add_argument("--jocor-lambda", type=float, default=0.1, help="JoCoR symmetric-KL weight.")
     return parser.parse_args()
 
 
@@ -92,11 +114,18 @@ def main() -> None:
     noise_index = Path(args.noise_index)
     if not noise_index.exists():
         raise FileNotFoundError(f"Noise index does not exist: {noise_index}")
-    output_dir = Path(args.output_dir) if args.output_dir else input_dir / f"checkpoint_validation_s{args.validation_seed}"
+    output_dir = Path(args.output_dir) if args.output_dir else input_dir / f"checkpoint_validation_all_methods_s{args.validation_seed}"
+    legacy_output_dir = input_dir / f"checkpoint_validation_s{args.validation_seed}"
+    if output_dir.resolve() == legacy_output_dir.resolve() and output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(
+            f"Refusing to write into legacy raw-output directory {output_dir}. "
+            "Use a new --output-dir such as checkpoint_validation_all_methods_s<validation-seed>."
+        )
     ensure_dir(output_dir)
 
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
+    preflight_run_dirs(output_dir, methods, seeds)
     path_maps = parse_path_maps(args.path_map)
     cfg = load_config(input_dir, Path(args.config) if args.config else None)
     apply_lora_defaults(cfg)
@@ -113,6 +142,14 @@ def main() -> None:
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
+        "two_branch": {
+            "remember_mode": "fixed",
+            "remember_rate": 0.8,
+            "batch_size": int(args.dual_batch_size),
+            "grad_accum_steps": int(args.dual_grad_accum_steps),
+            "jocor_lambda": float(args.jocor_lambda),
+            "selection_metric": "arithmetic mean of branch A/B validation Top-1; not ensemble prediction",
+        },
     }
     write_yaml(output_dir / "resolved_config.yaml", cfg)
 
@@ -134,14 +171,27 @@ def main() -> None:
         f"official_test={len(data['test_paths'])}; test is not evaluated during fitting."
     )
 
+    canonical_methods = [canonical_method_key(method) for method in methods]
     pgdf_reference: dict[str, Any] | None = None
-    if any(method.startswith("pgdf_") for method in methods):
-        log_stage("[2/5] Recomputing graph budget, centroid reference, and prototype scores on the training pool only.")
+    static_selections: dict[str, dict[str, Any]] = {}
+    graph_methods_requested = any(method in STATIC_METHODS or method.startswith("pgdf_") for method in canonical_methods)
+    if graph_methods_requested:
+        log_stage("[2/5] Recomputing graph/static references on the training pool only.")
         features = load_pgdf_features(input_dir, len(data["train_paths"]))
         pgdf_reference = build_validation_safe_pgdf_reference(features, data["train_labels"], split.train_mask, cfg)
         write_pgdf_reference(output_dir, data, split.train_mask, pgdf_reference)
+        if any(method in STATIC_METHODS for method in canonical_methods):
+            static_selections = build_validation_safe_static_selections(
+                features,
+                data["train_labels"],
+                split.train_mask,
+                cfg,
+                pgdf_reference=pgdf_reference,
+                fine_keep_ratio=0.6,
+                fine_center=False,
+            )
     else:
-        log_stage("[2/5] PGDF was not requested; skipping validation-safe graph reference construction.")
+        log_stage("[2/5] No graph/static method requested; skipping validation-safe reference construction.")
 
     auto_rule = build_auto_rule(args)
     all_logs: list[dict[str, Any]] = []
@@ -150,25 +200,41 @@ def main() -> None:
     run_index: list[dict[str, Any]] = []
     log_stage("[3/5] Running methods and seeds sequentially. A failed run raises immediately; later runs are not silently accepted.")
     for method_key in methods:
+        canonical_key = canonical_method_key(method_key)
         for seed in seeds:
             run_dir = output_dir / method_key / f"seed{seed}"
+            require_fresh_run_dir(run_dir)
             ensure_dir(run_dir)
             checkpoints = run_dir / "checkpoints"
             run_cfg = copy.deepcopy(cfg)
             run_cfg["lora_train"]["seed"] = int(seed)
-            if method_key in {"all_noisy", "jal_ce"}:
-                if method_key == "jal_ce":
+            selection_record = ""
+            if canonical_key in {"all_noisy", "jal_ce", *STATIC_METHODS}:
+                if canonical_key == "jal_ce":
                     configure_jal(run_cfg, args)
                     method_name = "JAL-CE-DINOv2+LoRA (full noisy training pool)"
+                    train_mask = split.train_mask
+                    selection_mode = "full_noisy_training_pool"
+                    static_score = np.full(len(train_mask), np.nan, dtype=np.float32)
+                elif canonical_key in STATIC_METHODS:
+                    run_cfg["loss_type"] = "ce"
+                    static_info = static_selections[canonical_key]
+                    train_mask = np.asarray(static_info["mask"], dtype=bool)
+                    selection_mode = str(static_info["selection_mode"])
+                    static_score = np.asarray(static_info["score"], dtype=np.float32)
+                    method_name = static_method_name(canonical_key)
                 else:
                     run_cfg["loss_type"] = "ce"
                     method_name = "DINOv2+LoRA all noisy CE (full noisy training pool)"
+                    train_mask = split.train_mask
+                    selection_mode = "full_noisy_training_pool"
+                    static_score = np.full(len(train_mask), np.nan, dtype=np.float32)
                 result = train_dinov2_lora(
                     data["train_paths"],
                     data["train_labels"],
                     validation_paths,
                     validation_labels,
-                    split.train_mask,
+                    train_mask,
                     run_cfg,
                     method=method_name,
                     seed=seed,
@@ -182,32 +248,47 @@ def main() -> None:
                     checkpoint_protocol=PROTOCOL_NAME,
                     posthoc_oracle_test=bool(args.posthoc_oracle_test),
                 )
-                all_logs.extend(result.logs)
-                result_row = {"method_key": method_key, **result.summary}
-            else:
+                selection_record = str(run_dir / "static_selection.csv")
+                write_static_selection(
+                    Path(selection_record), data, split.train_mask, train_mask, static_score, selection_mode
+                )
+                result_row = finalize_result_row(
+                    method_key,
+                    result.summary,
+                    selection_mode,
+                    selected_count=int(train_mask.sum()),
+                    candidate_count=int(split.train_mask.sum()),
+                )
+            elif canonical_key in DYNAMIC_METHODS:
                 run_cfg["loss_type"] = "ce"
-                if method_key == "dynamic":
-                    method_name = f"DINOv2 LoRA Dynamic small-loss r={args.dynamic_ratio:g}"
+                if canonical_key in {"dynamic_r08", "dynamic_r09"}:
+                    retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
+                    method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
                     proto_scores = None
                     centroid_mask = None
                     proto_keep_ratio = None
                     auto_proto_keep = None
-                elif method_key == "pgdf_auto":
+                    selection_mode = f"dynamic_training_pool_small_loss_r{retention_ratio:g}"
+                elif canonical_key == "pgdf_auto":
                     if pgdf_reference is None:
                         raise RuntimeError("PGDF reference was not constructed.")
+                    retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA PGDF-auto r={args.dynamic_ratio:g}"
                     proto_scores = pgdf_reference["proto_scores"]
                     centroid_mask = pgdf_reference["centroid_reference_mask"]
                     proto_keep_ratio = None
                     auto_proto_keep = auto_rule
+                    selection_mode = "pgdf_auto_training_pool_dynamic_loss_and_prototype"
                 else:
                     if pgdf_reference is None:
                         raise RuntimeError("PGDF reference was not constructed.")
+                    retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA PGDF fixed-p r={args.dynamic_ratio:g} p={args.fixed_p:g}"
                     proto_scores = pgdf_reference["proto_scores"]
                     centroid_mask = pgdf_reference["centroid_reference_mask"]
                     proto_keep_ratio = float(args.fixed_p)
                     auto_proto_keep = None
+                    selection_mode = "pgdf_fixed_training_pool_dynamic_loss_and_prototype"
                 result = train_dynamic_loss_lora(
                     data["train_paths"],
                     data["train_labels"],
@@ -217,7 +298,7 @@ def main() -> None:
                     run_cfg,
                     method=method_name,
                     seed=seed,
-                    retention_ratio=float(args.dynamic_ratio),
+                    retention_ratio=retention_ratio,
                     warmup_epochs=int(args.warmup_epochs),
                     update_interval=int(args.update_interval),
                     path_maps=path_maps,
@@ -233,12 +314,82 @@ def main() -> None:
                     checkpoint_protocol=PROTOCOL_NAME,
                     posthoc_oracle_test=bool(args.posthoc_oracle_test),
                 )
-                all_logs.extend(result.logs)
                 all_updates.extend(result.update_rows)
                 write_csv(run_dir / "selection_rows.csv", result.selection_rows, selection_fields())
                 write_csv(run_dir / "selection_updates.csv", result.update_rows, update_fields())
                 write_csv(run_dir / "selection_per_class.csv", result.per_class_rows, per_class_fields())
-                result_row = {"method_key": method_key, **result.summary}
+                selection_record = str(run_dir / "selection_rows.csv")
+                result_row = finalize_result_row(
+                    method_key,
+                    result.summary,
+                    selection_mode,
+                    selected_count=int(result.summary["final_selected_samples"]),
+                    candidate_count=int(result.summary["candidate_samples"]),
+                )
+            elif canonical_key in {"coteaching", "jocor"}:
+                run_cfg["loss_type"] = "ce"
+                run_cfg["lora_train"]["batch_size"] = int(args.dual_batch_size)
+                method_name = (
+                    "Co-teaching-DINOv2+LoRA fixed r=0.8 (two-branch validation mean)"
+                    if canonical_key == "coteaching"
+                    else f"JoCoR-DINOv2+LoRA r=0.8 lambda={args.jocor_lambda:g} (two-branch validation mean)"
+                )
+                dual_kwargs: dict[str, Any] = {
+                    "train_paths": data["train_paths"],
+                    "train_labels": data["train_labels"],
+                    "eval_paths": validation_paths,
+                    "eval_labels": validation_labels,
+                    "train_mask": split.train_mask,
+                    "cfg": run_cfg,
+                    "method": method_name,
+                    "seed": seed,
+                    "remember_mode": "fixed",
+                    "remember_rate": 0.8,
+                    "final_remember_rate": 0.8,
+                    "warmup_epochs": int(args.warmup_epochs),
+                    "grad_accum_steps": int(args.dual_grad_accum_steps),
+                    "path_maps": path_maps,
+                    # Synthetic clean/noisy GT is intentionally not supplied to
+                    # either training decision path in the unified protocol.
+                    "gt_clean_mask": None,
+                    "checkpoint_path": checkpoints / "best_val.pt",
+                    "test_paths": data["test_paths"],
+                    "test_labels": data["test_labels"],
+                    "final_checkpoint_path": checkpoints / "last.pt",
+                    "last5_checkpoint_dir": checkpoints / "last5",
+                    "checkpoint_protocol": PROTOCOL_NAME,
+                    "posthoc_oracle_test": bool(args.posthoc_oracle_test),
+                }
+                if canonical_key == "jocor":
+                    dual_kwargs["lambda_cor"] = float(args.jocor_lambda)
+                    result = train_jocor_lora(**dual_kwargs)
+                else:
+                    result = train_coteaching_lora(**dual_kwargs)
+                selection_record = str(run_dir / "selection_history.csv")
+                write_csv(Path(selection_record), result.logs, dual_selection_fields())
+                result_row = finalize_result_row(
+                    method_key,
+                    result.summary,
+                    "two_branch_mean_validation_top1",
+                    selected_count=float(result.summary["final_selected_count"]),
+                    candidate_count=int(split.train_mask.sum()),
+                )
+            else:
+                raise RuntimeError(f"Unhandled method: {method_key}")
+
+            all_logs.extend(result.logs)
+            write_csv(run_dir / "train_log.csv", result.logs, train_log_fields())
+            write_json(
+                run_dir / "selection_policy.json",
+                {
+                    "method_key": method_key,
+                    "selection_mode": result_row["selection_mode"],
+                    "selected_count": result_row["selected_count"],
+                    "selection_ratio": result_row["selection_ratio"],
+                    "validation_samples_are_training_candidates": False,
+                    "official_test_used_for_checkpoint_selection": False,
+                },
+            )
             all_results.append(result_row)
             write_json(run_dir / "result.json", result_row)
             run_index.append(
@@ -248,6 +399,7 @@ def main() -> None:
                     "run_dir": str(run_dir),
                     "best_val_checkpoint": str(checkpoints / "best_val.pt"),
                     "last_checkpoint": str(checkpoints / "last.pt"),
+                    "selection_record": selection_record,
                     "status": "complete",
                 }
             )
@@ -256,7 +408,7 @@ def main() -> None:
     write_csv(output_dir / "train_log.csv", all_logs, train_log_fields())
     write_csv(output_dir / "checkpoint_validation_results.csv", all_results, result_fields())
     write_csv(output_dir / "checkpoint_validation_updates.csv", all_updates, update_fields())
-    write_csv(output_dir / "run_index.csv", run_index, ["method_key", "seed", "run_dir", "best_val_checkpoint", "last_checkpoint", "status"])
+    write_csv(output_dir / "run_index.csv", run_index, ["method_key", "seed", "run_dir", "best_val_checkpoint", "last_checkpoint", "selection_record", "status"])
     summary = summarize_methods(all_results)
     write_csv(output_dir / "checkpoint_validation_summary.csv", summary, summary_fields())
     write_json(
@@ -323,6 +475,82 @@ def write_pgdf_reference(output_dir: Path, data: dict[str, Any], training_pool_m
         for label, count in sorted(reference["per_class_keep_counts"].items())
     ]
     write_csv(output_dir / "pgdf_training_pool_budget.csv", per_class, ["noisy_label", "gcdd_clean_budget_q_c"])
+
+
+def write_static_selection(
+    path: Path,
+    data: dict[str, Any],
+    training_pool_mask: np.ndarray,
+    selected_mask: np.ndarray,
+    scores: np.ndarray,
+    selection_mode: str,
+) -> None:
+    """Write an original-index-aligned static selection audit."""
+    rows = []
+    for index, sample_path in enumerate(data["train_paths"]):
+        in_pool = bool(training_pool_mask[index])
+        score = float(scores[index]) if in_pool and np.isfinite(scores[index]) else ""
+        rows.append(
+            {
+                "index": int(index),
+                "path": sample_path,
+                "noisy_label": str(data["train_labels"][index]),
+                "partition": "training_pool" if in_pool else "validation",
+                "eligible": "yes" if in_pool else "no",
+                "selected": "yes" if selected_mask[index] else "no",
+                "state": "clean" if selected_mask[index] else "ignored",
+                "score": score,
+                "selection_mode": selection_mode,
+            }
+        )
+    write_csv(
+        path,
+        rows,
+        ["index", "path", "noisy_label", "partition", "eligible", "selected", "state", "score", "selection_mode"],
+    )
+
+
+def static_method_name(method_key: str) -> str:
+    names = {
+        "full_gcdd": "DINOv2 LoRA + Full GCDD-clean (training-pool-only)",
+        "centroid": "DINOv2 LoRA + Centroid filtering (training-pool-only GCDD budget)",
+        "both_only": "DINOv2 LoRA + both only (training-pool-only intersection)",
+        "gcdd_proto": "DINOv2 LoRA + GCDD+Proto (training-pool-only)",
+        "fine": "FINE-DINOv2 feature nocenter p=0.6 (training-pool-only)",
+    }
+    return names[method_key]
+
+
+def finalize_result_row(
+    method_key: str,
+    summary: dict[str, Any],
+    selection_mode: str,
+    *,
+    selected_count: int | float,
+    candidate_count: int,
+) -> dict[str, Any]:
+    row = {"method_key": method_key, **summary}
+    row["selection_mode"] = selection_mode
+    row["selected_count"] = selected_count
+    row["selection_ratio"] = float(selected_count) / max(1, candidate_count)
+    row.setdefault("candidate_samples", int(candidate_count))
+    return row
+
+
+def require_fresh_run_dir(run_dir: Path) -> None:
+    """Protect completed or partial raw runs from accidental overwrite."""
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise FileExistsError(
+            f"Run directory is not empty and will not be overwritten: {run_dir}. "
+            "Choose a new --output-dir or remove/move the partial run explicitly."
+        )
+
+
+def preflight_run_dirs(output_dir: Path, methods: list[str], seeds: list[int]) -> None:
+    """Check the complete request before any config/reference file is rewritten."""
+    for method_key in methods:
+        for seed in seeds:
+            require_fresh_run_dir(output_dir / method_key / f"seed{seed}")
 
 
 def load_config(input_dir: Path, override_path: Path | None) -> dict[str, Any]:
@@ -429,18 +657,43 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dynamic-ratio and --fixed-p must be in (0, 1].")
     if args.warmup_epochs < 0 or args.update_interval <= 0:
         raise ValueError("--warmup-epochs must be non-negative and --update-interval must be positive.")
+    if args.dual_batch_size <= 0 or args.dual_grad_accum_steps <= 0:
+        raise ValueError("--dual-batch-size and --dual-grad-accum-steps must be positive.")
+    if args.jocor_lambda < 0.0:
+        raise ValueError("--jocor-lambda must be non-negative.")
 
 
 def parse_methods(raw: str) -> list[str]:
     methods = [item.strip() for item in raw.split(",") if item.strip()]
     if not methods:
         raise ValueError("At least one method is required.")
-    unknown = sorted(set(methods) - set(METHODS))
+    if "all" in methods:
+        if methods != ["all"]:
+            raise ValueError("--methods all cannot be combined with explicit method keys.")
+        return list(METHODS)
+    allowed = set(METHODS) | set(LEGACY_METHOD_ALIASES)
+    unknown = sorted(set(methods) - allowed)
     if unknown:
-        raise ValueError(f"Unknown methods: {unknown}. Allowed methods: {METHODS}")
-    if len(set(methods)) != len(methods):
-        raise ValueError("--methods contains duplicates.")
+        raise ValueError(f"Unknown methods: {unknown}. Allowed methods: {METHODS} plus legacy alias dynamic")
+    canonical = [canonical_method_key(method) for method in methods]
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("--methods contains duplicate or aliased-duplicate methods.")
     return methods
+
+
+def canonical_method_key(method_key: str) -> str:
+    return LEGACY_METHOD_ALIASES.get(method_key, method_key)
+
+
+def resolve_retention_ratio(method_key: str, pgdf_dynamic_ratio: float) -> float:
+    canonical = canonical_method_key(method_key)
+    if canonical == "dynamic_r08":
+        return 0.8
+    if canonical == "dynamic_r09":
+        return 0.9
+    if canonical in {"pgdf_auto", "pgdf_fixed"}:
+        return float(pgdf_dynamic_ratio)
+    raise ValueError(f"Method {method_key} has no dynamic retention ratio.")
 
 
 def parse_seeds(raw: str) -> list[int]:
@@ -515,7 +768,8 @@ def train_log_fields() -> list[str]:
     return [
         "method", "seed", "epoch", "lr_lora", "lr_head", "loss", "train_loss", "top1", "top5", "val_top1", "val_top5",
         "best_top1", "best_epoch", "train_samples", "candidate_samples", "selected_ratio", "eval_samples", "trainable_params", "total_params",
-        "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
+        "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
+        "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
     ]
 
 
@@ -523,10 +777,13 @@ def result_fields() -> list[str]:
     return [
         "method_key", "method", "seed", "checkpoint_protocol", "train_samples", "eval_samples", "validation_samples", "test_samples",
         "best_val_epoch", "best_val_top1", "best_val_top5", "validation_selected_test_top1", "validation_selected_test_top5",
-        "final_test_top1", "final_test_top5", "last5_test_mean", "last5_test_std", "oracle_best_test_epoch",
+        "validation_selected_test_model_a_top1", "validation_selected_test_model_a_top5", "validation_selected_test_model_b_top1", "validation_selected_test_model_b_top5",
+        "final_test_top1", "final_test_top5", "final_test_model_a_top1", "final_test_model_a_top5", "final_test_model_b_top1", "final_test_model_b_top5",
+        "last5_test_mean", "last5_test_std", "last5_test_top5_mean", "last5_test_top5_std", "oracle_best_test_epoch",
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
-        "selection_updates", "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
+        "selection_updates", "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
+        "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
     ]
 
 
@@ -541,6 +798,13 @@ def summary_fields() -> list[str]:
 
 def selection_fields() -> list[str]:
     return ["method", "seed", "retention_ratio", "proto_keep_ratio", "epoch", "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "state"]
+
+
+def dual_selection_fields() -> list[str]:
+    return [
+        "method", "seed", "epoch", "remember_rate", "selected_count", "selected_ratio", "top1_a", "top5_a",
+        "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5", "selection_mode",
+    ]
 
 
 def update_fields() -> list[str]:

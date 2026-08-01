@@ -9,10 +9,16 @@ from typing import Any
 
 import numpy as np
 
-from .baselines import centroid_scores, per_class_keep_counts, select_top_per_class
+from .baselines import (
+    centroid_scores,
+    compute_fine_scores,
+    per_class_keep_counts,
+    select_fine_classwise,
+    select_top_per_class,
+)
 from .graph import build_rrf_graphs
 from .io_utils import read_csv, write_csv, write_json
-from .scoring import compute_scores
+from .scoring import adaptive_otsu_split, compute_scores, percentile_by_class
 from .selection_utils import path_key_candidates
 
 
@@ -206,7 +212,7 @@ def build_validation_safe_pgdf_reference(
     pool_labels = noisy_labels[pool_idx]
     pool_features = {name: np.asarray(values[pool_idx], dtype=np.float32) for name, values in features.items()}
     graphs = build_rrf_graphs(pool_features, pool_labels, cfg)
-    _, split_info = compute_scores(pool_labels, graphs, cfg)
+    metrics, split_info = compute_scores(pool_labels, graphs, cfg)
     gcdd_clean_pool = np.asarray(split_info["state"] == "clean", dtype=bool)
     keep_counts = per_class_keep_counts(pool_labels, gcdd_clean_pool)
     pool_proto_scores = centroid_scores(pool_features["cls"], pool_labels)
@@ -225,7 +231,144 @@ def build_validation_safe_pgdf_reference(
         "gcdd_clean_mask": gcdd_clean,
         "per_class_keep_counts": keep_counts,
         "pool_indices": pool_idx,
+        # Retained for validation-safe static methods so the expensive graph is
+        # built once when static GCDD and PGDF are requested together.
+        "pool_metrics": metrics,
+        "pool_split_info": split_info,
     }
+
+
+def build_validation_safe_static_selections(
+    features: dict[str, np.ndarray],
+    noisy_labels: np.ndarray,
+    training_pool_mask: np.ndarray,
+    cfg: dict[str, Any],
+    *,
+    pgdf_reference: dict[str, Any] | None = None,
+    fine_keep_ratio: float = 0.6,
+    fine_center: bool = False,
+    fine_min_class_size: int = 3,
+) -> dict[str, dict[str, Any]]:
+    """Rebuild every static baseline strictly inside the training pool.
+
+    The returned masks use the original path/index space, but all validation
+    positions are false.  No saved full-pool selection CSV is consulted.
+    """
+    noisy_labels = np.asarray(noisy_labels, dtype=str)
+    training_pool_mask = np.asarray(training_pool_mask, dtype=bool)
+    if noisy_labels.shape != training_pool_mask.shape:
+        raise ValueError("training_pool_mask must align with noisy_labels.")
+    if not 0.0 < fine_keep_ratio <= 1.0:
+        raise ValueError("fine_keep_ratio must satisfy 0 < p <= 1.")
+
+    reference = pgdf_reference or build_validation_safe_pgdf_reference(
+        features,
+        noisy_labels,
+        training_pool_mask,
+        cfg,
+    )
+    pool_idx = np.asarray(reference["pool_indices"], dtype=np.int64)
+    if not np.array_equal(pool_idx, np.where(training_pool_mask)[0]):
+        raise ValueError("PGDF reference pool indices do not match training_pool_mask.")
+    pool_labels = noisy_labels[pool_idx]
+    pool_metrics = reference.get("pool_metrics")
+    if pool_metrics is None:
+        pool_features = {name: np.asarray(values[pool_idx], dtype=np.float32) for name, values in features.items()}
+        graphs = build_rrf_graphs(pool_features, pool_labels, cfg)
+        pool_metrics, _ = compute_scores(pool_labels, graphs, cfg)
+
+    pool_proto_scores = np.asarray(reference["proto_scores"][pool_idx], dtype=np.float32)
+    eps = float(cfg["selection"]["epsilon"])
+    p_proto = percentile_by_class(pool_proto_scores, pool_labels)
+    gcdd_proto_score_pool = np.power(
+        (np.asarray(pool_metrics["P_Dclass"]) + eps)
+        * (np.asarray(pool_metrics["P_Rclass"]) + eps)
+        * (np.asarray(pool_metrics["P_Iclass_norm"]) + eps)
+        * (np.asarray(pool_metrics["P_Qsame"]) + eps)
+        * (p_proto + eps),
+        1.0 / 5.0,
+    )
+    gcdd_proto_state, _ = adaptive_otsu_split(gcdd_proto_score_pool, pool_labels, cfg)
+    gcdd_proto_pool = np.asarray(gcdd_proto_state == "clean", dtype=bool)
+
+    pool_cls = np.asarray(features["cls"][pool_idx], dtype=np.float32)
+    fine_score_pool, _, fine_small_pool = compute_fine_scores(
+        pool_cls,
+        pool_labels,
+        center=fine_center,
+        min_class_size=fine_min_class_size,
+    )
+    fine_pool = select_fine_classwise(fine_score_pool, pool_labels, fine_keep_ratio, fine_small_pool)
+
+    full_gcdd = np.asarray(reference["gcdd_clean_mask"], dtype=bool).copy()
+    centroid = np.asarray(reference["centroid_reference_mask"], dtype=bool).copy()
+    gcdd_proto = expand_pool_values(gcdd_proto_pool, pool_idx, len(noisy_labels), False, dtype=bool)
+    fine = expand_pool_values(fine_pool, pool_idx, len(noisy_labels), False, dtype=bool)
+    masks = {
+        "full_gcdd": full_gcdd,
+        "centroid": centroid,
+        "gcdd_proto": gcdd_proto,
+        "both_only": gcdd_proto & centroid,
+        "fine": fine,
+    }
+    assert_validation_safe_masks(masks, training_pool_mask)
+
+    gcdd_score = expand_pool_values(
+        np.asarray(pool_metrics["S_clean"], dtype=np.float32), pool_idx, len(noisy_labels), np.nan, dtype=np.float32
+    )
+    proto_score = expand_pool_values(gcdd_proto_score_pool, pool_idx, len(noisy_labels), np.nan, dtype=np.float32)
+    fine_score = expand_pool_values(fine_score_pool, pool_idx, len(noisy_labels), np.nan, dtype=np.float32)
+    return {
+        "full_gcdd": {
+            "mask": masks["full_gcdd"],
+            "score": gcdd_score,
+            "selection_mode": "static_training_pool_full_gcdd_adaptive_otsu",
+        },
+        "centroid": {
+            "mask": masks["centroid"],
+            "score": np.asarray(reference["proto_scores"], dtype=np.float32),
+            "selection_mode": "static_training_pool_centroid_aligned_to_gcdd_budget",
+        },
+        "both_only": {
+            "mask": masks["both_only"],
+            "score": proto_score,
+            "selection_mode": "static_training_pool_gcdd_proto_intersection_centroid",
+        },
+        "gcdd_proto": {
+            "mask": masks["gcdd_proto"],
+            "score": proto_score,
+            "selection_mode": "static_training_pool_gcdd_proto_adaptive_otsu",
+        },
+        "fine": {
+            "mask": masks["fine"],
+            "score": fine_score,
+            "selection_mode": f"static_training_pool_fine_nocenter_p{fine_keep_ratio:g}",
+        },
+    }
+
+
+def expand_pool_values(
+    pool_values: np.ndarray,
+    pool_indices: np.ndarray,
+    total: int,
+    fill_value: Any,
+    *,
+    dtype: Any,
+) -> np.ndarray:
+    values = np.full(total, fill_value, dtype=dtype)
+    values[pool_indices] = pool_values
+    return values
+
+
+def assert_validation_safe_masks(masks: dict[str, np.ndarray], training_pool_mask: np.ndarray) -> None:
+    """Fail closed if any static selector includes a held-out validation row."""
+    for method, mask in masks.items():
+        values = np.asarray(mask, dtype=bool)
+        if values.shape != training_pool_mask.shape:
+            raise ValueError(f"Static mask {method} does not align with training_pool_mask.")
+        leaked = values & ~training_pool_mask
+        if np.any(leaked):
+            raise ValueError(f"Static mask {method} includes {int(leaked.sum())} validation sample(s).")
 
 
 def hash_paths(paths: list[str]) -> str:

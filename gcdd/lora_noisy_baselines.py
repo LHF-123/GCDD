@@ -88,6 +88,12 @@ def train_coteaching_lora(
     path_maps: list[tuple[str, str]] | None = None,
     gt_clean_mask: np.ndarray | None = None,
     checkpoint_path: Path | None = None,
+    test_paths: list[str] | None = None,
+    test_labels: np.ndarray | None = None,
+    final_checkpoint_path: Path | None = None,
+    last5_checkpoint_dir: Path | None = None,
+    checkpoint_protocol: str = "legacy_test_selected",
+    posthoc_oracle_test: bool = False,
 ) -> NoisyBaselineRunResult:
     return train_dual_model_lora(
         train_paths,
@@ -107,6 +113,12 @@ def train_coteaching_lora(
         path_maps=path_maps,
         gt_clean_mask=gt_clean_mask,
         checkpoint_path=checkpoint_path,
+        test_paths=test_paths,
+        test_labels=test_labels,
+        final_checkpoint_path=final_checkpoint_path,
+        last5_checkpoint_dir=last5_checkpoint_dir,
+        checkpoint_protocol=checkpoint_protocol,
+        posthoc_oracle_test=posthoc_oracle_test,
         batch_loss_fn=coteaching_batch_loss,
     )
 
@@ -129,6 +141,12 @@ def train_jocor_lora(
     path_maps: list[tuple[str, str]] | None = None,
     gt_clean_mask: np.ndarray | None = None,
     checkpoint_path: Path | None = None,
+    test_paths: list[str] | None = None,
+    test_labels: np.ndarray | None = None,
+    final_checkpoint_path: Path | None = None,
+    last5_checkpoint_dir: Path | None = None,
+    checkpoint_protocol: str = "legacy_test_selected",
+    posthoc_oracle_test: bool = False,
 ) -> NoisyBaselineRunResult:
     return train_dual_model_lora(
         train_paths,
@@ -148,6 +166,12 @@ def train_jocor_lora(
         path_maps=path_maps,
         gt_clean_mask=gt_clean_mask,
         checkpoint_path=checkpoint_path,
+        test_paths=test_paths,
+        test_labels=test_labels,
+        final_checkpoint_path=final_checkpoint_path,
+        last5_checkpoint_dir=last5_checkpoint_dir,
+        checkpoint_protocol=checkpoint_protocol,
+        posthoc_oracle_test=posthoc_oracle_test,
         batch_loss_fn=jocor_batch_loss,
     )
 
@@ -171,6 +195,12 @@ def train_dual_model_lora(
     path_maps: list[tuple[str, str]] | None,
     gt_clean_mask: np.ndarray | None,
     checkpoint_path: Path | None,
+    test_paths: list[str] | None,
+    test_labels: np.ndarray | None,
+    final_checkpoint_path: Path | None,
+    last5_checkpoint_dir: Path | None,
+    checkpoint_protocol: str,
+    posthoc_oracle_test: bool,
     batch_loss_fn: Callable[..., dict[str, Any]],
 ) -> NoisyBaselineRunResult:
     import torch
@@ -186,6 +216,8 @@ def train_dual_model_lora(
         gt_clean_mask = np.asarray(gt_clean_mask, dtype=bool)
         if gt_clean_mask.shape != train_mask.shape:
             raise ValueError("gt_clean_mask must match train_mask shape.")
+    if (test_paths is None) != (test_labels is None):
+        raise ValueError("test_paths and test_labels must be provided together.")
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -222,6 +254,22 @@ def train_dual_model_lora(
         pin_memory=bool(train_cfg.get("pin_memory", True)),
         drop_last=False,
     )
+    test_loader = None
+    test_idx = np.array([], dtype=np.int64)
+    if test_paths is not None and test_labels is not None:
+        test_known = np.array([label in label_to_id for label in test_labels], dtype=bool)
+        test_idx = np.where(test_known)[0]
+        if len(test_idx) == 0:
+            raise ValueError("Test split has no labels that appear in the train split.")
+        test_dataset = ImageSplitDataset(test_paths, test_labels, test_idx, label_to_id, eval_transform, path_maps)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=int(train_cfg.get("eval_batch_size", train_cfg["batch_size"])),
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 4)),
+            pin_memory=bool(train_cfg.get("pin_memory", True)),
+            drop_last=False,
+        )
 
     model_a, modules_a = build_lora_model(torch, cfg, len(classes), seed, device)
     model_b, modules_b = build_lora_model(torch, cfg, len(classes), seed + 1000, device)
@@ -248,6 +296,8 @@ def train_dual_model_lora(
     logs: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
+    last5_states: list[tuple[int, dict[str, Any]]] = []
+    oracle_states: list[tuple[int, dict[str, Any]]] = []
     log_stage(
         f"[{method}] seed={seed}: train_images={len(train_idx)}, eval_images={len(eval_idx)}, "
         f"remember_mode={remember_mode}, remember_rate={remember_rate:.3f}, trainable_params={trainable_params}"
@@ -318,19 +368,101 @@ def train_dual_model_lora(
             "top5_b": float(top5_b),
             "mean_ab_top1": float(mean_top1),
             "mean_ab_top5": float(mean_top5),
+            "top1": float(mean_top1),
+            "top5": float(mean_top5),
+            "val_top1": float(mean_top1),
+            "val_top5": float(mean_top5),
             "train_samples": int(len(train_idx)),
             "eval_samples": int(len(eval_idx)),
             "trainable_params": int(trainable_params),
             "total_params": int(total_params),
+            "selection_mode": "two_branch_mean_validation_top1",
         }
         logs.append(row)
-        if best_row is None or float(row["mean_ab_top1"]) > float(best_row["mean_ab_top1"]):
+        if select_best_dual_validation_row(logs) is row:
             best_row = row
-            best_state = {"model_a": trainable_state_dict(model_a), "model_b": trainable_state_dict(model_b)}
+            best_state = snapshot_dual_state(model_a, model_b)
+        row["best_top1"] = float(best_row["mean_ab_top1"])
+        row["best_epoch"] = int(best_row["epoch"])
+        epoch_state = snapshot_dual_state(model_a, model_b)
+        last5_states.append((epoch, epoch_state))
+        if len(last5_states) > 5:
+            last5_states.pop(0)
+        if posthoc_oracle_test and test_loader is not None:
+            oracle_states.append((epoch, epoch_state))
         log_stage(
             f"[{method}] seed={seed} epoch {epoch}/{epochs}: "
             f"loss={row['loss']:.4f}, mean_ab_top1={mean_top1:.4f}, selected_ratio={row['selected_ratio']:.4f}"
         )
+
+    final_state = snapshot_dual_state(model_a, model_b)
+    protocol_metrics: dict[str, Any] = {}
+    if test_loader is not None and best_state is not None and best_row is not None:
+        epoch_test_metrics: dict[int, dict[str, float]] = {}
+        if posthoc_oracle_test:
+            epoch_test_metrics = {
+                epoch: evaluate_dual_state(
+                    torch,
+                    model_a,
+                    model_b,
+                    state,
+                    test_loader,
+                    device,
+                    len(classes),
+                    amp,
+                )
+                for epoch, state in oracle_states
+            }
+            selected_test = epoch_test_metrics[int(best_row["epoch"])]
+            final_test = epoch_test_metrics[int(epochs)]
+            last5_test = [epoch_test_metrics[epoch] for epoch, _ in last5_states]
+        else:
+            selected_test = evaluate_dual_state(
+                torch, model_a, model_b, best_state, test_loader, device, len(classes), amp
+            )
+            final_test = evaluate_dual_state(
+                torch, model_a, model_b, final_state, test_loader, device, len(classes), amp
+            )
+            last5_test = [
+                evaluate_dual_state(torch, model_a, model_b, state, test_loader, device, len(classes), amp)
+                for _, state in last5_states
+            ]
+        last5_top1 = np.asarray([row["mean_top1"] for row in last5_test], dtype=np.float32)
+        last5_top5 = np.asarray([row["mean_top5"] for row in last5_test], dtype=np.float32)
+        protocol_metrics = {
+            "checkpoint_protocol": checkpoint_protocol,
+            "validation_samples": int(len(eval_idx)),
+            "test_samples": int(len(test_idx)),
+            "best_val_epoch": int(best_row["epoch"]),
+            "best_val_top1": float(best_row["mean_ab_top1"]),
+            "best_val_top5": float(best_row["mean_ab_top5"]),
+            "validation_selected_test_top1": float(selected_test["mean_top1"]),
+            "validation_selected_test_top5": float(selected_test["mean_top5"]),
+            "validation_selected_test_model_a_top1": float(selected_test["top1_a"]),
+            "validation_selected_test_model_a_top5": float(selected_test["top5_a"]),
+            "validation_selected_test_model_b_top1": float(selected_test["top1_b"]),
+            "validation_selected_test_model_b_top5": float(selected_test["top5_b"]),
+            "final_test_top1": float(final_test["mean_top1"]),
+            "final_test_top5": float(final_test["mean_top5"]),
+            "final_test_model_a_top1": float(final_test["top1_a"]),
+            "final_test_model_a_top5": float(final_test["top5_a"]),
+            "final_test_model_b_top1": float(final_test["top1_b"]),
+            "final_test_model_b_top5": float(final_test["top5_b"]),
+            "last5_test_mean": float(last5_top1.mean()),
+            "last5_test_std": float(last5_top1.std()),
+            "last5_test_top5_mean": float(last5_top5.mean()),
+            "last5_test_top5_std": float(last5_top5.std()),
+        }
+        if posthoc_oracle_test:
+            oracle_epoch, oracle_test = max(epoch_test_metrics.items(), key=lambda item: item[1]["mean_top1"])
+            protocol_metrics.update(
+                {
+                    "oracle_best_test_epoch": int(oracle_epoch),
+                    "oracle_best_test_top1": float(oracle_test["mean_top1"]),
+                    "oracle_best_test_top5": float(oracle_test["mean_top5"]),
+                    "oracle_best_to_final_drop": float(oracle_test["mean_top1"] - final_test["mean_top1"]),
+                }
+            )
 
     if checkpoint_path is not None and best_state is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -346,13 +478,48 @@ def train_dual_model_lora(
                 "remember_rate": float(remember_rate),
                 "final_remember_rate": float(final_remember_rate),
                 "lambda_cor": float(lambda_cor),
+                "selection_metric": "arithmetic mean of branch A/B validation Top-1; not ensemble prediction",
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
             },
             checkpoint_path,
         )
 
+    if final_checkpoint_path is not None:
+        final_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "method": method,
+                "seed": int(seed),
+                "classes": classes,
+                "state_dict": final_state,
+                "final_epoch": int(epochs),
+                "selection_metric": "arithmetic mean of branch A/B validation Top-1; not ensemble prediction",
+                "checkpoint_protocol": checkpoint_protocol,
+                **protocol_metrics,
+            },
+            final_checkpoint_path,
+        )
+    if last5_checkpoint_dir is not None:
+        last5_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        for epoch, state in last5_states:
+            torch.save(
+                {
+                    "method": method,
+                    "seed": int(seed),
+                    "classes": classes,
+                    "state_dict": state,
+                    "epoch": int(epoch),
+                    "checkpoint_protocol": checkpoint_protocol,
+                },
+                last5_checkpoint_dir / f"epoch_{epoch:03d}.pt",
+            )
+
+    summary = summarize_dual_logs(method, seed, logs, remember_mode, remember_rate, final_remember_rate, lambda_cor, warmup_epochs)
+    summary.update(protocol_metrics)
     return NoisyBaselineRunResult(
         logs=logs,
-        summary=summarize_dual_logs(method, seed, logs, remember_mode, remember_rate, final_remember_rate, lambda_cor, warmup_epochs),
+        summary=summary,
         trainable_modules=build_module_rows(modules_a, modules_b),
         trainable_params=trainable_params,
         total_params=total_params,
@@ -375,6 +542,52 @@ def build_lora_model(torch: Any, cfg: dict[str, Any], num_classes: int, seed: in
     for param in model.head.parameters():
         param.requires_grad_(True)
     return model, modules
+
+
+def select_best_dual_validation_row(logs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Select the first epoch maximizing branch-mean validation Top-1.
+
+    Only ``mean_ab_top1`` is read.  In particular, official-test fields cannot
+    influence checkpoint selection even if diagnostic rows contain them.
+    """
+    if not logs:
+        raise ValueError("At least one validation log row is required.")
+    return max(logs, key=lambda row: float(row["mean_ab_top1"]))
+
+
+def snapshot_dual_state(model_a: Any, model_b: Any) -> dict[str, dict[str, Any]]:
+    """Clone both trainable states so later CPU optimizer steps cannot mutate them."""
+    return {
+        "model_a": {name: value.clone() for name, value in trainable_state_dict(model_a).items()},
+        "model_b": {name: value.clone() for name, value in trainable_state_dict(model_b).items()},
+    }
+
+
+def evaluate_dual_state(
+    torch: Any,
+    model_a: Any,
+    model_b: Any,
+    state: dict[str, dict[str, Any]],
+    loader: Any,
+    device: str,
+    num_classes: int,
+    amp: bool,
+) -> dict[str, float]:
+    """Evaluate branches separately and report arithmetic means, never an ensemble."""
+    model_a.load_state_dict(state["model_a"], strict=False)
+    model_b.load_state_dict(state["model_b"], strict=False)
+    model_a.to(device)
+    model_b.to(device)
+    top1_a, top5_a = evaluate_lora(torch, model_a, loader, device, num_classes, amp)
+    top1_b, top5_b = evaluate_lora(torch, model_b, loader, device, num_classes, amp)
+    return {
+        "top1_a": float(top1_a),
+        "top5_a": float(top5_a),
+        "top1_b": float(top1_b),
+        "top5_b": float(top5_b),
+        "mean_top1": (float(top1_a) + float(top1_b)) / 2.0,
+        "mean_top5": (float(top5_a) + float(top5_b)) / 2.0,
+    }
 
 
 def coteaching_batch_loss(torch: Any, logits_a: Any, logits_b: Any, labels: Any, remember_rate: float, lambda_cor: float) -> dict[str, Any]:
@@ -424,7 +637,7 @@ def summarize_dual_logs(
 ) -> dict[str, Any]:
     if not logs:
         raise ValueError(f"No logs available for {method}.")
-    best = max(logs, key=lambda row: float(row["mean_ab_top1"]))
+    best = select_best_dual_validation_row(logs)
     final = logs[-1]
     last5 = logs[-5:]
     last5_mean = np.array([float(row["mean_ab_top1"]) for row in last5], dtype=np.float32)
@@ -442,16 +655,20 @@ def summarize_dual_logs(
         "best_mean_ab_top1": float(best["mean_ab_top1"]),
         "best_model_a_top1": float(best["top1_a"]),
         "best_model_b_top1": float(best["top1_b"]),
+        "best_mean_ab_top5": float(best["mean_ab_top5"]),
         "final_mean_ab_top1": float(final["mean_ab_top1"]),
+        "final_mean_ab_top5": float(final["mean_ab_top5"]),
         "final_model_a_top1": float(final["top1_a"]),
         "final_model_b_top1": float(final["top1_b"]),
         "last5_mean": float(last5_mean.mean()),
         "last5_std": float(last5_mean.std()),
         "final_selected_ratio": float(final["selected_ratio"]),
+        "final_selected_count": float(final["selected_count"]),
         "final_selected_purity": final["selected_purity"],
         "final_clean_recall": final["clean_recall"],
         "trainable_params": int(final["trainable_params"]),
         "total_params": int(final["total_params"]),
+        "selection_mode": "two_branch_mean_validation_top1",
     }
 
 

@@ -2,12 +2,16 @@
 
 ## Validation-Selected Checkpoint Protocol
 
-以下命令运行固定 clean-validation checkpoint 协议。入口支持 LoRA all noisy CE、Dynamic small-loss、JAL-CE、PGDF auto、fixed-p PGDF，并对每种方法运行 seed `1,42,88`。下方现有 asym40 命令显式保留了当时已完成的四方法；要运行完整五方法，请使用 `--methods all_noisy,dynamic,jal_ce,pgdf_auto,pgdf_fixed`。
+以下命令运行统一的 `fixed_clean_validation_v1` 协议。`--methods all` 按固定顺序展开 13 个方法：`all_noisy`、`full_gcdd`、`centroid`、`both_only`、`gcdd_proto`、`fine`、`dynamic_r08`、`dynamic_r09`、`jal_ce`、`coteaching`、`jocor`、`pgdf_auto`、`pgdf_fixed`。旧 key `dynamic` 仍可使用，并等价于 `dynamic_r08`。
 
 - checkpoint 只按训练集划出的固定 clean validation Top-1 选择；官方 test 不参与训练期选择。
 - `--fixed-p 0.4` 是预先固定的全局值，不能根据本轮 test 结果调整。
-- 默认启用 post-hoc oracle test curve，仅用于补充报告；正式主指标使用 `validation_selected_test_top1`。
+- validation 不参与训练、静态/动态筛选、graph budget、prototype reference 或 class centroid。
+- Co-teaching/JoCoR 以两个分支 Top-1 的算术均值选择 checkpoint，不使用 ensemble prediction。
+- 以下命令显式关闭 post-hoc oracle test；official test 只在训练结束后评估 validation-selected、final 和 last-5 checkpoint。
 - 任一运行报错会直接退出，不会跳过失败 seed 继续写完整结果。
+- 输出使用新的 `checkpoint_validation_all_methods_s20250726` 目录，不覆盖旧 `checkpoint_validation_s20250726` 原始结果。
+- 三个数据集共 `13 × 3 × 3 = 117` 个 run；Co-teaching 和 JoCoR 的每个 run 各训练两个分支模型。
 
 ### CUB-200-2011 asym40
 
@@ -15,13 +19,12 @@
 python scripts/run_lora_checkpoint_validation.py \
   --input-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42 \
   --noise-index outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv \
-  --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/checkpoint_validation_s20250726 \
-  --seeds 1,42,88 \
-  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --output-dir outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42/checkpoint_validation_all_methods_s20250726 \
+  --methods all --seeds 1,42,88 \
   --validation-ratio 0.10 --validation-seed 20250726 \
   --dynamic-ratio 0.8 --fixed-p 0.4 \
   --warmup-epochs 5 --update-interval 5 \
-  --posthoc-oracle-test
+  --no-posthoc-oracle-test
 ```
 
 ### Stanford Cars asym40
@@ -30,13 +33,12 @@ python scripts/run_lora_checkpoint_validation.py \
 python scripts/run_lora_checkpoint_validation.py \
   --input-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42 \
   --noise-index outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv \
-  --output-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42/checkpoint_validation_s20250726 \
-  --seeds 1,42,88 \
-  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --output-dir outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42/checkpoint_validation_all_methods_s20250726 \
+  --methods all --seeds 1,42,88 \
   --validation-ratio 0.10 --validation-seed 20250726 \
   --dynamic-ratio 0.8 --fixed-p 0.4 \
   --warmup-epochs 5 --update-interval 5 \
-  --posthoc-oracle-test
+  --no-posthoc-oracle-test
 ```
 
 ### FGVC-Aircraft asym40
@@ -45,23 +47,27 @@ python scripts/run_lora_checkpoint_validation.py \
 python scripts/run_lora_checkpoint_validation.py \
   --input-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42 \
   --noise-index outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv \
-  --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/checkpoint_validation_s20250726 \
-  --seeds 1,42,88 \
-  --methods dynamic,jal_ce,pgdf_auto,pgdf_fixed \
+  --output-dir outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42/checkpoint_validation_all_methods_s20250726 \
+  --methods all --seeds 1,42,88 \
   --validation-ratio 0.10 --validation-seed 20250726 \
   --dynamic-ratio 0.8 --fixed-p 0.4 \
   --warmup-epochs 5 --update-interval 5 \
-  --posthoc-oracle-test
+  --no-posthoc-oracle-test
 ```
 
 每个输出目录优先查看：
 
 ```text
 validation_manifest.csv
+validation_manifest.json
 checkpoint_validation_results.csv
 checkpoint_validation_summary.csv
+checkpoint_validation_summary.json
+run_index.csv
 run_summary.md
-<method>/seed<seed>/checkpoints/best_val.pt
+<method>/seed<seed>/train_log.csv
+<method>/seed<seed>/checkpoints/{best_val.pt,last.pt,last5/}
+<method>/seed<seed>/{selection_rows.csv|static_selection.csv|selection_history.csv}
 ```
 ## 参数优先级
 
