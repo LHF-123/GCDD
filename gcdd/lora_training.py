@@ -105,11 +105,14 @@ def train_dinov2_lora(
     full_noisy_candidate_mask: np.ndarray | None = None,
     checkpoint_protocol: str = "legacy_test_selected",
     posthoc_oracle_test: bool = False,
+    official_test_selected_only: bool = False,
 ) -> LoRARunResult:
     """Train DINOv2 with LoRA on image data for one method and seed.
 
     With an explicit test split, ``eval_paths`` is used only for validation-based
     checkpoint selection; test metrics are evaluated after all epochs finish.
+    ``official_test_selected_only`` evaluates only the validation-selected
+    state and leaves final/last-5 test diagnostics blank.
     """
     import torch
     from torch.utils.data import DataLoader
@@ -125,6 +128,8 @@ def train_dinov2_lora(
     loss_cfg = resolve_loss_config(cfg)
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
+    if official_test_selected_only and posthoc_oracle_test:
+        raise ValueError("official_test_selected_only cannot be combined with posthoc_oracle_test.")
     expected_jal_mask = np.ones(len(train_labels), dtype=bool) if full_noisy_candidate_mask is None else np.asarray(full_noisy_candidate_mask, dtype=bool)
     if expected_jal_mask.shape != train_mask.shape:
         raise ValueError("full_noisy_candidate_mask must match train_mask shape.")
@@ -301,6 +306,14 @@ def train_dinov2_lora(
             validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
             final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
             last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
+        elif official_test_selected_only:
+            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            final_test_top1 = ""
+            final_test_top5 = ""
+            last5_test_mean = ""
+            last5_test_std = ""
         else:
             validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
                 torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
@@ -315,8 +328,20 @@ def train_dinov2_lora(
                 ],
                 dtype=np.float32,
             )
+            last5_test_mean = float(last5_test_top1.mean())
+            last5_test_std = float(last5_test_top1.std())
+        if posthoc_oracle_test:
+            last5_test_mean = float(last5_test_top1.mean())
+            last5_test_std = float(last5_test_top1.std())
         protocol_metrics = {
             "checkpoint_protocol": checkpoint_protocol,
+            "official_test_evaluation": (
+                "validation_selected_only"
+                if official_test_selected_only
+                else "posthoc_oracle_curve"
+                if posthoc_oracle_test
+                else "validation_selected_final_last5"
+            ),
             "validation_samples": int(len(eval_idx)),
             "test_samples": int(len(test_idx)),
             "best_val_epoch": int(best_row["epoch"]),
@@ -324,10 +349,10 @@ def train_dinov2_lora(
             "best_val_top5": float(best_row["top5"]),
             "validation_selected_test_top1": float(validation_selected_test_top1),
             "validation_selected_test_top5": float(validation_selected_test_top5),
-            "final_test_top1": float(final_test_top1),
-            "final_test_top5": float(final_test_top5),
-            "last5_test_mean": float(last5_test_top1.mean()),
-            "last5_test_std": float(last5_test_top1.std()),
+            "final_test_top1": final_test_top1 if final_test_top1 == "" else float(final_test_top1),
+            "final_test_top5": final_test_top5 if final_test_top5 == "" else float(final_test_top5),
+            "last5_test_mean": last5_test_mean,
+            "last5_test_std": last5_test_std,
         }
         if posthoc_oracle_test:
             oracle_rows = [(epoch, *metrics) for epoch, metrics in epoch_test_metrics.items()]

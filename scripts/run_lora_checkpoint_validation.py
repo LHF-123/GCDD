@@ -51,7 +51,8 @@ METHODS = (
     "pgdf_auto",
     "pgdf_fixed",
 )
-STATIC_METHODS = ("full_gcdd", "centroid", "both_only", "gcdd_proto", "fine")
+ABLATION_METHODS = ("proto_only",)
+STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
 DYNAMIC_METHODS = ("dynamic", "dynamic_r08", "dynamic_r09", "pgdf_auto", "pgdf_fixed")
 LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
@@ -64,7 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-index", required=True, help="Synthetic-noise index CSV containing clean_label for the original train split.")
     parser.add_argument("--config", help="Optional YAML merged over <input-dir>/resolved_config.yaml for all methods.")
     parser.add_argument("--output-dir", help="Defaults to <input-dir>/checkpoint_validation_all_methods_s<validation-seed>.")
-    parser.add_argument("--methods", default="all", help="Use 'all' for all 13 methods, or a comma-separated subset. Legacy key dynamic aliases dynamic_r08.")
+    parser.add_argument(
+        "--methods",
+        default="all",
+        help="Use 'all' for the 13 primary methods, or an explicit subset. proto_only is an explicit ablation; dynamic aliases dynamic_r08.",
+    )
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
     parser.add_argument("--validation-ratio", type=float, default=0.10, help="Fixed clean validation fraction per clean class.")
     parser.add_argument("--validation-seed", type=int, default=20250726, help="Dataset-level seed used once to create the shared validation manifest.")
@@ -82,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path-map", action="append", default=[], metavar="OLD=NEW", help="Map stored image root to local image root.")
     parser.add_argument("--posthoc-oracle-test", dest="posthoc_oracle_test", action="store_true", default=False, help="After fitting, evaluate every epoch state on test only for a clearly labelled oracle supplement.")
     parser.add_argument("--no-posthoc-oracle-test", dest="posthoc_oracle_test", action="store_false", help="Skip the optional oracle test curve; main validation-selected and final metrics remain available.")
+    parser.add_argument(
+        "--official-test-selected-only",
+        action="store_true",
+        help="Evaluate official test only once on best_val.pt. Required for the explicit proto_only ablation.",
+    )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
     parser.add_argument("--batch-size", type=int, help="Override LoRA training batch size.")
     parser.add_argument("--eval-batch-size", type=int, help="Override validation/test batch size.")
@@ -125,6 +135,7 @@ def main() -> None:
 
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
+    validate_official_test_request(methods, bool(args.official_test_selected_only))
     preflight_run_dirs(output_dir, methods, seeds)
     path_maps = parse_path_maps(args.path_map)
     cfg = load_config(input_dir, Path(args.config) if args.config else None)
@@ -141,6 +152,7 @@ def main() -> None:
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
+        "official_test_selected_only": bool(args.official_test_selected_only),
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
         "two_branch": {
             "remember_mode": "fixed",
@@ -187,6 +199,7 @@ def main() -> None:
                 split.train_mask,
                 cfg,
                 pgdf_reference=pgdf_reference,
+                proto_keep_ratio=float(args.fixed_p),
                 fine_keep_ratio=0.6,
                 fine_center=False,
             )
@@ -222,7 +235,7 @@ def main() -> None:
                     train_mask = np.asarray(static_info["mask"], dtype=bool)
                     selection_mode = str(static_info["selection_mode"])
                     static_score = np.asarray(static_info["score"], dtype=np.float32)
-                    method_name = static_method_name(canonical_key)
+                    method_name = static_method_name(canonical_key, proto_keep_ratio=float(args.fixed_p))
                 else:
                     run_cfg["loss_type"] = "ce"
                     method_name = "DINOv2+LoRA all noisy CE (full noisy training pool)"
@@ -247,6 +260,7 @@ def main() -> None:
                     full_noisy_candidate_mask=split.train_mask,
                     checkpoint_protocol=PROTOCOL_NAME,
                     posthoc_oracle_test=bool(args.posthoc_oracle_test),
+                    official_test_selected_only=bool(args.official_test_selected_only),
                 )
                 selection_record = str(run_dir / "static_selection.csv")
                 write_static_selection(
@@ -259,6 +273,8 @@ def main() -> None:
                     selected_count=int(train_mask.sum()),
                     candidate_count=int(split.train_mask.sum()),
                 )
+                if canonical_key == "proto_only":
+                    result_row["proto_keep_ratio"] = float(args.fixed_p)
             elif canonical_key in DYNAMIC_METHODS:
                 run_cfg["loss_type"] = "ce"
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
@@ -510,10 +526,11 @@ def write_static_selection(
     )
 
 
-def static_method_name(method_key: str) -> str:
+def static_method_name(method_key: str, *, proto_keep_ratio: float = 0.4) -> str:
     names = {
         "full_gcdd": "DINOv2 LoRA + Full GCDD-clean (training-pool-only)",
         "centroid": "DINOv2 LoRA + Centroid filtering (training-pool-only GCDD budget)",
+        "proto_only": f"DINOv2 LoRA + Prototype gate only p={proto_keep_ratio:g} (training-pool-only)",
         "both_only": "DINOv2 LoRA + both only (training-pool-only intersection)",
         "gcdd_proto": "DINOv2 LoRA + GCDD+Proto (training-pool-only)",
         "fine": "FINE-DINOv2 feature nocenter p=0.6 (training-pool-only)",
@@ -671,14 +688,26 @@ def parse_methods(raw: str) -> list[str]:
         if methods != ["all"]:
             raise ValueError("--methods all cannot be combined with explicit method keys.")
         return list(METHODS)
-    allowed = set(METHODS) | set(LEGACY_METHOD_ALIASES)
+    allowed = set(METHODS) | set(ABLATION_METHODS) | set(LEGACY_METHOD_ALIASES)
     unknown = sorted(set(methods) - allowed)
     if unknown:
-        raise ValueError(f"Unknown methods: {unknown}. Allowed methods: {METHODS} plus legacy alias dynamic")
+        raise ValueError(
+            f"Unknown methods: {unknown}. Allowed primary methods: {METHODS}; "
+            f"explicit ablations: {ABLATION_METHODS}; legacy alias: dynamic"
+        )
     canonical = [canonical_method_key(method) for method in methods]
     if len(set(canonical)) != len(canonical):
         raise ValueError("--methods contains duplicate or aliased-duplicate methods.")
     return methods
+
+
+def validate_official_test_request(methods: list[str], selected_only: bool) -> None:
+    """Keep the prototype-only ablation on its strict one-shot test protocol."""
+    canonical = [canonical_method_key(method) for method in methods]
+    if "proto_only" in canonical and not selected_only:
+        raise ValueError("proto_only requires --official-test-selected-only.")
+    if selected_only and canonical != ["proto_only"]:
+        raise ValueError("--official-test-selected-only is currently restricted to --methods proto_only.")
 
 
 def canonical_method_key(method_key: str) -> str:
@@ -739,12 +768,18 @@ def summarize_methods(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def write_run_summary(path: Path, args: argparse.Namespace, manifest: dict[str, Any], summary: list[dict[str, Any]]) -> None:
+    official_test_mode = (
+        "validation-selected checkpoint only"
+        if args.official_test_selected_only
+        else "validation-selected, final, and last-5 checkpoints"
+    )
     lines = [
         "# Validation-Selected Checkpoint Run",
         "",
         f"- Protocol: `{PROTOCOL_NAME}`.",
         f"- Shared fixed clean validation: {manifest['validation_samples']}/{manifest['source_train_samples']} samples, ratio={manifest['validation_ratio']}, seed={manifest['validation_seed']}.",
         "- During fitting, checkpoint selection uses validation Top-1 only. The official test set is evaluated after fitting.",
+        f"- Official test evaluation: {official_test_mode}.",
         f"- Post-hoc oracle test curve: {'enabled (supplementary only)' if args.posthoc_oracle_test else 'disabled'}.",
         f"- Fixed PGDF p: {args.fixed_p}; this is a pre-declared global value, not selected from this run's test results.",
         "",
@@ -775,7 +810,7 @@ def train_log_fields() -> list[str]:
 
 def result_fields() -> list[str]:
     return [
-        "method_key", "method", "seed", "checkpoint_protocol", "train_samples", "eval_samples", "validation_samples", "test_samples",
+        "method_key", "method", "seed", "checkpoint_protocol", "official_test_evaluation", "train_samples", "eval_samples", "validation_samples", "test_samples",
         "best_val_epoch", "best_val_top1", "best_val_top5", "validation_selected_test_top1", "validation_selected_test_top5",
         "validation_selected_test_model_a_top1", "validation_selected_test_model_a_top5", "validation_selected_test_model_b_top1", "validation_selected_test_model_b_top5",
         "final_test_top1", "final_test_top5", "final_test_model_a_top1", "final_test_model_a_top5", "final_test_model_b_top1", "final_test_model_b_top5",

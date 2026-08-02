@@ -18,6 +18,7 @@ from .baselines import (
 )
 from .graph import build_rrf_graphs
 from .io_utils import read_csv, write_csv, write_json
+from .lora_dynamic import select_top_proto_classwise
 from .scoring import adaptive_otsu_split, compute_scores, percentile_by_class
 from .selection_utils import path_key_candidates
 
@@ -245,6 +246,7 @@ def build_validation_safe_static_selections(
     cfg: dict[str, Any],
     *,
     pgdf_reference: dict[str, Any] | None = None,
+    proto_keep_ratio: float = 0.4,
     fine_keep_ratio: float = 0.6,
     fine_center: bool = False,
     fine_min_class_size: int = 3,
@@ -260,6 +262,8 @@ def build_validation_safe_static_selections(
         raise ValueError("training_pool_mask must align with noisy_labels.")
     if not 0.0 < fine_keep_ratio <= 1.0:
         raise ValueError("fine_keep_ratio must satisfy 0 < p <= 1.")
+    if not 0.0 < proto_keep_ratio <= 1.0:
+        raise ValueError("proto_keep_ratio must satisfy 0 < p <= 1.")
 
     reference = pgdf_reference or build_validation_safe_pgdf_reference(
         features,
@@ -278,6 +282,12 @@ def build_validation_safe_static_selections(
         pool_metrics, _ = compute_scores(pool_labels, graphs, cfg)
 
     pool_proto_scores = np.asarray(reference["proto_scores"][pool_idx], dtype=np.float32)
+    proto_only_pool = select_top_proto_classwise(
+        pool_proto_scores,
+        pool_labels,
+        np.ones(len(pool_idx), dtype=bool),
+        proto_keep_ratio,
+    )
     eps = float(cfg["selection"]["epsilon"])
     p_proto = percentile_by_class(pool_proto_scores, pool_labels)
     gcdd_proto_score_pool = np.power(
@@ -302,11 +312,13 @@ def build_validation_safe_static_selections(
 
     full_gcdd = np.asarray(reference["gcdd_clean_mask"], dtype=bool).copy()
     centroid = np.asarray(reference["centroid_reference_mask"], dtype=bool).copy()
+    proto_only = expand_pool_values(proto_only_pool, pool_idx, len(noisy_labels), False, dtype=bool)
     gcdd_proto = expand_pool_values(gcdd_proto_pool, pool_idx, len(noisy_labels), False, dtype=bool)
     fine = expand_pool_values(fine_pool, pool_idx, len(noisy_labels), False, dtype=bool)
     masks = {
         "full_gcdd": full_gcdd,
         "centroid": centroid,
+        "proto_only": proto_only,
         "gcdd_proto": gcdd_proto,
         "both_only": gcdd_proto & centroid,
         "fine": fine,
@@ -328,6 +340,11 @@ def build_validation_safe_static_selections(
             "mask": masks["centroid"],
             "score": np.asarray(reference["proto_scores"], dtype=np.float32),
             "selection_mode": "static_training_pool_centroid_aligned_to_gcdd_budget",
+        },
+        "proto_only": {
+            "mask": masks["proto_only"],
+            "score": np.asarray(reference["proto_scores"], dtype=np.float32),
+            "selection_mode": f"static_training_pool_prototype_only_p{proto_keep_ratio:g}",
         },
         "both_only": {
             "mask": masks["both_only"],
