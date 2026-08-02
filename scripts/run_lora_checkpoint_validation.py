@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,10 @@ from gcdd.checkpoint_validation import (
     build_validation_safe_static_selections,
     load_clean_labels_from_noise_index,
 )
+from gcdd.budget_matching import ClassBudgetSchedule, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, write_csv, write_json, write_yaml
-from gcdd.lora_dynamic import train_dynamic_loss_lora
+from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
@@ -51,9 +53,9 @@ METHODS = (
     "pgdf_auto",
     "pgdf_fixed",
 )
-ABLATION_METHODS = ("proto_only",)
+ABLATION_METHODS = ("proto_only", "dynamic_budget_matched")
 STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
-DYNAMIC_METHODS = ("dynamic", "dynamic_r08", "dynamic_r09", "pgdf_auto", "pgdf_fixed")
+DYNAMIC_METHODS = ("dynamic", "dynamic_r08", "dynamic_r09", "dynamic_budget_matched", "pgdf_auto", "pgdf_fixed")
 LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
 
@@ -68,13 +70,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--methods",
         default="all",
-        help="Use 'all' for the 13 primary methods, or an explicit subset. proto_only is an explicit ablation; dynamic aliases dynamic_r08.",
+        help=(
+            "Use 'all' for the 13 primary methods, or an explicit subset. "
+            "proto_only and dynamic_budget_matched are explicit ablations; dynamic aliases dynamic_r08."
+        ),
     )
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
     parser.add_argument("--validation-ratio", type=float, default=0.10, help="Fixed clean validation fraction per clean class.")
     parser.add_argument("--validation-seed", type=int, default=20250726, help="Dataset-level seed used once to create the shared validation manifest.")
     parser.add_argument("--dynamic-ratio", type=float, default=0.8, help="Class-wise dynamic small-loss keep ratio r.")
     parser.add_argument("--fixed-p", type=float, default=0.4, help="Pre-declared global prototype keep ratio for PGDF fixed-p.")
+    parser.add_argument(
+        "--pgdf-budget-root",
+        help=(
+            "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
+            "Required only by dynamic_budget_matched."
+        ),
+    )
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Dynamic/PGDF full-pool warm-up epochs.")
     parser.add_argument("--update-interval", type=int, default=5, help="Dynamic/PGDF selection update interval.")
     parser.add_argument("--auto-high-jaccard", type=float, default=0.75)
@@ -90,7 +102,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--official-test-selected-only",
         action="store_true",
-        help="Evaluate official test only once on best_val.pt. Required for the explicit proto_only ablation.",
+        help=(
+            "Evaluate official test only once on best_val.pt. Required for the explicit "
+            "proto_only and dynamic_budget_matched ablations."
+        ),
     )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
     parser.add_argument("--batch-size", type=int, help="Override LoRA training batch size.")
@@ -136,6 +151,8 @@ def main() -> None:
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
     validate_official_test_request(methods, bool(args.official_test_selected_only))
+    pgdf_budget_root = Path(args.pgdf_budget_root) if args.pgdf_budget_root else None
+    validate_budget_method_request(methods, pgdf_budget_root, seeds)
     preflight_run_dirs(output_dir, methods, seeds)
     path_maps = parse_path_maps(args.path_map)
     cfg = load_config(input_dir, Path(args.config) if args.config else None)
@@ -153,6 +170,7 @@ def main() -> None:
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
         "official_test_selected_only": bool(args.official_test_selected_only),
+        "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
         "two_branch": {
             "remember_mode": "fixed",
@@ -175,6 +193,8 @@ def main() -> None:
         validation_ratio=float(args.validation_ratio),
         validation_seed=int(args.validation_seed),
     )
+    if pgdf_budget_root is not None:
+        validate_budget_source_manifest(pgdf_budget_root, split.metadata)
     validation_idx = np.where(split.validation_mask)[0]
     validation_paths = [data["train_paths"][int(index)] for index in validation_idx]
     validation_labels = clean_labels[validation_idx]
@@ -277,6 +297,8 @@ def main() -> None:
                     result_row["proto_keep_ratio"] = float(args.fixed_p)
             elif canonical_key in DYNAMIC_METHODS:
                 run_cfg["loss_type"] = "ce"
+                budget_schedule: ClassBudgetSchedule | None = None
+                scheduler_retention_ratio: float | None = None
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -285,6 +307,43 @@ def main() -> None:
                     proto_keep_ratio = None
                     auto_proto_keep = None
                     selection_mode = f"dynamic_training_pool_small_loss_r{retention_ratio:g}"
+                elif canonical_key == "dynamic_budget_matched":
+                    if pgdf_budget_root is None:
+                        raise RuntimeError("PGDF budget root was not configured.")
+                    budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
+                    expected_updates = selection_update_epochs(
+                        int(run_cfg["lora_train"]["epochs"]),
+                        int(args.warmup_epochs),
+                        int(args.update_interval),
+                    )
+                    budget_schedule = load_pgdf_class_budget_schedule(
+                        budget_path,
+                        expected_seed=seed,
+                        expected_update_epochs=expected_updates,
+                        labels=data["train_labels"],
+                        candidate_mask=split.train_mask,
+                    )
+                    validate_budget_source_hyperparameters(
+                        budget_schedule,
+                        dynamic_ratio=float(args.dynamic_ratio),
+                        fixed_p=float(args.fixed_p),
+                    )
+                    retention_ratio = float(budget_schedule.source_retention_ratio)
+                    scheduler_retention_ratio = min(
+                        budget_schedule.source_retention_ratio,
+                        budget_schedule.source_proto_keep_ratio,
+                    )
+                    method_name = (
+                        "DINOv2 LoRA Dynamic small-loss matched to PGDF class budget "
+                        f"r={budget_schedule.source_retention_ratio:g} "
+                        f"p={budget_schedule.source_proto_keep_ratio:g}"
+                    )
+                    proto_scores = None
+                    centroid_mask = None
+                    proto_keep_ratio = None
+                    auto_proto_keep = None
+                    selection_mode = "dynamic_small_loss_pgdf_per_class_budget_matched"
+                    write_budget_source(run_dir, budget_schedule)
                 elif canonical_key == "pgdf_auto":
                     if pgdf_reference is None:
                         raise RuntimeError("PGDF reference was not constructed.")
@@ -329,7 +388,12 @@ def main() -> None:
                     last5_checkpoint_dir=checkpoints / "last5",
                     checkpoint_protocol=PROTOCOL_NAME,
                     posthoc_oracle_test=bool(args.posthoc_oracle_test),
+                    class_budget_schedule=budget_schedule.budgets if budget_schedule is not None else None,
+                    scheduler_retention_ratio=scheduler_retention_ratio,
+                    official_test_selected_only=bool(args.official_test_selected_only),
                 )
+                if budget_schedule is not None:
+                    verify_observed_budget_match(result.per_class_rows, budget_schedule)
                 all_updates.extend(result.update_rows)
                 write_csv(run_dir / "selection_rows.csv", result.selection_rows, selection_fields())
                 write_csv(run_dir / "selection_updates.csv", result.update_rows, update_fields())
@@ -342,6 +406,16 @@ def main() -> None:
                     selected_count=int(result.summary["final_selected_samples"]),
                     candidate_count=int(result.summary["candidate_samples"]),
                 )
+                if budget_schedule is not None:
+                    result_row.update(
+                        {
+                            "budget_source_path": budget_schedule.source_path,
+                            "budget_source_sha256": budget_schedule.source_sha256,
+                            "budget_source_retention_ratio": budget_schedule.source_retention_ratio,
+                            "budget_source_proto_keep_ratio": budget_schedule.source_proto_keep_ratio,
+                            "budget_match_verified": "yes",
+                        }
+                    )
             elif canonical_key in {"coteaching", "jocor"}:
                 run_cfg["loss_type"] = "ce"
                 run_cfg["lora_train"]["batch_size"] = int(args.dual_batch_size)
@@ -404,6 +478,9 @@ def main() -> None:
                     "selection_ratio": result_row["selection_ratio"],
                     "validation_samples_are_training_candidates": False,
                     "official_test_used_for_checkpoint_selection": False,
+                    "budget_source_path": result_row.get("budget_source_path", ""),
+                    "budget_source_sha256": result_row.get("budget_source_sha256", ""),
+                    "budget_match_verified": result_row.get("budget_match_verified", ""),
                 },
             )
             all_results.append(result_row)
@@ -433,6 +510,7 @@ def main() -> None:
             "protocol": PROTOCOL_NAME,
             "input_dir": str(input_dir),
             "noise_index": str(noise_index),
+            "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
             "methods": methods,
             "seeds": seeds,
             "validation_manifest": split.metadata,
@@ -552,6 +630,125 @@ def finalize_result_row(
     row["selection_ratio"] = float(selected_count) / max(1, candidate_count)
     row.setdefault("candidate_samples", int(candidate_count))
     return row
+
+
+def validate_budget_method_request(
+    methods: list[str],
+    pgdf_budget_root: Path | None,
+    seeds: list[int],
+) -> None:
+    requested = "dynamic_budget_matched" in {canonical_method_key(method) for method in methods}
+    if requested and pgdf_budget_root is None:
+        raise ValueError("dynamic_budget_matched requires --pgdf-budget-root.")
+    if not requested:
+        return
+    if not pgdf_budget_root.is_dir():
+        raise FileNotFoundError(f"PGDF budget root does not exist: {pgdf_budget_root}")
+    missing = [
+        str(pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv")
+        for seed in seeds
+        if not (pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv").is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(f"Missing PGDF per-class budget files: {missing}")
+
+
+def validate_budget_source_manifest(pgdf_budget_root: Path, current_manifest: dict[str, Any]) -> None:
+    """Require the budget source to use the exact fixed validation partition."""
+    source_path = pgdf_budget_root.parent / "validation_manifest.json"
+    if not source_path.exists():
+        raise FileNotFoundError(f"PGDF budget source validation manifest is missing: {source_path}")
+    with source_path.open("r", encoding="utf-8") as handle:
+        source = json.load(handle)
+    exact_fields = (
+        "protocol",
+        "validation_seed",
+        "train_paths_sha256",
+        "source_train_samples",
+        "training_pool_samples",
+        "validation_samples",
+        "stratification_label",
+        "validation_label",
+    )
+    mismatches = [
+        field for field in exact_fields if source.get(field) != current_manifest.get(field)
+    ]
+    if not np.isclose(
+        float(source.get("validation_ratio", -1.0)),
+        float(current_manifest.get("validation_ratio", -2.0)),
+    ):
+        mismatches.append("validation_ratio")
+    if mismatches:
+        raise ValueError(
+            "PGDF budget source does not use the current fixed validation manifest; "
+            f"mismatched fields: {sorted(set(mismatches))}."
+        )
+
+
+def validate_budget_source_hyperparameters(
+    schedule: ClassBudgetSchedule,
+    *,
+    dynamic_ratio: float,
+    fixed_p: float,
+) -> None:
+    if not np.isclose(schedule.source_retention_ratio, dynamic_ratio):
+        raise ValueError(
+            f"PGDF budget r={schedule.source_retention_ratio} does not match "
+            f"--dynamic-ratio={dynamic_ratio}."
+        )
+    if not np.isclose(schedule.source_proto_keep_ratio, fixed_p):
+        raise ValueError(
+            f"PGDF budget p={schedule.source_proto_keep_ratio} does not match --fixed-p={fixed_p}."
+        )
+
+
+def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule) -> None:
+    """Freeze only PGDF class counts, never its selected sample identities or scores."""
+    write_csv(
+        run_dir / "budget_source.csv",
+        schedule.rows,
+        ["seed", "epoch", "noisy_label", "total_count", "selected_count", "selected_ratio"],
+    )
+    write_json(
+        run_dir / "budget_source.json",
+        {
+            "source_path": schedule.source_path,
+            "source_sha256": schedule.source_sha256,
+            "source_method": "pgdf_fixed",
+            "source_retention_ratio": schedule.source_retention_ratio,
+            "source_proto_keep_ratio": schedule.source_proto_keep_ratio,
+            "seed": schedule.seed,
+            "update_epochs": sorted(schedule.budgets),
+            "selection_rule": "current-model class-wise small-loss with exact PGDF selected_count",
+            "uses_pgdf_sample_identity": False,
+            "uses_prototype_or_graph_scores": False,
+        },
+    )
+
+
+def verify_observed_budget_match(
+    per_class_rows: list[dict[str, Any]],
+    schedule: ClassBudgetSchedule,
+) -> None:
+    observed = {
+        (int(row["epoch"]), str(row["web_label"])): int(row["selected_count"])
+        for row in per_class_rows
+    }
+    expected = {
+        (epoch, noisy_label): int(selected_count)
+        for epoch, class_counts in schedule.budgets.items()
+        for noisy_label, selected_count in class_counts.items()
+    }
+    if observed != expected:
+        missing = sorted(set(expected) - set(observed))
+        extra = sorted(set(observed) - set(expected))
+        wrong = sorted(
+            key for key in set(expected) & set(observed) if expected[key] != observed[key]
+        )
+        raise RuntimeError(
+            "Observed Dynamic selections do not exactly match the PGDF class budgets: "
+            f"missing={missing[:5]}, extra={extra[:5]}, wrong_counts={wrong[:5]}."
+        )
 
 
 def require_fresh_run_dir(run_dir: Path) -> None:
@@ -678,6 +875,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dual-batch-size and --dual-grad-accum-steps must be positive.")
     if args.jocor_lambda < 0.0:
         raise ValueError("--jocor-lambda must be non-negative.")
+    if args.official_test_selected_only and args.posthoc_oracle_test:
+        raise ValueError("--official-test-selected-only cannot be combined with --posthoc-oracle-test.")
 
 
 def parse_methods(raw: str) -> list[str]:
@@ -702,12 +901,17 @@ def parse_methods(raw: str) -> list[str]:
 
 
 def validate_official_test_request(methods: list[str], selected_only: bool) -> None:
-    """Keep the prototype-only ablation on its strict one-shot test protocol."""
+    """Keep strict ablations on their validation-selected one-shot test protocol."""
     canonical = [canonical_method_key(method) for method in methods]
-    if "proto_only" in canonical and not selected_only:
-        raise ValueError("proto_only requires --official-test-selected-only.")
-    if selected_only and canonical != ["proto_only"]:
-        raise ValueError("--official-test-selected-only is currently restricted to --methods proto_only.")
+    strict_methods = {"proto_only", "dynamic_budget_matched"}
+    requested_strict = sorted(strict_methods & set(canonical))
+    if requested_strict and not selected_only:
+        raise ValueError(f"{', '.join(requested_strict)} requires --official-test-selected-only.")
+    if selected_only and (len(canonical) != 1 or canonical[0] not in strict_methods):
+        raise ValueError(
+            "--official-test-selected-only is restricted to a single strict ablation: "
+            "proto_only or dynamic_budget_matched."
+        )
 
 
 def canonical_method_key(method_key: str) -> str:
@@ -817,7 +1021,9 @@ def result_fields() -> list[str]:
         "last5_test_mean", "last5_test_std", "last5_test_top5_mean", "last5_test_top5_std", "oracle_best_test_epoch",
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
-        "selection_updates", "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
+        "selection_updates", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
+        "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
+        "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
     ]
 

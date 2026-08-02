@@ -65,6 +65,9 @@ def train_dynamic_loss_lora(
     last5_checkpoint_dir: Path | None = None,
     checkpoint_protocol: str = "legacy_test_selected",
     posthoc_oracle_test: bool = False,
+    class_budget_schedule: dict[int, dict[str, int]] | None = None,
+    scheduler_retention_ratio: float | None = None,
+    official_test_selected_only: bool = False,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -78,6 +81,8 @@ def train_dynamic_loss_lora(
     validate_dynamic_args(retention_ratio, warmup_epochs, update_interval, proto_keep_ratio, auto_proto_keep)
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
+    if official_test_selected_only and posthoc_oracle_test:
+        raise ValueError("official_test_selected_only cannot be combined with posthoc_oracle_test.")
     path_maps = path_maps or []
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
     if candidate_mask.shape != (len(train_labels),):
@@ -96,6 +101,10 @@ def train_dynamic_loss_lora(
             raise ValueError("proto_scores contains NaN values for candidate samples.")
     if auto_proto_keep is not None and centroid_mask is None:
         raise ValueError("auto_proto_keep requires centroid_mask to compute dynamic/prototype overlap.")
+    if class_budget_schedule is not None and any(
+        value is not None for value in (centroid_mask, proto_scores, proto_keep_ratio, auto_proto_keep)
+    ):
+        raise ValueError("class_budget_schedule cannot be combined with prototype, centroid, or graph selection inputs.")
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -173,12 +182,27 @@ def train_dynamic_loss_lora(
 
     epochs = int(train_cfg["epochs"])
     batch_size = int(train_cfg["batch_size"])
+    expected_budget_epochs = selection_update_epochs(epochs, warmup_epochs, update_interval)
+    if class_budget_schedule is not None:
+        validate_class_budget_schedule(
+            class_budget_schedule,
+            train_labels,
+            candidate_mask,
+            expected_budget_epochs,
+        )
+    effective_scheduler_ratio = (
+        estimate_selection_retention_ratio(retention_ratio, proto_keep_ratio, auto_proto_keep)
+        if scheduler_retention_ratio is None
+        else float(scheduler_retention_ratio)
+    )
+    if not 0.0 < effective_scheduler_ratio <= 1.0:
+        raise ValueError("scheduler_retention_ratio must satisfy 0 < ratio <= 1.")
     total_steps = estimate_dynamic_total_steps(
         candidate_count=int(candidate_mask.sum()),
         batch_size=batch_size,
         epochs=epochs,
         warmup_epochs=warmup_epochs,
-        retention_ratio=estimate_selection_retention_ratio(retention_ratio, proto_keep_ratio, auto_proto_keep),
+        retention_ratio=effective_scheduler_ratio,
     )
     warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.1)))
     scheduler = build_scheduler(torch, optimizer, total_steps, warmup_steps, str(train_cfg.get("scheduler", "cosine")))
@@ -272,7 +296,15 @@ def train_dynamic_loss_lora(
         if epoch < epochs and should_update_selection(epoch, warmup_epochs, update_interval):
             losses, confidence = compute_train_losses(torch, model, loss_loader, device, len(train_labels), bool(train_cfg.get("amp", True)))
             previous_mask = selected_mask.copy()
-            loss_selected_mask = select_small_loss_classwise(losses, train_labels, candidate_mask, retention_ratio)
+            if class_budget_schedule is not None:
+                loss_selected_mask = select_small_loss_classwise_by_budget(
+                    losses,
+                    train_labels,
+                    candidate_mask,
+                    class_budget_schedule[epoch],
+                )
+            else:
+                loss_selected_mask = select_small_loss_classwise(losses, train_labels, candidate_mask, retention_ratio)
             proto_pass_mask = None
             if auto_proto_keep is not None and selected_proto_keep_ratio is None:
                 auto_proto_jaccard = mask_jaccard(loss_selected_mask, centroid_mask)
@@ -355,6 +387,16 @@ def train_dynamic_loss_lora(
             validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
             final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
             last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
+            last5_test_mean: float | str = float(last5_test_top1.mean())
+            last5_test_std: float | str = float(last5_test_top1.std())
+        elif official_test_selected_only:
+            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+            )
+            final_test_top1 = ""
+            final_test_top5 = ""
+            last5_test_mean = ""
+            last5_test_std = ""
         else:
             validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
                 torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
@@ -369,8 +411,17 @@ def train_dynamic_loss_lora(
                 ],
                 dtype=np.float32,
             )
+            last5_test_mean = float(last5_test_top1.mean())
+            last5_test_std = float(last5_test_top1.std())
         protocol_metrics = {
             "checkpoint_protocol": checkpoint_protocol,
+            "official_test_evaluation": (
+                "validation_selected_only"
+                if official_test_selected_only
+                else "posthoc_oracle_curve"
+                if posthoc_oracle_test
+                else "validation_selected_final_last5"
+            ),
             "validation_samples": int(len(eval_idx)),
             "test_samples": int(len(test_idx)),
             "best_val_epoch": int(best_row["epoch"]),
@@ -378,10 +429,10 @@ def train_dynamic_loss_lora(
             "best_val_top5": float(best_row["top5"]),
             "validation_selected_test_top1": float(validation_selected_test_top1),
             "validation_selected_test_top5": float(validation_selected_test_top5),
-            "final_test_top1": float(final_test_top1),
-            "final_test_top5": float(final_test_top5),
-            "last5_test_mean": float(last5_test_top1.mean()),
-            "last5_test_std": float(last5_test_top1.std()),
+            "final_test_top1": final_test_top1 if final_test_top1 == "" else float(final_test_top1),
+            "final_test_top5": final_test_top5 if final_test_top5 == "" else float(final_test_top5),
+            "last5_test_mean": last5_test_mean,
+            "last5_test_std": last5_test_std,
         }
         if posthoc_oracle_test:
             oracle_rows = [(epoch, *metrics) for epoch, metrics in epoch_test_metrics.items()]
@@ -410,6 +461,8 @@ def train_dynamic_loss_lora(
                 "auto_proto_jaccard": auto_proto_jaccard,
                 "warmup_epochs": int(warmup_epochs),
                 "update_interval": int(update_interval),
+                "budget_matched": class_budget_schedule is not None,
+                "scheduler_retention_ratio": float(effective_scheduler_ratio),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -430,6 +483,8 @@ def train_dynamic_loss_lora(
                 "auto_proto_jaccard": auto_proto_jaccard,
                 "warmup_epochs": int(warmup_epochs),
                 "update_interval": int(update_interval),
+                "budget_matched": class_budget_schedule is not None,
+                "scheduler_retention_ratio": float(effective_scheduler_ratio),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -453,6 +508,8 @@ def train_dynamic_loss_lora(
             "auto_proto_jaccard": auto_proto_jaccard if auto_proto_jaccard is not None else "",
             "warmup_epochs": int(warmup_epochs),
             "update_interval": int(update_interval),
+            "budget_matched": "yes" if class_budget_schedule is not None else "no",
+            "scheduler_retention_ratio": float(effective_scheduler_ratio),
             "candidate_samples": int(candidate_mask.sum()),
             "final_selected_samples": int(selected_mask.sum()),
             "selection_updates": len(update_rows),
@@ -493,6 +550,15 @@ def validate_dynamic_args(
 
 def should_update_selection(epoch: int, warmup_epochs: int, update_interval: int) -> bool:
     return epoch >= warmup_epochs and (epoch - warmup_epochs) % update_interval == 0
+
+
+def selection_update_epochs(epochs: int, warmup_epochs: int, update_interval: int) -> list[int]:
+    """Return post-epoch selection updates; the final epoch has no successor."""
+    return [
+        epoch
+        for epoch in range(1, max(0, int(epochs)))
+        if should_update_selection(epoch, warmup_epochs, update_interval)
+    ]
 
 
 def estimate_dynamic_total_steps(candidate_count: int, batch_size: int, epochs: int, warmup_epochs: int, retention_ratio: float) -> int:
@@ -582,6 +648,72 @@ def select_small_loss_classwise(losses: np.ndarray, labels: np.ndarray, candidat
         keep = len(idx) if retention_ratio >= 1.0 else max(1, int(math.floor(len(idx) * retention_ratio)))
         order = np.argsort(losses[idx], kind="mergesort")
         selected[idx[order[:keep]]] = True
+    return selected
+
+
+def validate_class_budget_schedule(
+    schedule: dict[int, dict[str, int]],
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    expected_update_epochs: list[int],
+) -> None:
+    found_epochs = sorted(int(epoch) for epoch in schedule)
+    if found_epochs != list(expected_update_epochs):
+        raise ValueError(
+            f"class_budget_schedule epochs {found_epochs} do not match expected updates "
+            f"{expected_update_epochs}."
+        )
+    for epoch in expected_update_epochs:
+        validate_class_budgets(labels, candidate_mask, schedule[epoch], epoch=epoch)
+
+
+def validate_class_budgets(
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    class_budgets: dict[str, int],
+    *,
+    epoch: int | None = None,
+) -> None:
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    expected_classes = sorted(set(labels[candidate_mask].tolist()))
+    normalized = {str(label): int(count) for label, count in class_budgets.items()}
+    if set(normalized) != set(expected_classes):
+        missing = sorted(set(expected_classes) - set(normalized))
+        extra = sorted(set(normalized) - set(expected_classes))
+        raise ValueError(
+            f"Class budget keys do not match noisy-label classes at epoch {epoch}: "
+            f"missing={missing}, extra={extra}."
+        )
+    for label in expected_classes:
+        total = int(np.sum(candidate_mask & (labels == label)))
+        keep = normalized[label]
+        if not 1 <= keep <= total:
+            raise ValueError(
+                f"Invalid class budget at epoch {epoch}, class {label!r}: "
+                f"keep={keep}, available={total}."
+            )
+
+
+def select_small_loss_classwise_by_budget(
+    losses: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    class_budgets: dict[str, int],
+) -> np.ndarray:
+    """Select exactly the supplied count in each noisy-label class by loss only."""
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    validate_class_budgets(labels, candidate_mask, class_budgets)
+    normalized = {str(label): int(count) for label, count in class_budgets.items()}
+    selected = np.zeros(len(labels), dtype=bool)
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        if np.any(np.isnan(losses[idx])):
+            raise ValueError(f"Missing loss values for class {label}.")
+        # Stable sorting makes equal-loss ties reproducible by original index.
+        order = np.argsort(losses[idx], kind="mergesort")
+        selected[idx[order[: normalized[label]]]] = True
     return selected
 
 
