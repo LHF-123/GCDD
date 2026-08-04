@@ -103,8 +103,8 @@ def parse_args() -> argparse.Namespace:
         "--official-test-selected-only",
         action="store_true",
         help=(
-            "Evaluate official test only once on best_val.pt. Required for the explicit "
-            "proto_only and dynamic_budget_matched ablations."
+            "Evaluate official test only once on best_val.pt for single-branch methods. "
+            "Required for the explicit proto_only and dynamic_budget_matched ablations."
         ),
     )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
@@ -904,13 +904,15 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
     """Keep strict ablations on their validation-selected one-shot test protocol."""
     canonical = [canonical_method_key(method) for method in methods]
     strict_methods = {"proto_only", "dynamic_budget_matched"}
+    selected_only_supported = (set(METHODS) | set(ABLATION_METHODS)) - {"coteaching", "jocor"}
     requested_strict = sorted(strict_methods & set(canonical))
     if requested_strict and not selected_only:
         raise ValueError(f"{', '.join(requested_strict)} requires --official-test-selected-only.")
-    if selected_only and (len(canonical) != 1 or canonical[0] not in strict_methods):
+    unsupported = sorted(set(canonical) - selected_only_supported)
+    if selected_only and unsupported:
         raise ValueError(
-            "--official-test-selected-only is restricted to a single strict ablation: "
-            "proto_only or dynamic_budget_matched."
+            "--official-test-selected-only is not implemented for methods that train two branches: "
+            f"{unsupported}."
         )
 
 
