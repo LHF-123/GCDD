@@ -33,10 +33,23 @@ if [[ $# -ne 1 ]]; then
 fi
 
 NOISE_SEED=$1
-case "$NOISE_SEED" in
-  17|42|73) ;;
-  *) die "noise seed 必须是 17、42 或 73；收到：${NOISE_SEED}" ;;
-esac
+if [[ ! "$NOISE_SEED" =~ ^[0-9]+$ ]]; then
+  die "noise seed 必须是非负整数；收到：${NOISE_SEED}"
+fi
+# Normalize leading zeros so e.g. 042 is the same realization as 42.
+NOISE_SEED=$((10#$NOISE_SEED))
+REFERENCE_NOISE_SEEDS=(17 42 73)
+NOISE_SEEDS=("${REFERENCE_NOISE_SEEDS[@]}")
+IS_REFERENCE_SEED=no
+for REFERENCE_SEED in "${REFERENCE_NOISE_SEEDS[@]}"; do
+  if [[ "$NOISE_SEED" == "$REFERENCE_SEED" ]]; then
+    IS_REFERENCE_SEED=yes
+    break
+  fi
+done
+if [[ "$IS_REFERENCE_SEED" == no ]]; then
+  NOISE_SEEDS+=("$NOISE_SEED")
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -86,15 +99,16 @@ exec > >(tee -a "$REALIZATION_ROOT/launcher.log") 2>&1
 echo "[INFO] 仓库目录：${REPO_ROOT}"
 echo "[INFO] noise seed：${NOISE_SEED}；training seed：42；validation seed：20250726"
 echo "[INFO] 本实例将顺序训练 4 个 run：Dynamic r=0.8、JAL-CE、PGDF r=0.8/p=0.4、Budget-matched Dynamic。"
+echo "[INFO] 用于交叉审计的 noise index：${NOISE_SEEDS[*]}；仅训练当前 noise seed。"
 if [[ ${#CREATE_VALIDATION_ARGS[@]} -eq 0 ]]; then
   echo "[INFO] 复用正式 validation manifest：${VALIDATION_SOURCE_DIR}"
 else
   echo "[INFO] 未发现旧 manifest；将在新 realization 目录中确定性重建 fixed_clean_validation_v1。"
 fi
 
-CURRENT_STAGE="生成并核对三个 noise index"
+CURRENT_STAGE="生成并核对当前及参考 noise index"
 mkdir -p "$NOISE_INDEX_DIR"
-for SEED in 17 42 73; do
+for SEED in "${NOISE_SEEDS[@]}"; do
   PREFIX="cub_asym_r0p4_s${SEED}"
   EXPECTED=(
     "$NOISE_INDEX_DIR/${PREFIX}_index.csv"
@@ -123,7 +137,7 @@ done
 
 NOISE_INDEX="$NOISE_INDEX_DIR/cub_asym_r0p4_s${NOISE_SEED}_index.csv"
 PEER_ARGS=()
-for PEER_SEED in 17 42 73; do
+for PEER_SEED in "${NOISE_SEEDS[@]}"; do
   if [[ "$PEER_SEED" != "$NOISE_SEED" ]]; then
     PEER_ARGS+=(--peer-noise-index "$NOISE_INDEX_DIR/cub_asym_r0p4_s${PEER_SEED}_index.csv")
   fi
