@@ -68,6 +68,8 @@ class RandomDerangementExperimentTests(unittest.TestCase):
             manifest = root / "alternative.csv"
             validation_source = root / "formal_validation"
             validation_peer = root / "peer_validation"
+            validation_missing_peer = root / "missing_peer_validation"
+            validation_partial_peer = root / "partial_peer_validation"
             validation_destination = root / "new_validation"
             validation_source.mkdir()
             validation_peer.mkdir()
@@ -179,7 +181,7 @@ class RandomDerangementExperimentTests(unittest.TestCase):
                 validation_seed=20250726,
                 noise_rate=0.4,
                 expected_pool=(18, 12, 6),
-                peer_validation_dirs=(validation_peer,),
+                peer_validation_dirs=(validation_peer, validation_missing_peer),
             )
             alternative_rows = read_csv_with_fields(manifest)[0]
             original_mask = [row["is_noisy"] == "true" for row in rows]
@@ -190,6 +192,29 @@ class RandomDerangementExperimentTests(unittest.TestCase):
             self.assertEqual(file_sha256(validation_source / "validation_manifest.csv"), file_sha256(validation_destination / "validation_manifest.csv"))
             self.assertEqual((audit["training_pool"], audit["training_pool_clean"], audit["training_pool_noisy"]), (18, 12, 6))
             self.assertTrue(audit["peer_validation_manifest_comparisons"][0]["semantic_equal"])
+            self.assertEqual(audit["peer_validation_manifest_comparisons"][0]["status"], "PASS")
+            self.assertEqual(audit["peer_validation_manifest_comparisons"][1]["status"], "OPTIONAL_MISSING")
+
+            validation_partial_peer.mkdir()
+            (validation_partial_peer / "validation_manifest.csv").write_bytes(source_csv.read_bytes())
+            with self.assertRaises(FileNotFoundError):
+                audit_noise_control(
+                    dataset="synthetic",
+                    train_paths=paths,
+                    original_noise_index=original,
+                    alternative_manifest=manifest,
+                    validation_source_dir=validation_source,
+                    validation_destination_dir=validation_destination,
+                    mapping=mapping,
+                    mapping_file=mapping_file,
+                    mapping_sha256=mapping_hash,
+                    noise_seed=42,
+                    mapping_seed=20260815,
+                    validation_seed=20250726,
+                    noise_rate=0.4,
+                    expected_pool=(18, 12, 6),
+                    peer_validation_dirs=(validation_partial_peer,),
+                )
 
             changed_rows = [dict(row) for row in validation_rows]
             changed_rows[1]["partition"] = "validation"

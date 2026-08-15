@@ -425,6 +425,24 @@ def audit_noise_control(
     for peer_dir in peer_validation_dirs:
         peer_csv = peer_dir / "validation_manifest.csv"
         peer_json = peer_dir / "validation_manifest.json"
+        csv_exists = peer_csv.is_file()
+        json_exists = peer_json.is_file()
+        if not csv_exists and not json_exists:
+            peer_comparisons.append(
+                {
+                    "peer_dir": str(peer_dir),
+                    "status": "OPTIONAL_MISSING",
+                    "semantic_equal": "",
+                    "row_mismatch_count": "",
+                    "metadata_mismatch_fields": [],
+                }
+            )
+            continue
+        if csv_exists != json_exists:
+            raise FileNotFoundError(
+                f"{dataset}: optional peer validation manifest is only partially present at {peer_dir}; "
+                "CSV and JSON must either both exist or both be absent."
+            )
         load_and_validate_manifest(
             peer_csv,
             peer_json,
@@ -439,6 +457,8 @@ def audit_noise_control(
             peer_csv,
             peer_json,
         )
+        comparison["peer_dir"] = str(peer_dir)
+        comparison["status"] = "PASS" if comparison["semantic_equal"] else "MISMATCH"
         peer_comparisons.append(comparison)
         if not comparison["semantic_equal"]:
             raise ValueError(
