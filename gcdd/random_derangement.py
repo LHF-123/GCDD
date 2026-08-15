@@ -53,6 +53,21 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def mapping_file_sha256(path: Path) -> str:
+    """Hash a mapping JSON with platform-independent CRLF normalization.
+
+    The mappings were first frozen on Windows, so their published hashes are
+    hashes of the CRLF bytes.  Git may check the same JSON out with LF on
+    Linux.  Normalizing only line endings preserves the original published
+    hashes while all JSON content remains covered by the digest.
+    """
+
+    data = path.read_bytes()
+    lf_data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    canonical_data = lf_data.replace(b"\n", b"\r\n")
+    return hashlib.sha256(canonical_data).hexdigest()
+
+
 def generate_derangement(class_order: Iterable[str], seed: int) -> dict[str, str]:
     """Generate one deterministic bijection with no fixed points."""
 
@@ -98,7 +113,7 @@ def prepare_mapping(
     if path.exists():
         payload = read_json(path)
         _validate_mapping_payload(payload, dataset=dataset, class_order=labels, mapping_seed=mapping_seed)
-        digest = file_sha256(path)
+        digest = mapping_file_sha256(path)
         recorded = sidecar.read_text(encoding="ascii").strip().split()[0]
         if recorded != digest:
             raise ValueError(f"Frozen mapping SHA-256 mismatch for {path}: {recorded} != {digest}")
@@ -120,7 +135,7 @@ def prepare_mapping(
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_json_exclusive(path, payload)
-    digest = file_sha256(path)
+    digest = mapping_file_sha256(path)
     _write_text_exclusive(sidecar, f"{digest}  {path.name}\n", encoding="ascii")
     return mapping, digest
 
@@ -304,7 +319,7 @@ def audit_noise_control(
         noise_rate=float(noise_rate),
     )
     validate_derangement(mapping, cyclic_summary["class_order"])
-    if file_sha256(mapping_file) != mapping_sha256:
+    if mapping_file_sha256(mapping_file) != mapping_sha256:
         raise ValueError(f"Mapping JSON changed after it was loaded: {mapping_file}")
 
     original_mask = np.asarray([parse_bool(row["is_noisy"]) for row in original_rows], dtype=bool)

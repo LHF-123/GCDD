@@ -10,6 +10,7 @@ from gcdd.checkpoint_validation import PROTOCOL_NAME, hash_paths
 from gcdd.random_derangement import (
     audit_noise_control,
     file_sha256,
+    mapping_file_sha256,
     prepare_mapping,
     prepare_noise_manifest,
     read_csv_with_fields,
@@ -41,10 +42,23 @@ class RandomDerangementExperimentTests(unittest.TestCase):
             )
             self.assertEqual(first, second)
             self.assertEqual(first_hash, second_hash)
-            self.assertEqual(first_hash, file_sha256(path))
+            self.assertEqual(first_hash, mapping_file_sha256(path))
             self.assertEqual(set(first), set(classes))
             self.assertEqual(set(first.values()), set(classes))
             self.assertTrue(all(source != target for source, target in first.items()))
+
+            # Simulate Git checking a Windows-created JSON out on Linux.  The
+            # semantic mapping and its frozen published hash must not change.
+            path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n"))
+            linux_mapping, linux_hash = prepare_mapping(
+                path,
+                dataset="synthetic",
+                class_order=classes,
+                mapping_seed=20260815,
+            )
+            self.assertEqual(first, linux_mapping)
+            self.assertEqual(first_hash, linux_hash)
+            self.assertEqual(first_hash, mapping_file_sha256(path))
 
     def test_source_flip_mask_validation_and_pool_counts_are_exact(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
