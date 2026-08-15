@@ -67,8 +67,10 @@ class RandomDerangementExperimentTests(unittest.TestCase):
             mapping_file = root / "mapping.json"
             manifest = root / "alternative.csv"
             validation_source = root / "formal_validation"
+            validation_peer = root / "peer_validation"
             validation_destination = root / "new_validation"
             validation_source.mkdir()
+            validation_peer.mkdir()
 
             paths = [f"train/{label}/sample_{index:02d}.jpg" for label in ("0", "1") for index in range(10)]
             fields = [
@@ -133,22 +135,33 @@ class RandomDerangementExperimentTests(unittest.TestCase):
                 validation_rows,
                 ["index", "path", "clean_label", "partition"],
             )
+            validation_metadata = {
+                "protocol": PROTOCOL_NAME,
+                "validation_ratio": 0.10,
+                "validation_seed": 20250726,
+                "train_paths_sha256": hash_paths(paths),
+                "source_train_samples": 20,
+                "training_pool_samples": 18,
+                "validation_samples": 2,
+                "stratification_label": "clean_label",
+                "validation_label": "clean_label",
+            }
             (validation_source / "validation_manifest.json").write_text(
-                json.dumps(
-                    {
-                        "protocol": PROTOCOL_NAME,
-                        "validation_ratio": 0.10,
-                        "validation_seed": 20250726,
-                        "train_paths_sha256": hash_paths(paths),
-                        "source_train_samples": 20,
-                        "training_pool_samples": 18,
-                        "validation_samples": 2,
-                        "stratification_label": "clean_label",
-                        "validation_label": "clean_label",
-                    },
-                    indent=2,
-                ),
+                json.dumps(validation_metadata, indent=2),
                 encoding="utf-8",
+            )
+            source_csv = validation_source / "validation_manifest.csv"
+            # Same rows with LF-only bytes and differently formatted JSON must
+            # remain the exact same validation experiment semantically.
+            (validation_peer / "validation_manifest.csv").write_bytes(
+                source_csv.read_bytes().replace(b"\r\n", b"\n")
+            )
+            (validation_peer / "validation_manifest.json").write_bytes(
+                (json.dumps(validation_metadata, separators=(",", ":")) + "\n").encode("utf-8")
+            )
+            self.assertNotEqual(
+                file_sha256(source_csv),
+                file_sha256(validation_peer / "validation_manifest.csv"),
             )
 
             audit = audit_noise_control(
@@ -166,6 +179,7 @@ class RandomDerangementExperimentTests(unittest.TestCase):
                 validation_seed=20250726,
                 noise_rate=0.4,
                 expected_pool=(18, 12, 6),
+                peer_validation_dirs=(validation_peer,),
             )
             alternative_rows = read_csv_with_fields(manifest)[0]
             original_mask = [row["is_noisy"] == "true" for row in rows]
@@ -175,6 +189,33 @@ class RandomDerangementExperimentTests(unittest.TestCase):
             self.assertEqual(audit["validation_manifest_mismatch_count"], 0)
             self.assertEqual(file_sha256(validation_source / "validation_manifest.csv"), file_sha256(validation_destination / "validation_manifest.csv"))
             self.assertEqual((audit["training_pool"], audit["training_pool_clean"], audit["training_pool_noisy"]), (18, 12, 6))
+            self.assertTrue(audit["peer_validation_manifest_comparisons"][0]["semantic_equal"])
+
+            changed_rows = [dict(row) for row in validation_rows]
+            changed_rows[1]["partition"] = "validation"
+            _write_csv(
+                validation_peer / "validation_manifest.csv",
+                changed_rows,
+                ["index", "path", "clean_label", "partition"],
+            )
+            with self.assertRaises(ValueError):
+                audit_noise_control(
+                    dataset="synthetic",
+                    train_paths=paths,
+                    original_noise_index=original,
+                    alternative_manifest=manifest,
+                    validation_source_dir=validation_source,
+                    validation_destination_dir=validation_destination,
+                    mapping=mapping,
+                    mapping_file=mapping_file,
+                    mapping_sha256=mapping_hash,
+                    noise_seed=42,
+                    mapping_seed=20260815,
+                    validation_seed=20250726,
+                    noise_rate=0.4,
+                    expected_pool=(18, 12, 6),
+                    peer_validation_dirs=(validation_peer,),
+                )
 
     def test_master_plan_has_45_unique_runs_and_exact_dependencies(self) -> None:
         mapping_hashes = {dataset.key: dataset.key * 64 for dataset in DATASETS}

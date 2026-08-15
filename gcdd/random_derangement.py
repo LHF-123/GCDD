@@ -44,6 +44,19 @@ MANIFEST_EXTRA_FIELDS = [
     "original_noise_index_sha256",
 ]
 
+VALIDATION_ROW_FIELDS = ("index", "path", "clean_label", "partition")
+VALIDATION_METADATA_FIELDS = (
+    "protocol",
+    "validation_ratio",
+    "validation_seed",
+    "train_paths_sha256",
+    "source_train_samples",
+    "training_pool_samples",
+    "validation_samples",
+    "stratification_label",
+    "validation_label",
+)
+
 
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -66,6 +79,53 @@ def mapping_file_sha256(path: Path) -> str:
     lf_data = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     canonical_data = lf_data.replace(b"\n", b"\r\n")
     return hashlib.sha256(canonical_data).hexdigest()
+
+
+def compare_validation_manifests(
+    reference_csv: Path,
+    reference_json: Path,
+    candidate_csv: Path,
+    candidate_json: Path,
+) -> dict[str, Any]:
+    """Compare validation manifests by experiment semantics, not text bytes."""
+
+    required = (reference_csv, reference_json, candidate_csv, candidate_json)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Validation manifest files are missing: {missing}")
+    reference_rows = read_csv_with_fields(reference_csv)[0]
+    candidate_rows = read_csv_with_fields(candidate_csv)[0]
+    aligned = min(len(reference_rows), len(candidate_rows))
+    row_mismatch_count = abs(len(reference_rows) - len(candidate_rows))
+    row_mismatch_examples: list[int] = []
+    for index in range(aligned):
+        if any(
+            str(reference_rows[index].get(field, ""))
+            != str(candidate_rows[index].get(field, ""))
+            for field in VALIDATION_ROW_FIELDS
+        ):
+            row_mismatch_count += 1
+            if len(row_mismatch_examples) < 5:
+                row_mismatch_examples.append(index)
+    reference_metadata = read_json(reference_json)
+    candidate_metadata = read_json(candidate_json)
+    metadata_mismatch_fields = [
+        field
+        for field in VALIDATION_METADATA_FIELDS
+        if reference_metadata.get(field) != candidate_metadata.get(field)
+    ]
+    return {
+        "reference_csv": str(reference_csv),
+        "candidate_csv": str(candidate_csv),
+        "reference_csv_sha256": file_sha256(reference_csv),
+        "candidate_csv_sha256": file_sha256(candidate_csv),
+        "reference_json_sha256": file_sha256(reference_json),
+        "candidate_json_sha256": file_sha256(candidate_json),
+        "row_mismatch_count": row_mismatch_count,
+        "row_mismatch_examples": row_mismatch_examples,
+        "metadata_mismatch_fields": metadata_mismatch_fields,
+        "semantic_equal": row_mismatch_count == 0 and not metadata_mismatch_fields,
+    }
 
 
 def generate_derangement(class_order: Iterable[str], seed: int) -> dict[str, str]:
@@ -347,21 +407,6 @@ def audit_noise_control(
     source_json = validation_source_dir / "validation_manifest.json"
     destination_csv = validation_destination_dir / "validation_manifest.csv"
     destination_json = validation_destination_dir / "validation_manifest.json"
-    _copy_or_validate_identical(source_csv, destination_csv)
-    _copy_or_validate_identical(source_json, destination_json)
-    source_hash = file_sha256(source_csv)
-    source_json_hash = file_sha256(source_json)
-    if file_sha256(destination_csv) != source_hash or file_sha256(destination_json) != source_json_hash:
-        raise ValueError(f"{dataset}: copied validation manifest is not byte-identical to the formal manifest.")
-    for peer_dir in peer_validation_dirs:
-        for name, expected_hash in (
-            ("validation_manifest.csv", source_hash),
-            ("validation_manifest.json", source_json_hash),
-        ):
-            peer_path = peer_dir / name
-            if not peer_path.is_file() or file_sha256(peer_path) != expected_hash:
-                raise ValueError(f"{dataset}: formal validation manifest differs at {peer_path}.")
-
     manifest_rows, manifest_metadata = load_and_validate_manifest(
         source_csv,
         source_json,
@@ -370,6 +415,37 @@ def audit_noise_control(
         validation_seed=int(validation_seed),
         expected_validation_ratio=0.10,
     )
+    _copy_or_validate_identical(source_csv, destination_csv)
+    _copy_or_validate_identical(source_json, destination_json)
+    source_hash = file_sha256(source_csv)
+    source_json_hash = file_sha256(source_json)
+    if file_sha256(destination_csv) != source_hash or file_sha256(destination_json) != source_json_hash:
+        raise ValueError(f"{dataset}: copied validation manifest is not byte-identical to the formal manifest.")
+    peer_comparisons: list[dict[str, Any]] = []
+    for peer_dir in peer_validation_dirs:
+        peer_csv = peer_dir / "validation_manifest.csv"
+        peer_json = peer_dir / "validation_manifest.json"
+        load_and_validate_manifest(
+            peer_csv,
+            peer_json,
+            train_paths,
+            original_rows,
+            validation_seed=int(validation_seed),
+            expected_validation_ratio=0.10,
+        )
+        comparison = compare_validation_manifests(
+            source_csv,
+            source_json,
+            peer_csv,
+            peer_json,
+        )
+        peer_comparisons.append(comparison)
+        if not comparison["semantic_equal"]:
+            raise ValueError(
+                f"{dataset}: formal validation manifest semantics differ at {peer_dir}; "
+                f"row_mismatch_count={comparison['row_mismatch_count']}, "
+                f"metadata_mismatch_fields={comparison['metadata_mismatch_fields']}."
+            )
     destination_rows, _ = load_and_validate_manifest(
         destination_csv,
         destination_json,
@@ -423,6 +499,7 @@ def audit_noise_control(
         "validation_manifest_sha256": source_hash,
         "validation_manifest_json_sha256": source_json_hash,
         "validation_manifest_mismatch_count": validation_mismatch_count,
+        "peer_validation_manifest_comparisons": peer_comparisons,
         "training_pool": expected_total,
         "training_pool_clean": expected_clean,
         "training_pool_noisy": expected_noisy,

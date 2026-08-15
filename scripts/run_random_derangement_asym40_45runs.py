@@ -38,6 +38,7 @@ from gcdd.noise_realization import align_noise_rows, validate_cyclic_noise_rows
 from gcdd.random_derangement import (
     MAPPING_TYPE,
     audit_noise_control,
+    compare_validation_manifests,
     file_sha256,
     prepare_input_adapter,
     prepare_mapping,
@@ -992,7 +993,18 @@ def write_mapping_sensitivity(
         item = prepared[spec.key]
         for method, (protocol_dir, old_method) in old_locations.items():
             validation = spec.base_input_dir / protocol_dir / "validation_manifest.csv"
-            if not validation.is_file() or file_sha256(validation) != item.validation_manifest_sha256:
+            validation_json = validation.with_suffix(".json")
+            try:
+                comparison = compare_validation_manifests(
+                    item.validation_manifest,
+                    item.validation_manifest.with_suffix(".json"),
+                    validation,
+                    validation_json,
+                )
+            except (FileNotFoundError, json.JSONDecodeError, ValueError) as exc:
+                missing.append(f"{spec.key}/{method}: validation manifest is unavailable: {exc}")
+                continue
+            if not comparison["semantic_equal"]:
                 missing.append(f"{spec.key}/{method}: validation manifest is not reliably identical")
                 continue
             for seed in TRAINING_SEEDS:
