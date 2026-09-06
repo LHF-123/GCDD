@@ -21,7 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Summarize Dynamic Prototype validation-selected test results across datasets."
     )
-    parser.add_argument("--method-key", required=True, choices=("dynamic_proto_only", "pgdf_dynamic_proto"))
+    parser.add_argument(
+        "--method-key",
+        required=True,
+        choices=("dynamic_proto_only", "fixed_proto_warmup_matched", "pgdf_dynamic_proto"),
+    )
     parser.add_argument(
         "--dataset",
         action="append",

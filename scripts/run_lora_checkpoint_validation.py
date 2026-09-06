@@ -31,7 +31,7 @@ from gcdd.checkpoint_validation import (
 )
 from gcdd.budget_matching import ClassBudgetSchedule, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
-from gcdd.io_utils import ensure_dir, write_csv, write_json, write_yaml
+from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
 from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
@@ -56,8 +56,10 @@ METHODS = (
 ABLATION_METHODS = (
     "proto_only",
     "dynamic_budget_matched",
+    "dynamic_budget_matched_dynamic_proto",
     "dynamic_proto_only",
     "pgdf_dynamic_proto",
+    "fixed_proto_warmup_matched",
 )
 STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
 DYNAMIC_METHODS = (
@@ -65,10 +67,12 @@ DYNAMIC_METHODS = (
     "dynamic_r08",
     "dynamic_r09",
     "dynamic_budget_matched",
+    "dynamic_budget_matched_dynamic_proto",
     "pgdf_auto",
     "pgdf_fixed",
     "dynamic_proto_only",
     "pgdf_dynamic_proto",
+    "fixed_proto_warmup_matched",
 )
 LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
@@ -175,6 +179,7 @@ def main() -> None:
     apply_overrides(cfg, args)
     validate_args(args)
     jal_params = resolve_jal_params(cfg, args)
+    noise_metadata = load_noise_metadata(noise_index)
     cfg["checkpoint_validation"] = {
         "protocol": PROTOCOL_NAME,
         "validation_ratio": float(args.validation_ratio),
@@ -186,6 +191,7 @@ def main() -> None:
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
         "official_test_selected_only": bool(args.official_test_selected_only),
         "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
+        "noise_realization": noise_metadata,
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
         "two_branch": {
             "remember_mode": "fixed",
@@ -225,7 +231,7 @@ def main() -> None:
     # cache or graph reference; their geometry is rebuilt inside the LoRA
     # training loop from the current model state.
     graph_methods_requested = any(
-        method in STATIC_METHODS or method in {"pgdf_auto", "pgdf_fixed"}
+        method in STATIC_METHODS or method in {"pgdf_auto", "pgdf_fixed", "fixed_proto_warmup_matched"}
         for method in canonical_methods
     )
     if graph_methods_requested:
@@ -330,7 +336,7 @@ def main() -> None:
                     proto_keep_ratio = None
                     auto_proto_keep = None
                     selection_mode = f"dynamic_training_pool_small_loss_r{retention_ratio:g}"
-                elif canonical_key == "dynamic_budget_matched":
+                elif canonical_key in {"dynamic_budget_matched", "dynamic_budget_matched_dynamic_proto"}:
                     if pgdf_budget_root is None:
                         raise RuntimeError("PGDF budget root was not configured.")
                     budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
@@ -356,8 +362,13 @@ def main() -> None:
                         budget_schedule.source_retention_ratio,
                         budget_schedule.source_proto_keep_ratio,
                     )
+                    source_label = (
+                        "PGDF-DynamicProto"
+                        if canonical_key == "dynamic_budget_matched_dynamic_proto"
+                        else "PGDF"
+                    )
                     method_name = (
-                        "DINOv2 LoRA Dynamic small-loss matched to PGDF class budget "
+                        f"DINOv2 LoRA Dynamic small-loss matched to {source_label} class budget "
                         f"r={budget_schedule.source_retention_ratio:g} "
                         f"p={budget_schedule.source_proto_keep_ratio:g}"
                     )
@@ -365,8 +376,16 @@ def main() -> None:
                     centroid_mask = None
                     proto_keep_ratio = None
                     auto_proto_keep = None
-                    selection_mode = "dynamic_small_loss_pgdf_per_class_budget_matched"
-                    write_budget_source(run_dir, budget_schedule)
+                    selection_mode = (
+                        "dynamic_small_loss_pgdf_dynamic_proto_per_class_budget_matched"
+                        if canonical_key == "dynamic_budget_matched_dynamic_proto"
+                        else "dynamic_small_loss_pgdf_per_class_budget_matched"
+                    )
+                    write_budget_source(
+                        run_dir,
+                        budget_schedule,
+                        source_method="pgdf_dynamic_proto" if canonical_key == "dynamic_budget_matched_dynamic_proto" else "pgdf_fixed",
+                    )
                 elif canonical_key == "dynamic_proto_only":
                     # This is deliberately not the legacy static proto_only
                     # baseline.  It follows the requested full-pool warm-up
@@ -393,6 +412,19 @@ def main() -> None:
                     selection_strategy = "loss_and_proto"
                     prototype_mode = "dynamic_lora"
                     selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
+                elif canonical_key == "fixed_proto_warmup_matched":
+                    if pgdf_reference is None:
+                        raise RuntimeError("Fixed prototype reference was not constructed.")
+                    retention_ratio = 1.0
+                    method_name = f"DINOv2 LoRA Warmup-Matched Fixed Prototype Gate Only p={args.fixed_p:g}"
+                    proto_scores = pgdf_reference["proto_scores"]
+                    centroid_mask = None
+                    proto_keep_ratio = float(args.fixed_p)
+                    auto_proto_keep = None
+                    selection_strategy = "proto_only"
+                    prototype_mode = "fixed"
+                    selection_mode = "fixed_frozen_prototype_warmup_matched_training_pool"
+                    scheduler_retention_ratio = float(args.fixed_p)
                 elif canonical_key == "pgdf_auto":
                     if pgdf_reference is None:
                         raise RuntimeError("PGDF reference was not constructed.")
@@ -520,6 +552,17 @@ def main() -> None:
             else:
                 raise RuntimeError(f"Unhandled method: {method_key}")
 
+            result_row.update(
+                {
+                    "noise_index": str(noise_index),
+                    "noise_strategy": noise_metadata["noise_strategy"],
+                    "noise_ratio": noise_metadata["noise_ratio"],
+                    "noise_seed": noise_metadata["noise_seed"],
+                    "mapping_type": noise_metadata["mapping_type"],
+                    "mapping_seed": noise_metadata["mapping_seed"],
+                    "validation_seed": int(args.validation_seed),
+                }
+            )
             all_logs.extend(result.logs)
             write_csv(run_dir / "train_log.csv", result.logs, train_log_fields())
             write_json(
@@ -565,6 +608,7 @@ def main() -> None:
             "protocol": PROTOCOL_NAME,
             "input_dir": str(input_dir),
             "noise_index": str(noise_index),
+            "noise_realization": noise_metadata,
             "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
             "methods": methods,
             "seeds": seeds,
@@ -687,12 +731,36 @@ def finalize_result_row(
     return row
 
 
+def load_noise_metadata(noise_index: Path) -> dict[str, Any]:
+    """Read immutable noise provenance once and record it in every new result row."""
+    rows = [row for row in read_csv(noise_index) if row.get("split", "train").lower() == "train"]
+    if not rows:
+        raise ValueError(f"Noise index has no training rows: {noise_index}")
+
+    def uniform(column: str, fallback: str = "") -> str:
+        values = {str(row.get(column, fallback)) for row in rows}
+        if len(values) != 1:
+            raise ValueError(f"Noise index has inconsistent {column}: {sorted(values)}")
+        return next(iter(values))
+
+    return {
+        "noise_strategy": uniform("noise_strategy"),
+        "noise_ratio": float(uniform("noise_ratio")),
+        "noise_seed": int(uniform("noise_seed")),
+        "mapping_type": uniform("mapping_type", "cyclic"),
+        "mapping_seed": uniform("mapping_seed", ""),
+    }
+
+
 def validate_budget_method_request(
     methods: list[str],
     pgdf_budget_root: Path | None,
     seeds: list[int],
 ) -> None:
-    requested = "dynamic_budget_matched" in {canonical_method_key(method) for method in methods}
+    requested = bool(
+        {"dynamic_budget_matched", "dynamic_budget_matched_dynamic_proto"}
+        & {canonical_method_key(method) for method in methods}
+    )
     if requested and pgdf_budget_root is None:
         raise ValueError("dynamic_budget_matched requires --pgdf-budget-root.")
     if not requested:
@@ -757,7 +825,7 @@ def validate_budget_source_hyperparameters(
         )
 
 
-def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule) -> None:
+def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule, *, source_method: str) -> None:
     """Freeze only PGDF class counts, never its selected sample identities or scores."""
     write_csv(
         run_dir / "budget_source.csv",
@@ -769,7 +837,7 @@ def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule) -> None:
         {
             "source_path": schedule.source_path,
             "source_sha256": schedule.source_sha256,
-            "source_method": "pgdf_fixed",
+            "source_method": source_method,
             "source_retention_ratio": schedule.source_retention_ratio,
             "source_proto_keep_ratio": schedule.source_proto_keep_ratio,
             "seed": schedule.seed,
@@ -958,7 +1026,14 @@ def parse_methods(raw: str) -> list[str]:
 def validate_official_test_request(methods: list[str], selected_only: bool) -> None:
     """Keep strict ablations on their validation-selected one-shot test protocol."""
     canonical = [canonical_method_key(method) for method in methods]
-    strict_methods = {"proto_only", "dynamic_budget_matched", "dynamic_proto_only", "pgdf_dynamic_proto"}
+    strict_methods = {
+        "proto_only",
+        "dynamic_budget_matched",
+        "dynamic_budget_matched_dynamic_proto",
+        "dynamic_proto_only",
+        "pgdf_dynamic_proto",
+        "fixed_proto_warmup_matched",
+    }
     selected_only_supported = (set(METHODS) | set(ABLATION_METHODS)) - {"coteaching", "jocor"}
     requested_strict = sorted(strict_methods & set(canonical))
     if requested_strict and not selected_only:
@@ -1071,7 +1146,7 @@ def train_log_fields() -> list[str]:
 
 def result_fields() -> list[str]:
     return [
-        "method_key", "method", "seed", "checkpoint_protocol", "official_test_evaluation", "train_samples", "eval_samples", "validation_samples", "test_samples",
+        "method_key", "method", "seed", "noise_index", "noise_strategy", "noise_ratio", "noise_seed", "mapping_type", "mapping_seed", "validation_seed", "checkpoint_protocol", "official_test_evaluation", "train_samples", "eval_samples", "validation_samples", "test_samples",
         "best_val_epoch", "best_val_top1", "best_val_top5", "validation_selected_test_top1", "validation_selected_test_top5",
         "validation_selected_test_model_a_top1", "validation_selected_test_model_a_top5", "validation_selected_test_model_b_top1", "validation_selected_test_model_b_top5",
         "final_test_top1", "final_test_top5", "final_test_model_a_top1", "final_test_model_a_top5", "final_test_model_b_top1", "final_test_model_b_top5",
