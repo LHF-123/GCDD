@@ -53,9 +53,23 @@ METHODS = (
     "pgdf_auto",
     "pgdf_fixed",
 )
-ABLATION_METHODS = ("proto_only", "dynamic_budget_matched")
+ABLATION_METHODS = (
+    "proto_only",
+    "dynamic_budget_matched",
+    "dynamic_proto_only",
+    "pgdf_dynamic_proto",
+)
 STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
-DYNAMIC_METHODS = ("dynamic", "dynamic_r08", "dynamic_r09", "dynamic_budget_matched", "pgdf_auto", "pgdf_fixed")
+DYNAMIC_METHODS = (
+    "dynamic",
+    "dynamic_r08",
+    "dynamic_r09",
+    "dynamic_budget_matched",
+    "pgdf_auto",
+    "pgdf_fixed",
+    "dynamic_proto_only",
+    "pgdf_dynamic_proto",
+)
 LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
 
@@ -72,7 +86,8 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Use 'all' for the 13 primary methods, or an explicit subset. "
-            "proto_only and dynamic_budget_matched are explicit ablations; dynamic aliases dynamic_r08."
+            "proto_only, dynamic_budget_matched, dynamic_proto_only, and pgdf_dynamic_proto are explicit ablations; "
+            "dynamic aliases dynamic_r08."
         ),
     )
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
@@ -104,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Evaluate official test only once on best_val.pt for single-branch methods. "
-            "Required for the explicit proto_only and dynamic_budget_matched ablations."
+            "Required for proto_only, dynamic_budget_matched, dynamic_proto_only, and pgdf_dynamic_proto."
         ),
     )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
@@ -206,7 +221,13 @@ def main() -> None:
     canonical_methods = [canonical_method_key(method) for method in methods]
     pgdf_reference: dict[str, Any] | None = None
     static_selections: dict[str, dict[str, Any]] = {}
-    graph_methods_requested = any(method in STATIC_METHODS or method.startswith("pgdf_") for method in canonical_methods)
+    # Dynamic-prototype ablations intentionally do not touch the frozen CLS
+    # cache or graph reference; their geometry is rebuilt inside the LoRA
+    # training loop from the current model state.
+    graph_methods_requested = any(
+        method in STATIC_METHODS or method in {"pgdf_auto", "pgdf_fixed"}
+        for method in canonical_methods
+    )
     if graph_methods_requested:
         log_stage("[2/5] Recomputing graph/static references on the training pool only.")
         features = load_pgdf_features(input_dir, len(data["train_paths"]))
@@ -299,6 +320,8 @@ def main() -> None:
                 run_cfg["loss_type"] = "ce"
                 budget_schedule: ClassBudgetSchedule | None = None
                 scheduler_retention_ratio: float | None = None
+                selection_strategy = "loss_only"
+                prototype_mode = "fixed"
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -344,6 +367,32 @@ def main() -> None:
                     auto_proto_keep = None
                     selection_mode = "dynamic_small_loss_pgdf_per_class_budget_matched"
                     write_budget_source(run_dir, budget_schedule)
+                elif canonical_key == "dynamic_proto_only":
+                    # This is deliberately not the legacy static proto_only
+                    # baseline.  It follows the requested full-pool warm-up
+                    # and periodic update schedule, with no CE ranking.
+                    retention_ratio = 1.0
+                    method_name = f"DINOv2 LoRA Dynamic Prototype Gate Only p={args.fixed_p:g}"
+                    proto_scores = None
+                    centroid_mask = None
+                    proto_keep_ratio = float(args.fixed_p)
+                    auto_proto_keep = None
+                    selection_strategy = "proto_only"
+                    prototype_mode = "dynamic_lora"
+                    selection_mode = "dynamic_lora_prototype_only_training_pool"
+                    scheduler_retention_ratio = float(args.fixed_p)
+                elif canonical_key == "pgdf_dynamic_proto":
+                    retention_ratio = float(args.dynamic_ratio)
+                    method_name = (
+                        f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g}"
+                    )
+                    proto_scores = None
+                    centroid_mask = None
+                    proto_keep_ratio = float(args.fixed_p)
+                    auto_proto_keep = None
+                    selection_strategy = "loss_and_proto"
+                    prototype_mode = "dynamic_lora"
+                    selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
                 elif canonical_key == "pgdf_auto":
                     if pgdf_reference is None:
                         raise RuntimeError("PGDF reference was not constructed.")
@@ -353,6 +402,7 @@ def main() -> None:
                     centroid_mask = pgdf_reference["centroid_reference_mask"]
                     proto_keep_ratio = None
                     auto_proto_keep = auto_rule
+                    selection_strategy = "loss_and_proto"
                     selection_mode = "pgdf_auto_training_pool_dynamic_loss_and_prototype"
                 else:
                     if pgdf_reference is None:
@@ -363,6 +413,7 @@ def main() -> None:
                     centroid_mask = pgdf_reference["centroid_reference_mask"]
                     proto_keep_ratio = float(args.fixed_p)
                     auto_proto_keep = None
+                    selection_strategy = "loss_and_proto"
                     selection_mode = "pgdf_fixed_training_pool_dynamic_loss_and_prototype"
                 result = train_dynamic_loss_lora(
                     data["train_paths"],
@@ -391,6 +442,8 @@ def main() -> None:
                     class_budget_schedule=budget_schedule.budgets if budget_schedule is not None else None,
                     scheduler_retention_ratio=scheduler_retention_ratio,
                     official_test_selected_only=bool(args.official_test_selected_only),
+                    selection_strategy=selection_strategy,
+                    prototype_mode=prototype_mode,
                 )
                 if budget_schedule is not None:
                     verify_observed_budget_match(result.per_class_rows, budget_schedule)
@@ -481,6 +534,8 @@ def main() -> None:
                     "budget_source_path": result_row.get("budget_source_path", ""),
                     "budget_source_sha256": result_row.get("budget_source_sha256", ""),
                     "budget_match_verified": result_row.get("budget_match_verified", ""),
+                    "selection_strategy": result.summary.get("selection_strategy", ""),
+                    "prototype_mode": result.summary.get("prototype_mode", ""),
                 },
             )
             all_results.append(result_row)
@@ -903,7 +958,7 @@ def parse_methods(raw: str) -> list[str]:
 def validate_official_test_request(methods: list[str], selected_only: bool) -> None:
     """Keep strict ablations on their validation-selected one-shot test protocol."""
     canonical = [canonical_method_key(method) for method in methods]
-    strict_methods = {"proto_only", "dynamic_budget_matched"}
+    strict_methods = {"proto_only", "dynamic_budget_matched", "dynamic_proto_only", "pgdf_dynamic_proto"}
     selected_only_supported = (set(METHODS) | set(ABLATION_METHODS)) - {"coteaching", "jocor"}
     requested_strict = sorted(strict_methods & set(canonical))
     if requested_strict and not selected_only:
@@ -926,7 +981,7 @@ def resolve_retention_ratio(method_key: str, pgdf_dynamic_ratio: float) -> float
         return 0.8
     if canonical == "dynamic_r09":
         return 0.9
-    if canonical in {"pgdf_auto", "pgdf_fixed"}:
+    if canonical in {"pgdf_auto", "pgdf_fixed", "pgdf_dynamic_proto"}:
         return float(pgdf_dynamic_ratio)
     raise ValueError(f"Method {method_key} has no dynamic retention ratio.")
 
@@ -1023,7 +1078,7 @@ def result_fields() -> list[str]:
         "last5_test_mean", "last5_test_std", "last5_test_top5_mean", "last5_test_top5_std", "oracle_best_test_epoch",
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
-        "selection_updates", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
+        "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1040,7 +1095,10 @@ def summary_fields() -> list[str]:
 
 
 def selection_fields() -> list[str]:
-    return ["method", "seed", "retention_ratio", "proto_keep_ratio", "epoch", "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "state"]
+    return [
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "epoch",
+        "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "state",
+    ]
 
 
 def dual_selection_fields() -> list[str]:
@@ -1052,15 +1110,18 @@ def dual_selection_fields() -> list[str]:
 
 def update_fields() -> list[str]:
     return [
-        "method", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "epoch", "num_candidates", "num_loss_selected",
-        "num_proto_pass", "num_selected", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
+        "num_proto_pass", "num_selected", "fallback_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected", "overlap_with_previous_selection", "overlap_with_centroid",
+        "prototype_feature_source", "prototype_feature_dim", "prototype_checksum", "prototype_gate_membership_hash",
+        "prototype_mean", "prototype_std", "selection_model_state_checksum", "prototype_model_state_checksum",
+        "same_model_state_for_loss_and_prototype", "lora_updated_since_initial",
     ]
 
 
 def per_class_fields() -> list[str]:
     return [
-        "method", "seed", "retention_ratio", "proto_keep_ratio", "epoch", "web_label", "total_count", "loss_selected_count",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "epoch", "web_label", "total_count", "loss_selected_count",
         "proto_pass_count", "selected_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected",
     ]

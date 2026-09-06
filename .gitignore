@@ -13,3 +13,4 @@ checkpoints/
 *.pth
 
 /dataset/
+/tests/

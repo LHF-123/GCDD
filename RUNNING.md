@@ -969,3 +969,33 @@ outputs/Web-Bird/v1_web_bird/lora/
 如果 DINOv2 LoRA + GCDD+Proto-only added 仍低于 DINOv2 LoRA + Centroid filtering：
   说明当前 hard clean 额外样本对 backbone 微调也没有明显正收益，应继续分析样本质量或改 score。
 ```
+
+## Synthetic asym40 Prototype gate only p=0.4
+
+正式 `fixed_clean_validation_v1` 消融使用显式方法 `proto_only`，不改变 `--methods all` 的原 13 方法集合。它在 training pool 内按 noisy-label 类别保留 prototype score 最高的 40%，静态训练，并只在训练完成后评估 validation-selected checkpoint。
+
+```bash
+bash scripts/run_proto_only_p04_checkpoint_validation.sh
+```
+
+该命令依次运行 CUB、Stanford Cars、FGVC-Aircraft 的 seeds `1/42/88`，共 9 个 run；不会覆盖已有输出。
+
+## CUB cyclic-asym40 独立 noise realization 敏感性
+
+脚本接受任意非负整数 noise seed；主敏感性实验使用 `17`、`42`、`73`。training seed 始终固定为 `42`。每个实例顺序运行 Dynamic small-loss r=0.8、JAL-CE、PGDF r=0.8/p=0.4 和 Budget-matched Dynamic，共 4 个 run：
+
+```bash
+# 实例 1
+bash scripts/run_cub_noise_realization_validation.sh 17
+
+# 实例 2
+bash scripts/run_cub_noise_realization_validation.sh 42
+
+# 实例 3
+bash scripts/run_cub_noise_realization_validation.sh 73
+
+# 额外 realization，例如 seed 101
+bash scripts/run_cub_noise_realization_validation.sh 101
+```
+
+脚本优先复用 seed42 主实验的 `fixed_clean_validation_v1` manifest；若旧 manifest 未同步，则用相同 clean labels、`validation-ratio=0.10` 和 `validation-seed=20250726` 在本次新 realization 目录中确定性重建。它会为当前 noise seed 重新构造 `labels.npy`，并在 training pool 上重新构造 PGDF graph/prototype。对于非 `17/42/73` 的当前 seed，脚本会额外生成该 seed 的 noise index，并以 `17/42/73` 为 peer index 做翻转集合审计；只训练当前 seed。四种方法均使用 validation-selected checkpoint，official test 只评估所选 checkpoint，不执行 posthoc oracle test。脚本拒绝覆盖已有 realization 输出。
