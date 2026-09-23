@@ -1,0 +1,8 @@
+# Overlay for scripts/run_lora_checkpoint_validation.py with
+# --methods pgdf_dynamic_proto.  All other LoRA/PGDF schedule values remain
+# inherited from the input directory's resolved_config.yaml and CLI arguments.
+pgdf:
+  geometry_mode: neighbor_margin
+  # Formal Neighbor-Margin experiments use the strict intersection only.
+  # Set true only for a separately labelled fallback ablation.
+  neighbor_margin_use_fallback: false

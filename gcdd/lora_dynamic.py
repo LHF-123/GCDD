@@ -60,6 +60,27 @@ class DynamicPrototypeSnapshot:
     prototype_mean: float
     prototype_std: float
     model_state_checksum: str
+    # These are update-local C x D values, never persisted to a selection
+    # artifact.  They let alternative geometry gates reuse the exact observed-
+    # label prototype construction used by the original dynamic PGDF gate.
+    prototype_labels: tuple[str, ...]
+    prototypes: np.ndarray
+
+
+@dataclass(frozen=True)
+class NeighborMarginSnapshot:
+    """Compact per-sample diagnostics for one Neighbor-Margin update.
+
+    The temporary all-class similarity matrix is deliberately not retained.
+    Every vector below is aligned to the original full training-array index;
+    non-candidate positions are left empty/NaN and never become trainable.
+    """
+
+    margin: np.ndarray
+    observed_similarity: np.ndarray
+    competitor_similarity: np.ndarray
+    competitor_class: np.ndarray
+    candidate_mask: np.ndarray
 
 
 def train_dynamic_loss_lora(
@@ -91,6 +112,8 @@ def train_dynamic_loss_lora(
     official_test_selected_only: bool = False,
     selection_strategy: str = "auto",
     prototype_mode: str = "fixed",
+    geometry_mode: str = "prototype_similarity",
+    neighbor_margin_use_fallback: bool = False,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -118,6 +141,7 @@ def train_dynamic_loss_lora(
         auto_proto_keep,
         selection_strategy=selection_strategy,
         prototype_mode=prototype_mode,
+        geometry_mode=geometry_mode,
     )
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
@@ -156,6 +180,13 @@ def train_dynamic_loss_lora(
             raise ValueError("dynamic_lora prototypes require proto_keep_ratio.")
     elif prototype_mode == "fixed" and selection_strategy in {"proto_only", "loss_and_proto"} and proto_scores is None:
         raise ValueError("fixed prototype selection requires proto_scores.")
+    if geometry_mode == "neighbor_margin" and not (
+        selection_strategy == "loss_and_proto" and prototype_mode == "dynamic_lora"
+    ):
+        raise ValueError(
+            "neighbor_margin geometry is defined only for dynamic_lora PGDF "
+            "loss_and_proto selection."
+        )
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -289,7 +320,7 @@ def train_dynamic_loss_lora(
         f"{selection_split_name}_images={len(eval_idx)}, retention_ratio="
         f"{'not_used' if selection_strategy == 'proto_only' else f'{retention_ratio:.3f}'}, "
         f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
-        f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, "
+        f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, geometry_mode={geometry_mode}, "
         f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
     )
 
@@ -365,6 +396,11 @@ def train_dynamic_loss_lora(
             proto_pass_mask = None
             current_proto_scores: np.ndarray | None = proto_scores
             prototype_snapshot: DynamicPrototypeSnapshot | None = None
+            neighbor_margin_snapshot: NeighborMarginSnapshot | None = None
+            neighbor_margin_candidate_mask: np.ndarray | None = None
+            reliable_mask: np.ndarray | None = None
+            ambiguous_mask: np.ndarray | None = None
+            suspicious_mask: np.ndarray | None = None
             fallback_count = 0
 
             # Dynamic Prototype Gate Only intentionally never runs this block:
@@ -410,9 +446,25 @@ def train_dynamic_loss_lora(
                         candidate_mask,
                         float(selected_proto_keep_ratio),
                         selection_model_checksum,
+                        build_gate=geometry_mode == "prototype_similarity",
                     )
                     current_proto_scores = prototype_snapshot.scores
-                    proto_pass_mask = prototype_snapshot.gate_mask
+                    if geometry_mode == "neighbor_margin":
+                        neighbor_margin_snapshot = compute_neighbor_margin(
+                            dynamic_features,
+                            train_labels,
+                            candidate_mask,
+                            prototype_snapshot,
+                        )
+                        neighbor_margin_candidate_mask = build_neighbor_margin_candidates(
+                            neighbor_margin_snapshot.margin,
+                            train_labels,
+                            candidate_mask,
+                            float(selected_proto_keep_ratio),
+                        )
+                        proto_pass_mask = neighbor_margin_candidate_mask
+                    else:
+                        proto_pass_mask = prototype_snapshot.gate_mask
                 else:
                     if auto_proto_keep is not None and selected_proto_keep_ratio is None:
                         if loss_selected_mask is None:
@@ -443,19 +495,40 @@ def train_dynamic_loss_lora(
             elif selection_strategy == "loss_and_proto":
                 if loss_selected_mask is None or proto_pass_mask is None or losses is None:
                     raise RuntimeError("loss_and_proto selection requires loss and prototype masks.")
-                fallback_count = count_classwise_intersection_fallbacks(
-                    loss_selected_mask,
-                    proto_pass_mask,
-                    train_labels,
-                    candidate_mask,
-                )
-                selected_mask = combine_loss_and_proto_classwise(
-                    loss_selected_mask,
-                    proto_pass_mask,
-                    losses,
-                    train_labels,
-                    candidate_mask,
-                )
+                if geometry_mode == "neighbor_margin":
+                    if neighbor_margin_snapshot is None or neighbor_margin_candidate_mask is None:
+                        raise RuntimeError("neighbor_margin selection requires a current margin snapshot and candidate mask.")
+                    selected_mask, fallback_count = combine_loss_and_neighbor_margin_classwise(
+                        loss_selected_mask,
+                        neighbor_margin_candidate_mask,
+                        neighbor_margin_snapshot.margin,
+                        losses,
+                        train_labels,
+                        candidate_mask,
+                        use_fallback=neighbor_margin_use_fallback,
+                    )
+                    reliable_mask, ambiguous_mask, suspicious_mask = stratify_neighbor_margin_samples(
+                        selected_mask,
+                        neighbor_margin_snapshot.margin,
+                        candidate_mask,
+                    )
+                else:
+                    # This is the original PGDF path.  Keep its selection and
+                    # class-preserving fallback byte-for-byte independent of
+                    # the Neighbor-Margin implementation.
+                    fallback_count = count_classwise_intersection_fallbacks(
+                        loss_selected_mask,
+                        proto_pass_mask,
+                        train_labels,
+                        candidate_mask,
+                    )
+                    selected_mask = combine_loss_and_proto_classwise(
+                        loss_selected_mask,
+                        proto_pass_mask,
+                        losses,
+                        train_labels,
+                        candidate_mask,
+                    )
             else:
                 raise RuntimeError(f"Unsupported selection_strategy: {selection_strategy}")
             update_rows.append(
@@ -467,6 +540,7 @@ def train_dynamic_loss_lora(
                     selected_proto_keep_ratio,
                     epoch,
                     candidate_mask,
+                    train_labels,
                     selected_mask,
                     previous_mask,
                     centroid_mask,
@@ -481,6 +555,12 @@ def train_dynamic_loss_lora(
                     selection_model_checksum=selection_model_checksum,
                     lora_updated_since_initial=(selection_model_checksum != initial_trainable_checksum),
                     fallback_count=fallback_count,
+                    geometry_mode=geometry_mode,
+                    neighbor_margin_use_fallback=neighbor_margin_use_fallback,
+                    neighbor_margin_snapshot=neighbor_margin_snapshot,
+                    reliable_mask=reliable_mask,
+                    ambiguous_mask=ambiguous_mask,
+                    suspicious_mask=suspicious_mask,
                 )
             )
             selection_rows.extend(
@@ -502,6 +582,11 @@ def train_dynamic_loss_lora(
                     proto_scores=current_proto_scores,
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
+                    geometry_mode=geometry_mode,
+                    neighbor_margin_snapshot=neighbor_margin_snapshot,
+                    reliable_mask=reliable_mask,
+                    ambiguous_mask=ambiguous_mask,
+                    suspicious_mask=suspicious_mask,
                 )
             )
             per_class_rows.extend(
@@ -521,12 +606,33 @@ def train_dynamic_loss_lora(
                     proto_scores=current_proto_scores,
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
+                    geometry_mode=geometry_mode,
+                    neighbor_margin_snapshot=neighbor_margin_snapshot,
+                    reliable_mask=reliable_mask,
+                    ambiguous_mask=ambiguous_mask,
+                    suspicious_mask=suspicious_mask,
                 )
+            )
+            neighbor_summary = (
+                f", reliable={int(reliable_mask.sum())}, ambiguous={int(ambiguous_mask.sum())}, "
+                f"suspicious={int(suspicious_mask.sum())}, reliable_zero_classes="
+                f"{update_rows[-1]['reliable_zero_class_count']}, "
+                f"margin(mean/std/min/max/median)="
+                f"{update_rows[-1]['margin_mean']:.4f}/"
+                f"{update_rows[-1]['margin_std']:.4f}/"
+                f"{update_rows[-1]['margin_min']:.4f}/"
+                f"{update_rows[-1]['margin_max']:.4f}/"
+                f"{update_rows[-1]['margin_median']:.4f}"
+                if geometry_mode == "neighbor_margin"
+                and reliable_mask is not None
+                and ambiguous_mask is not None
+                and suspicious_mask is not None
+                else ""
             )
             log_stage(
                 f"[dynamic-loss] selection update epoch={epoch}: "
                 f"selected={int(selected_mask.sum())}, proto_mode={prototype_mode}, "
-                f"prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}"
+                f"prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}{neighbor_summary}"
             )
 
     final_state = trainable_state_dict(model)
@@ -619,6 +725,8 @@ def train_dynamic_loss_lora(
                 "scheduler_retention_ratio": float(effective_scheduler_ratio),
                 "selection_strategy": selection_strategy,
                 "prototype_mode": prototype_mode,
+                "geometry_mode": geometry_mode,
+                "neighbor_margin_use_fallback": bool(neighbor_margin_use_fallback),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -643,6 +751,8 @@ def train_dynamic_loss_lora(
                 "scheduler_retention_ratio": float(effective_scheduler_ratio),
                 "selection_strategy": selection_strategy,
                 "prototype_mode": prototype_mode,
+                "geometry_mode": geometry_mode,
+                "neighbor_margin_use_fallback": bool(neighbor_margin_use_fallback),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -673,6 +783,8 @@ def train_dynamic_loss_lora(
             "selection_updates": len(update_rows),
             "selection_strategy": selection_strategy,
             "prototype_mode": prototype_mode,
+            "geometry_mode": geometry_mode,
+            "neighbor_margin_use_fallback": "yes" if neighbor_margin_use_fallback else "no",
             "backbone_frozen": "yes",
             "lora_updated_before_selection": (
                 "yes" if any(row.get("lora_updated_since_initial") == "yes" for row in update_rows) else "no"
@@ -700,6 +812,7 @@ def validate_dynamic_args(
     *,
     selection_strategy: str = "loss_only",
     prototype_mode: str = "fixed",
+    geometry_mode: str = "prototype_similarity",
 ) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
@@ -713,6 +826,8 @@ def validate_dynamic_args(
         raise ValueError("selection_strategy must be loss_only, proto_only, or loss_and_proto.")
     if prototype_mode not in {"fixed", "dynamic_lora"}:
         raise ValueError("prototype_mode must be fixed or dynamic_lora.")
+    if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
+        raise ValueError("geometry_mode must be prototype_similarity or neighbor_margin.")
     if selection_strategy in {"proto_only", "loss_and_proto"} and proto_keep_ratio is None:
         raise ValueError("Prototype selection requires proto_keep_ratio.")
     if selection_strategy == "proto_only" and auto_proto_keep is not None:
@@ -861,8 +976,15 @@ def build_dynamic_prototype_snapshot(
     candidate_mask: np.ndarray,
     proto_keep_ratio: float,
     model_state_checksum: str,
+    *,
+    build_gate: bool = True,
 ) -> DynamicPrototypeSnapshot:
-    """Rebuild observed-label prototypes and a top-p gate from current CLS features."""
+    """Rebuild observed-label prototypes and, optionally, the original top-p gate.
+
+    ``build_gate=False`` is used by Neighbor-Margin: it retains the identical
+    prototype construction but deliberately skips the legacy absolute-
+    similarity candidate decision.
+    """
     features = np.asarray(current_features, dtype=np.float32)
     labels = np.asarray(labels).astype(str)
     candidate_mask = np.asarray(candidate_mask, dtype=bool)
@@ -879,6 +1001,8 @@ def build_dynamic_prototype_snapshot(
     gate_mask = np.zeros(len(labels), dtype=bool)
     prototype_chunks: list[bytes] = []
     prototype_values: list[np.ndarray] = []
+    prototype_vectors: list[np.ndarray] = []
+    prototype_labels: list[str] = []
     class_retained_counts: dict[str, int] = {}
     for label in sorted(set(labels[candidate_mask].tolist())):
         idx = np.where(candidate_mask & (labels == label))[0]
@@ -894,11 +1018,17 @@ def build_dynamic_prototype_snapshot(
         prototype = prototype / prototype_norm
         class_scores = (normalized_vectors @ prototype).astype(np.float32)
         scores[idx] = class_scores
-        keep = len(idx) if proto_keep_ratio >= 1.0 else max(1, int(math.floor(proto_keep_ratio * len(idx))))
-        order = np.argsort(-class_scores, kind="mergesort")
-        gate_mask[idx[order[:keep]]] = True
-        class_retained_counts[str(label)] = int(keep)
+        if build_gate:
+            keep = len(idx) if proto_keep_ratio >= 1.0 else max(1, int(math.floor(proto_keep_ratio * len(idx))))
+            # Stable sort makes ties resolve by the original training index.
+            order = np.argsort(-class_scores, kind="mergesort")
+            gate_mask[idx[order[:keep]]] = True
+            class_retained_counts[str(label)] = int(keep)
+        else:
+            class_retained_counts[str(label)] = 0
         prototype_values.append(prototype.astype(np.float32, copy=False))
+        prototype_vectors.append(prototype)
+        prototype_labels.append(str(label))
         prototype_chunks.extend((str(label).encode("utf-8"), prototype.astype(np.float32, copy=False).tobytes()))
 
     if np.any(np.isnan(scores[candidate_mask])):
@@ -918,6 +1048,221 @@ def build_dynamic_prototype_snapshot(
         prototype_mean=float(stacked_prototypes.mean()),
         prototype_std=float(stacked_prototypes.std()),
         model_state_checksum=model_state_checksum,
+        prototype_labels=tuple(prototype_labels),
+        prototypes=np.vstack(prototype_vectors),
+    )
+
+
+def compute_neighbor_margin(
+    current_features: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    prototype_snapshot: DynamicPrototypeSnapshot,
+) -> NeighborMarginSnapshot:
+    """Compute observed-vs-nearest-other-class geometry without retaining N×C.
+
+    Features and prototypes are normalized exactly as in
+    :func:`build_dynamic_prototype_snapshot`.  The all-class matrix exists only
+    as a local update-time array; only four per-sample diagnostics survive.
+    """
+    features = np.asarray(current_features, dtype=np.float64)
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if features.ndim != 2 or features.shape[0] != len(labels):
+        raise ValueError("current_features must align with labels for Neighbor-Margin geometry.")
+    if candidate_mask.shape != labels.shape:
+        raise ValueError("candidate_mask must align with labels for Neighbor-Margin geometry.")
+    prototype_labels = tuple(str(label) for label in prototype_snapshot.prototype_labels)
+    prototypes = np.asarray(prototype_snapshot.prototypes, dtype=np.float64)
+    if prototypes.ndim != 2 or prototypes.shape[0] != len(prototype_labels):
+        raise ValueError("Dynamic prototype labels and vectors are misaligned.")
+    if len(prototype_labels) < 2:
+        raise ValueError("Neighbor-Margin requires at least two non-empty observed-label prototypes.")
+    if not np.all(np.isfinite(prototypes)):
+        raise ValueError("Neighbor-Margin prototypes contain non-finite values.")
+    prototype_norms = np.linalg.norm(prototypes, axis=1, keepdims=True)
+    if np.any(prototype_norms <= 0.0):
+        raise ValueError("Neighbor-Margin prototypes contain a zero-norm vector.")
+    prototypes = prototypes / prototype_norms
+
+    candidate_idx = np.where(candidate_mask)[0]
+    vectors = features[candidate_idx]
+    if np.any(~np.isfinite(vectors)):
+        raise ValueError("Neighbor-Margin features contain missing or non-finite training-pool values.")
+    vector_norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    if np.any(vector_norms <= 0.0):
+        raise ValueError("Neighbor-Margin features contain a zero-norm training-pool vector.")
+    normalized_vectors = vectors / vector_norms
+    label_to_column = {label: column for column, label in enumerate(prototype_labels)}
+    try:
+        observed_columns = np.asarray([label_to_column[str(labels[index])] for index in candidate_idx], dtype=np.int64)
+    except KeyError as exc:
+        raise ValueError(f"Candidate observed-label class has no prototype: {exc.args[0]!r}.") from exc
+
+    # This N_pool x C temporary is intentionally discarded before return.
+    similarities = normalized_vectors @ prototypes.T
+    observed_values = similarities[np.arange(len(candidate_idx)), observed_columns].copy()
+    similarities[np.arange(len(candidate_idx)), observed_columns] = -np.inf
+    competitor_columns = np.argmax(similarities, axis=1)
+    competitor_values = similarities[np.arange(len(candidate_idx)), competitor_columns]
+    if np.any(~np.isfinite(observed_values)) or np.any(~np.isfinite(competitor_values)):
+        raise RuntimeError("Neighbor-Margin could not determine a finite observed/competing similarity.")
+
+    margin = np.full(len(labels), np.nan, dtype=np.float32)
+    observed_similarity = np.full(len(labels), np.nan, dtype=np.float32)
+    competitor_similarity = np.full(len(labels), np.nan, dtype=np.float32)
+    max_label_width = max(1, max(len(label) for label in prototype_labels))
+    competitor_class = np.full(len(labels), "", dtype=f"<U{max_label_width}")
+    margin[candidate_idx] = (observed_values - competitor_values).astype(np.float32)
+    observed_similarity[candidate_idx] = observed_values.astype(np.float32)
+    competitor_similarity[candidate_idx] = competitor_values.astype(np.float32)
+    competitor_class[candidate_idx] = np.asarray(
+        [prototype_labels[column] for column in competitor_columns], dtype=competitor_class.dtype
+    )
+    if np.any(competitor_class[candidate_idx] == labels[candidate_idx]):
+        raise RuntimeError("Neighbor-Margin competitor_class must differ from observed class.")
+    if not np.allclose(
+        margin[candidate_idx],
+        observed_similarity[candidate_idx] - competitor_similarity[candidate_idx],
+        rtol=1.0e-5,
+        atol=1.0e-6,
+    ):
+        raise RuntimeError("Neighbor-Margin invariant failed: margin != observed_similarity - competitor_similarity.")
+    return NeighborMarginSnapshot(
+        margin=margin,
+        observed_similarity=observed_similarity,
+        competitor_similarity=competitor_similarity,
+        competitor_class=competitor_class,
+        candidate_mask=candidate_mask.copy(),
+    )
+
+
+def build_neighbor_margin_candidates(
+    margin: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    proto_keep_ratio: float,
+) -> np.ndarray:
+    """Keep observed-class top-p positive Neighbor-Margin samples only."""
+    margin = np.asarray(margin, dtype=np.float32)
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if margin.shape != labels.shape or candidate_mask.shape != labels.shape:
+        raise ValueError("Neighbor-Margin arrays must all align with labels.")
+    if not 0.0 < proto_keep_ratio <= 1.0:
+        raise ValueError("proto_keep_ratio must satisfy 0 < p <= 1 for Neighbor-Margin.")
+    if np.any(~np.isfinite(margin[candidate_mask])):
+        raise ValueError("Neighbor-Margin is missing or non-finite for a training-pool sample.")
+
+    selected = np.zeros(len(labels), dtype=bool)
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        keep = len(idx) if proto_keep_ratio >= 1.0 else max(1, int(math.floor(proto_keep_ratio * len(idx))))
+        # mergesort preserves ``idx`` order, which is the stable original
+        # training-array index order when margins tie.
+        order = np.argsort(-margin[idx], kind="mergesort")
+        top_idx = idx[order[:keep]]
+        selected[top_idx[margin[top_idx] > 0.0]] = True
+    if np.any(selected & ~candidate_mask):
+        raise RuntimeError("Neighbor-Margin candidate contains a non-training-pool sample.")
+    if np.any(margin[selected] <= 0.0):
+        raise RuntimeError("Neighbor-Margin candidate must contain only strictly positive margins.")
+    return selected
+
+
+def combine_loss_and_neighbor_margin_classwise(
+    loss_selected_mask: np.ndarray,
+    neighbor_margin_candidate_mask: np.ndarray,
+    margin: np.ndarray,
+    losses: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    *,
+    use_fallback: bool,
+) -> tuple[np.ndarray, int]:
+    """Return strict Reliable intersection, with an explicitly opt-in extension.
+
+    The formal default never backfills a class.  If a later experiment opts in,
+    a vacant class may receive only its best positive-margin small-loss sample;
+    negative-margin (Suspicious) samples are never promoted.
+    """
+    loss_selected_mask = np.asarray(loss_selected_mask, dtype=bool)
+    neighbor_margin_candidate_mask = np.asarray(neighbor_margin_candidate_mask, dtype=bool)
+    margin = np.asarray(margin, dtype=np.float32)
+    losses = np.asarray(losses, dtype=np.float32)
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    reliable = loss_selected_mask & neighbor_margin_candidate_mask
+    if np.any(reliable & ~candidate_mask):
+        raise RuntimeError("Reliable selection contains a non-training-pool sample.")
+    if np.any(margin[reliable] <= 0.0):
+        raise RuntimeError("Reliable samples must have strictly positive Neighbor-Margin.")
+    fallback_count = 0
+    if not use_fallback:
+        if not np.array_equal(reliable, loss_selected_mask & neighbor_margin_candidate_mask):
+            raise RuntimeError("Neighbor-Margin Reliable mask must be the strict gate intersection.")
+        return reliable, fallback_count
+
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        if np.any(reliable[idx]):
+            continue
+        eligible = idx[loss_selected_mask[idx] & (margin[idx] > 0.0)]
+        if len(eligible) == 0:
+            continue
+        # Highest positive margin first; stable original-index order resolves
+        # exact ties.  This extension remains explicitly isolated from the
+        # baseline PGDF fallback and disabled for formal Neighbor-Margin runs.
+        order = np.argsort(-margin[eligible], kind="mergesort")
+        reliable[int(eligible[order[0]])] = True
+        fallback_count += 1
+    if np.any(margin[reliable] <= 0.0):
+        raise RuntimeError("Neighbor-Margin fallback promoted a non-positive-margin sample.")
+    return reliable, fallback_count
+
+
+def stratify_neighbor_margin_samples(
+    reliable_mask: np.ndarray,
+    margin: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the mutually exclusive Reliable/Ambiguous/Suspicious partition."""
+    reliable = np.asarray(reliable_mask, dtype=bool)
+    margin = np.asarray(margin, dtype=np.float32)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if reliable.shape != candidate_mask.shape or margin.shape != candidate_mask.shape:
+        raise ValueError("Neighbor-Margin stratification arrays must have matching shapes.")
+    if np.any(~np.isfinite(margin[candidate_mask])):
+        raise ValueError("Neighbor-Margin stratification requires finite candidate margins.")
+    if np.any(reliable & ~candidate_mask):
+        raise RuntimeError("Reliable partition contains a non-training-pool sample.")
+    if np.any(margin[reliable] <= 0.0):
+        raise RuntimeError("Reliable partition contains a non-positive-margin sample.")
+    suspicious = candidate_mask & (margin < 0.0)
+    ambiguous = candidate_mask & ~reliable & ~suspicious
+    if np.any(reliable & ambiguous) or np.any(reliable & suspicious) or np.any(ambiguous & suspicious):
+        raise RuntimeError("Neighbor-Margin sample states must be mutually exclusive.")
+    if not np.array_equal(reliable | ambiguous | suspicious, candidate_mask):
+        raise RuntimeError("Neighbor-Margin sample states must cover the complete training pool.")
+    if np.any(margin[suspicious] >= 0.0):
+        raise RuntimeError("Suspicious partition contains a non-negative-margin sample.")
+    return reliable, ambiguous, suspicious
+
+
+def count_empty_reliable_classes(
+    reliable_mask: np.ndarray,
+    candidate_mask: np.ndarray,
+    labels: np.ndarray,
+) -> int:
+    """Count observed-label classes with no current Reliable training sample."""
+    reliable_mask = np.asarray(reliable_mask, dtype=bool)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    labels = np.asarray(labels).astype(str)
+    if reliable_mask.shape != candidate_mask.shape or labels.shape != candidate_mask.shape:
+        raise ValueError("Reliable-class count inputs must have matching shapes.")
+    return sum(
+        not np.any(reliable_mask[candidate_mask & (labels == label)])
+        for label in sorted(set(labels[candidate_mask].tolist()))
     )
 
 
@@ -1088,6 +1433,7 @@ def build_update_row(
     proto_keep_ratio: float | None,
     epoch: int,
     candidate_mask: np.ndarray,
+    labels: np.ndarray,
     selected_mask: np.ndarray,
     previous_mask: np.ndarray,
     centroid_mask: np.ndarray | None,
@@ -1102,6 +1448,12 @@ def build_update_row(
     selection_model_checksum: str = "",
     lora_updated_since_initial: bool = False,
     fallback_count: int = 0,
+    geometry_mode: str = "prototype_similarity",
+    neighbor_margin_use_fallback: bool = False,
+    neighbor_margin_snapshot: NeighborMarginSnapshot | None = None,
+    reliable_mask: np.ndarray | None = None,
+    ambiguous_mask: np.ndarray | None = None,
+    suspicious_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     selected_losses = losses[selected_mask] if losses is not None else np.asarray([], dtype=np.float32)
     unselected_mask = candidate_mask & ~selected_mask
@@ -1112,6 +1464,34 @@ def build_update_row(
         if loss_selected_mask is not None
         else np.zeros(len(candidate_mask), dtype=bool)
     )
+    if geometry_mode == "neighbor_margin":
+        if (
+            neighbor_margin_snapshot is None
+            or reliable_mask is None
+            or ambiguous_mask is None
+            or suspicious_mask is None
+        ):
+            raise RuntimeError("Neighbor-Margin update logging requires all three sample-state masks.")
+        reliable_mask = np.asarray(reliable_mask, dtype=bool)
+        ambiguous_mask = np.asarray(ambiguous_mask, dtype=bool)
+        suspicious_mask = np.asarray(suspicious_mask, dtype=bool)
+        margin = neighbor_margin_snapshot.margin
+        observed_similarity = neighbor_margin_snapshot.observed_similarity
+        competitor_similarity = neighbor_margin_snapshot.competitor_similarity
+    else:
+        margin = None
+        observed_similarity = None
+        competitor_similarity = None
+    reliable_zero_class_count: int | str = ""
+    if geometry_mode == "neighbor_margin":
+        # ``selected_mask`` is Reliable in this mode.  The number of empty
+        # classes is supplied by scanning per-sample observed labels in the
+        # caller-independent helper below.
+        reliable_zero_class_count = count_empty_reliable_classes(
+            selected_mask,
+            candidate_mask,
+            labels,
+        )
     return {
         "method": method,
         "dataset": dataset,
@@ -1121,11 +1501,14 @@ def build_update_row(
         "auto_proto_jaccard": auto_proto_jaccard if auto_proto_jaccard is not None else "",
         "selection_strategy": selection_strategy,
         "prototype_mode": prototype_mode,
+        "geometry_mode": geometry_mode,
+        "neighbor_margin_use_fallback": "yes" if neighbor_margin_use_fallback else "no",
         "epoch": int(epoch),
         "num_candidates": int(candidate_mask.sum()),
         "full_training_pool_size": int(candidate_mask.sum()),
         "num_loss_selected": int(loss_selected_mask.sum()) if loss_selected_mask is not None else "",
         "num_proto_pass": int(proto_pass_mask.sum()),
+        "num_neighbor_margin_candidate": int(proto_pass_mask.sum()) if geometry_mode == "neighbor_margin" else "",
         "num_selected": int(selected_mask.sum()),
         "fallback_count": int(fallback_count),
         "proto_reject_count": int(proto_rejected_mask.sum()),
@@ -1155,6 +1538,20 @@ def build_update_row(
             else ""
         ),
         "lora_updated_since_initial": "yes" if lora_updated_since_initial else "no",
+        "reliable_count": int(reliable_mask.sum()) if reliable_mask is not None else "",
+        "ambiguous_count": int(ambiguous_mask.sum()) if ambiguous_mask is not None else "",
+        "suspicious_count": int(suspicious_mask.sum()) if suspicious_mask is not None else "",
+        "reliable_ratio": safe_ratio(int(reliable_mask.sum()), int(candidate_mask.sum())) if reliable_mask is not None else "",
+        "ambiguous_ratio": safe_ratio(int(ambiguous_mask.sum()), int(candidate_mask.sum())) if ambiguous_mask is not None else "",
+        "suspicious_ratio": safe_ratio(int(suspicious_mask.sum()), int(candidate_mask.sum())) if suspicious_mask is not None else "",
+        "reliable_zero_class_count": reliable_zero_class_count,
+        "margin_mean": float(np.mean(margin[candidate_mask])) if margin is not None else "",
+        "margin_std": float(np.std(margin[candidate_mask])) if margin is not None else "",
+        "margin_min": float(np.min(margin[candidate_mask])) if margin is not None else "",
+        "margin_max": float(np.max(margin[candidate_mask])) if margin is not None else "",
+        "margin_median": float(np.median(margin[candidate_mask])) if margin is not None else "",
+        "mean_observed_similarity": float(np.mean(observed_similarity[candidate_mask])) if observed_similarity is not None else "",
+        "mean_competitor_similarity": float(np.mean(competitor_similarity[candidate_mask])) if competitor_similarity is not None else "",
     }
 
 
@@ -1176,10 +1573,45 @@ def build_selection_rows(
     proto_scores: np.ndarray | None = None,
     selection_strategy: str = "loss_only",
     prototype_mode: str = "fixed",
+    geometry_mode: str = "prototype_similarity",
+    neighbor_margin_snapshot: NeighborMarginSnapshot | None = None,
+    reliable_mask: np.ndarray | None = None,
+    ambiguous_mask: np.ndarray | None = None,
+    suspicious_mask: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
     proto_pass_mask = candidate_mask if proto_pass_mask is None else proto_pass_mask
+    if geometry_mode == "neighbor_margin" and (
+        neighbor_margin_snapshot is None
+        or reliable_mask is None
+        or ambiguous_mask is None
+        or suspicious_mask is None
+    ):
+        raise RuntimeError("Neighbor-Margin selection rows require margin diagnostics and all sample states.")
     for idx in np.where(candidate_mask)[0]:
+        if geometry_mode == "neighbor_margin":
+            if reliable_mask[int(idx)]:
+                state = "reliable"
+            elif ambiguous_mask[int(idx)]:
+                state = "ambiguous"
+            elif suspicious_mask[int(idx)]:
+                state = "suspicious"
+            else:
+                raise RuntimeError(f"Candidate index {int(idx)} has no Neighbor-Margin state.")
+            margin = float(neighbor_margin_snapshot.margin[int(idx)])
+            observed_similarity = float(neighbor_margin_snapshot.observed_similarity[int(idx)])
+            competitor_similarity = float(neighbor_margin_snapshot.competitor_similarity[int(idx)])
+            competitor_class = str(neighbor_margin_snapshot.competitor_class[int(idx)])
+            geometry_candidate = "yes" if proto_pass_mask[int(idx)] else "no"
+            neighbor_margin_candidate = geometry_candidate
+        else:
+            state = "clean" if selected_mask[int(idx)] else "ignored"
+            margin = ""
+            observed_similarity = ""
+            competitor_similarity = ""
+            competitor_class = ""
+            geometry_candidate = "yes" if proto_pass_mask[int(idx)] else "no"
+            neighbor_margin_candidate = ""
         rows.append(
             {
                 "method": method,
@@ -1189,6 +1621,7 @@ def build_selection_rows(
                 "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
                 "selection_strategy": selection_strategy,
                 "prototype_mode": prototype_mode,
+                "geometry_mode": geometry_mode,
                 "epoch": int(epoch),
                 "index": int(idx),
                 "path": paths[int(idx)],
@@ -1198,7 +1631,14 @@ def build_selection_rows(
                 "proto_score": float(proto_scores[int(idx)]) if proto_scores is not None else "",
                 "loss_selected": "yes" if loss_selected_mask is not None and loss_selected_mask[int(idx)] else "no" if loss_selected_mask is not None else "",
                 "proto_pass": "yes" if proto_pass_mask[int(idx)] else "no",
-                "state": "clean" if selected_mask[int(idx)] else "ignored",
+                "geometry_candidate": geometry_candidate,
+                "neighbor_margin_candidate": neighbor_margin_candidate,
+                "neighbor_margin": margin,
+                "observed_similarity": observed_similarity,
+                "competitor_similarity": competitor_similarity,
+                "competitor_class": competitor_class,
+                "active_training": "yes" if selected_mask[int(idx)] else "no",
+                "state": state,
             }
         )
     return rows
@@ -1220,9 +1660,21 @@ def build_per_class_rows(
     proto_scores: np.ndarray | None = None,
     selection_strategy: str = "loss_only",
     prototype_mode: str = "fixed",
+    geometry_mode: str = "prototype_similarity",
+    neighbor_margin_snapshot: NeighborMarginSnapshot | None = None,
+    reliable_mask: np.ndarray | None = None,
+    ambiguous_mask: np.ndarray | None = None,
+    suspicious_mask: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     rows = []
     proto_pass_mask = candidate_mask if proto_pass_mask is None else proto_pass_mask
+    if geometry_mode == "neighbor_margin" and (
+        neighbor_margin_snapshot is None
+        or reliable_mask is None
+        or ambiguous_mask is None
+        or suspicious_mask is None
+    ):
+        raise RuntimeError("Neighbor-Margin per-class rows require margin diagnostics and all sample states.")
     for label in sorted(set(labels[candidate_mask].tolist())):
         idx = np.where(candidate_mask & (labels == label))[0]
         selected_idx = idx[selected_mask[idx]]
@@ -1232,6 +1684,7 @@ def build_per_class_rows(
             if loss_selected_mask is not None
             else np.asarray([], dtype=np.int64)
         )
+        class_margin = neighbor_margin_snapshot.margin[idx] if neighbor_margin_snapshot is not None else None
         rows.append(
             {
                 "method": method,
@@ -1241,6 +1694,7 @@ def build_per_class_rows(
                 "proto_keep_ratio": proto_keep_ratio if proto_keep_ratio is not None else "",
                 "selection_strategy": selection_strategy,
                 "prototype_mode": prototype_mode,
+                "geometry_mode": geometry_mode,
                 "epoch": int(epoch),
                 "web_label": str(label),
                 "total_count": int(len(idx)),
@@ -1254,6 +1708,22 @@ def build_per_class_rows(
                 "mean_loss_proto_rejected": float(np.nanmean(losses[proto_rejected_idx])) if losses is not None and len(proto_rejected_idx) else "",
                 "mean_proto_selected": float(np.nanmean(proto_scores[selected_idx])) if proto_scores is not None and len(selected_idx) else "",
                 "mean_proto_unselected": float(np.nanmean(proto_scores[unselected_idx])) if proto_scores is not None and len(unselected_idx) else "",
+                "neighbor_margin_candidate_count": int(np.sum(proto_pass_mask[idx])) if geometry_mode == "neighbor_margin" else "",
+                "reliable_count": int(np.sum(reliable_mask[idx])) if reliable_mask is not None else "",
+                "ambiguous_count": int(np.sum(ambiguous_mask[idx])) if ambiguous_mask is not None else "",
+                "suspicious_count": int(np.sum(suspicious_mask[idx])) if suspicious_mask is not None else "",
+                "reliable_zero": "yes" if reliable_mask is not None and not np.any(reliable_mask[idx]) else "no" if reliable_mask is not None else "",
+                "mean_neighbor_margin": float(np.mean(class_margin)) if class_margin is not None else "",
+                "mean_observed_similarity": (
+                    float(np.mean(neighbor_margin_snapshot.observed_similarity[idx]))
+                    if neighbor_margin_snapshot is not None
+                    else ""
+                ),
+                "mean_competitor_similarity": (
+                    float(np.mean(neighbor_margin_snapshot.competitor_similarity[idx]))
+                    if neighbor_margin_snapshot is not None
+                    else ""
+                ),
             }
         )
     return rows

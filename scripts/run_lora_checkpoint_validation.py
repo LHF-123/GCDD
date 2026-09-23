@@ -100,6 +100,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dynamic-ratio", type=float, default=0.8, help="Class-wise dynamic small-loss keep ratio r.")
     parser.add_argument("--fixed-p", type=float, default=0.4, help="Pre-declared global prototype keep ratio for PGDF fixed-p.")
     parser.add_argument(
+        "--geometry-mode",
+        choices=["prototype_similarity", "neighbor_margin"],
+        help="Override pgdf.geometry_mode from YAML for pgdf_dynamic_proto only.",
+    )
+    parser.add_argument(
+        "--neighbor-margin-use-fallback",
+        dest="neighbor_margin_use_fallback",
+        action="store_true",
+        default=None,
+        help="Opt in to the experimental positive-margin small-loss fallback; default is YAML false.",
+    )
+    parser.add_argument(
+        "--no-neighbor-margin-use-fallback",
+        dest="neighbor_margin_use_fallback",
+        action="store_false",
+        help="Disable the experimental Neighbor-Margin fallback explicitly.",
+    )
+    parser.add_argument(
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
@@ -178,6 +196,7 @@ def main() -> None:
     apply_lora_defaults(cfg)
     apply_overrides(cfg, args)
     validate_args(args)
+    geometry_mode, neighbor_margin_use_fallback = resolve_pgdf_geometry_config(cfg)
     jal_params = resolve_jal_params(cfg, args)
     noise_metadata = load_noise_metadata(noise_index)
     cfg["checkpoint_validation"] = {
@@ -186,6 +205,8 @@ def main() -> None:
         "validation_seed": int(args.validation_seed),
         "dynamic_ratio": float(args.dynamic_ratio),
         "fixed_p": float(args.fixed_p),
+        "geometry_mode": geometry_mode,
+        "neighbor_margin_use_fallback": neighbor_margin_use_fallback,
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
@@ -328,6 +349,8 @@ def main() -> None:
                 scheduler_retention_ratio: float | None = None
                 selection_strategy = "loss_only"
                 prototype_mode = "fixed"
+                dynamic_geometry_mode = "prototype_similarity"
+                dynamic_neighbor_margin_use_fallback = False
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -402,8 +425,11 @@ def main() -> None:
                     scheduler_retention_ratio = float(args.fixed_p)
                 elif canonical_key == "pgdf_dynamic_proto":
                     retention_ratio = float(args.dynamic_ratio)
+                    dynamic_geometry_mode = geometry_mode
+                    dynamic_neighbor_margin_use_fallback = neighbor_margin_use_fallback
                     method_name = (
-                        f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g}"
+                        f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g} "
+                        f"geometry={dynamic_geometry_mode}"
                     )
                     proto_scores = None
                     centroid_mask = None
@@ -411,7 +437,11 @@ def main() -> None:
                     auto_proto_keep = None
                     selection_strategy = "loss_and_proto"
                     prototype_mode = "dynamic_lora"
-                    selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
+                    selection_mode = (
+                        "pgdf_dynamic_lora_neighbor_margin_reliable_only_training_pool"
+                        if dynamic_geometry_mode == "neighbor_margin"
+                        else "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
+                    )
                 elif canonical_key == "fixed_proto_warmup_matched":
                     if pgdf_reference is None:
                         raise RuntimeError("Fixed prototype reference was not constructed.")
@@ -476,6 +506,16 @@ def main() -> None:
                     official_test_selected_only=bool(args.official_test_selected_only),
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
+                    geometry_mode=dynamic_geometry_mode,
+                    neighbor_margin_use_fallback=dynamic_neighbor_margin_use_fallback,
+                )
+                # The clean/noisy mask is intentionally attached only after
+                # all model fitting and selection are complete.  It is never
+                # passed into ``train_dynamic_loss_lora`` or its selectors.
+                attach_posthoc_noise_diagnostics(
+                    result.update_rows,
+                    result.selection_rows,
+                    data["train_labels"] == clean_labels,
                 )
                 if budget_schedule is not None:
                     verify_observed_budget_match(result.per_class_rows, budget_schedule)
@@ -579,6 +619,8 @@ def main() -> None:
                     "budget_match_verified": result_row.get("budget_match_verified", ""),
                     "selection_strategy": result.summary.get("selection_strategy", ""),
                     "prototype_mode": result.summary.get("prototype_mode", ""),
+                    "geometry_mode": result.summary.get("geometry_mode", ""),
+                    "neighbor_margin_use_fallback": result.summary.get("neighbor_margin_use_fallback", ""),
                 },
             )
             all_results.append(result_row)
@@ -729,6 +771,83 @@ def finalize_result_row(
     row["selection_ratio"] = float(selected_count) / max(1, candidate_count)
     row.setdefault("candidate_samples", int(candidate_count))
     return row
+
+
+def attach_posthoc_noise_diagnostics(
+    update_rows: list[dict[str, Any]],
+    selection_rows: list[dict[str, Any]],
+    clean_mask: np.ndarray,
+) -> None:
+    """Attach synthetic-noise diagnostics after selection/training has finished.
+
+    This helper deliberately lives in the experiment entry point rather than
+    the trainer.  The trainer never receives clean labels or flip status, so
+    these fields cannot affect features, rankings, thresholds, fallbacks, loss,
+    checkpoint choice, or any training decision.
+    """
+    clean_mask = np.asarray(clean_mask, dtype=bool)
+    rows_by_epoch: dict[int, list[dict[str, Any]]] = {}
+    for row in selection_rows:
+        index = int(row["index"])
+        if not 0 <= index < len(clean_mask):
+            raise RuntimeError(f"Selection diagnostic index {index} is outside clean-mask bounds.")
+        is_clean = bool(clean_mask[index])
+        row["posthoc_is_clean"] = "yes" if is_clean else "no"
+        row["posthoc_is_noisy"] = "no" if is_clean else "yes"
+        rows_by_epoch.setdefault(int(row["epoch"]), []).append(row)
+
+    def ratio(numerator: int, denominator: int) -> float | str:
+        return float(numerator) / float(denominator) if denominator else ""
+
+    for update in update_rows:
+        rows = rows_by_epoch.get(int(update["epoch"]), [])
+        if not rows:
+            raise RuntimeError(f"Selection update {update['epoch']} has no original-index diagnostics.")
+        clean = np.asarray([row["posthoc_is_clean"] == "yes" for row in rows], dtype=bool)
+        noisy = ~clean
+        active = np.asarray([row.get("active_training") == "yes" for row in rows], dtype=bool)
+        geometry_candidate = np.asarray([row.get("geometry_candidate") == "yes" for row in rows], dtype=bool)
+        state = np.asarray([str(row.get("state", "")) for row in rows], dtype=str)
+        is_neighbor_margin = str(update.get("geometry_mode", "")) == "neighbor_margin"
+        if is_neighbor_margin:
+            reliable = state == "reliable"
+            ambiguous = state == "ambiguous"
+            suspicious = state == "suspicious"
+            if not np.array_equal(reliable, active):
+                raise RuntimeError("Post-hoc diagnostic found a non-Reliable Neighbor-Margin training sample.")
+            update.update(
+                {
+                    "reliable_purity": ratio(int(np.sum(reliable & clean)), int(np.sum(reliable))),
+                    "reliable_noisy_retention": ratio(int(np.sum(reliable & noisy)), int(np.sum(noisy))),
+                    "suspicious_noise_ratio": ratio(int(np.sum(suspicious & noisy)), int(np.sum(suspicious))),
+                    "ambiguous_clean_ratio": ratio(int(np.sum(ambiguous & clean)), int(np.sum(ambiguous))),
+                    "ambiguous_noisy_ratio": ratio(int(np.sum(ambiguous & noisy)), int(np.sum(ambiguous))),
+                    "neighbor_margin_candidate_purity": ratio(
+                        int(np.sum(geometry_candidate & clean)), int(np.sum(geometry_candidate))
+                    ),
+                    "prototype_candidate_purity": "",
+                }
+            )
+        else:
+            has_prototype_candidate = str(update.get("selection_strategy", "")) in {
+                "proto_only",
+                "loss_and_proto",
+            }
+            update.update(
+                {
+                    "reliable_purity": "",
+                    "reliable_noisy_retention": "",
+                    "suspicious_noise_ratio": "",
+                    "ambiguous_clean_ratio": "",
+                    "ambiguous_noisy_ratio": "",
+                    "neighbor_margin_candidate_purity": "",
+                    "prototype_candidate_purity": (
+                        ratio(int(np.sum(geometry_candidate & clean)), int(np.sum(geometry_candidate)))
+                        if has_prototype_candidate
+                        else ""
+                    ),
+                }
+            )
 
 
 def load_noise_metadata(noise_index: Path) -> dict[str, Any]:
@@ -929,6 +1048,9 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
     }
     for key, value in defaults.items():
         cfg["lora_train"].setdefault(key, value)
+    cfg.setdefault("pgdf", {})
+    cfg["pgdf"].setdefault("geometry_mode", "prototype_similarity")
+    cfg["pgdf"].setdefault("neighbor_margin_use_fallback", False)
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -955,6 +1077,24 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
     for key, value in {"device": args.device, "local_repo": args.local_repo, "input_size": args.input_size}.items():
         if value is not None:
             feature_cfg[key] = value
+    if args.geometry_mode is not None:
+        cfg["pgdf"]["geometry_mode"] = args.geometry_mode
+    if args.neighbor_margin_use_fallback is not None:
+        cfg["pgdf"]["neighbor_margin_use_fallback"] = bool(args.neighbor_margin_use_fallback)
+
+
+def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool]:
+    """Validate the dynamic-PGDF geometry switch after YAML/CLI resolution."""
+    pgdf_cfg = cfg.get("pgdf", {})
+    geometry_mode = str(pgdf_cfg.get("geometry_mode", "prototype_similarity"))
+    if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
+        raise ValueError(
+            "pgdf.geometry_mode must be 'prototype_similarity' or 'neighbor_margin'."
+        )
+    fallback = pgdf_cfg.get("neighbor_margin_use_fallback", False)
+    if not isinstance(fallback, bool):
+        raise ValueError("pgdf.neighbor_margin_use_fallback must be boolean.")
+    return geometry_mode, fallback
 
 
 def configure_jal(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1154,6 +1294,7 @@ def result_fields() -> list[str]:
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
         "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
+        "geometry_mode", "neighbor_margin_use_fallback",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1171,8 +1312,10 @@ def summary_fields() -> list[str]:
 
 def selection_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "epoch",
-        "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "state",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "epoch",
+        "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "geometry_candidate", "neighbor_margin_candidate",
+        "neighbor_margin", "observed_similarity", "competitor_similarity", "competitor_class", "active_training", "state",
+        "posthoc_is_clean", "posthoc_is_noisy",
     ]
 
 
@@ -1185,20 +1328,25 @@ def dual_selection_fields() -> list[str]:
 
 def update_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
-        "num_proto_pass", "num_selected", "fallback_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "geometry_mode", "neighbor_margin_use_fallback", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
+        "num_proto_pass", "num_neighbor_margin_candidate", "num_selected", "fallback_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected", "overlap_with_previous_selection", "overlap_with_centroid",
         "prototype_feature_source", "prototype_feature_dim", "prototype_checksum", "prototype_gate_membership_hash",
         "prototype_mean", "prototype_std", "selection_model_state_checksum", "prototype_model_state_checksum",
         "same_model_state_for_loss_and_prototype", "lora_updated_since_initial",
+        "reliable_count", "ambiguous_count", "suspicious_count", "reliable_ratio", "ambiguous_ratio", "suspicious_ratio", "reliable_zero_class_count",
+        "margin_mean", "margin_std", "margin_min", "margin_max", "margin_median", "mean_observed_similarity", "mean_competitor_similarity",
+        "reliable_purity", "reliable_noisy_retention", "suspicious_noise_ratio", "ambiguous_clean_ratio", "ambiguous_noisy_ratio",
+        "prototype_candidate_purity", "neighbor_margin_candidate_purity",
     ]
 
 
 def per_class_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "epoch", "web_label", "total_count", "loss_selected_count",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "epoch", "web_label", "total_count", "loss_selected_count",
         "proto_pass_count", "selected_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected",
+        "neighbor_margin_candidate_count", "reliable_count", "ambiguous_count", "suspicious_count", "reliable_zero", "mean_neighbor_margin", "mean_observed_similarity", "mean_competitor_similarity",
     ]
 
 

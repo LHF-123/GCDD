@@ -1,0 +1,4 @@
+# Explicit original dynamic-PGDF geometry overlay.  This is also the default.
+pgdf:
+  geometry_mode: prototype_similarity
+  neighbor_margin_use_fallback: false
