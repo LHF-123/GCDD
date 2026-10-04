@@ -86,6 +86,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", help="Optional YAML merged over <input-dir>/resolved_config.yaml for all methods.")
     parser.add_argument("--output-dir", help="Defaults to <input-dir>/checkpoint_validation_all_methods_s<validation-seed>.")
     parser.add_argument(
+        "--run-layout",
+        choices=["method_seed", "direct_seed"],
+        default="method_seed",
+        help="Run directory layout: method_seed (default: <method>/seed<seed>) or direct_seed (seed<seed>; exactly one method).",
+    )
+    parser.add_argument(
         "--methods",
         default="all",
         help=(
@@ -187,10 +193,11 @@ def main() -> None:
 
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
+    validate_run_layout_request(methods, str(args.run_layout))
     validate_official_test_request(methods, bool(args.official_test_selected_only))
     pgdf_budget_root = Path(args.pgdf_budget_root) if args.pgdf_budget_root else None
     validate_budget_method_request(methods, pgdf_budget_root, seeds)
-    preflight_run_dirs(output_dir, methods, seeds)
+    preflight_run_dirs(output_dir, methods, seeds, str(args.run_layout))
     path_maps = parse_path_maps(args.path_map)
     cfg = load_config(input_dir, Path(args.config) if args.config else None)
     apply_lora_defaults(cfg)
@@ -211,6 +218,7 @@ def main() -> None:
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
         "official_test_selected_only": bool(args.official_test_selected_only),
+        "run_layout": str(args.run_layout),
         "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
         "noise_realization": noise_metadata,
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
@@ -283,7 +291,7 @@ def main() -> None:
     for method_key in methods:
         canonical_key = canonical_method_key(method_key)
         for seed in seeds:
-            run_dir = output_dir / method_key / f"seed{seed}"
+            run_dir = build_run_dir(output_dir, method_key, seed, str(args.run_layout))
             require_fresh_run_dir(run_dir)
             ensure_dir(run_dir)
             checkpoints = run_dir / "checkpoints"
@@ -1002,11 +1010,23 @@ def require_fresh_run_dir(run_dir: Path) -> None:
         )
 
 
-def preflight_run_dirs(output_dir: Path, methods: list[str], seeds: list[int]) -> None:
+def validate_run_layout_request(methods: list[str], run_layout: str) -> None:
+    """Keep the flat seed layout unambiguous without changing the default layout."""
+    if run_layout == "direct_seed" and len(methods) != 1:
+        raise ValueError("--run-layout direct_seed requires exactly one --methods entry.")
+
+
+def build_run_dir(output_dir: Path, method_key: str, seed: int, run_layout: str) -> Path:
+    if run_layout == "direct_seed":
+        return output_dir / f"seed{seed}"
+    return output_dir / method_key / f"seed{seed}"
+
+
+def preflight_run_dirs(output_dir: Path, methods: list[str], seeds: list[int], run_layout: str) -> None:
     """Check the complete request before any config/reference file is rewritten."""
     for method_key in methods:
         for seed in seeds:
-            require_fresh_run_dir(output_dir / method_key / f"seed{seed}")
+            require_fresh_run_dir(build_run_dir(output_dir, method_key, seed, run_layout))
 
 
 def load_config(input_dir: Path, override_path: Path | None) -> dict[str, Any]:

@@ -1,8 +1,127 @@
-# Overlay for scripts/run_lora_checkpoint_validation.py with
-# --methods pgdf_dynamic_proto.  All other LoRA/PGDF schedule values remain
-# inherited from the input directory's resolved_config.yaml and CLI arguments.
+# Complete, self-contained protocol for the formal Neighbor-Margin experiment.
+#
+# This is the only experiment configuration consumed by the standalone
+# launcher. The three raw dataset roots and the new run root are command-line
+# arguments because they are machine-specific.
+
+protocol:
+  name: neighbor_margin_strict_cyclic_asym40
+  # Training-policy identity. Add future tier-treatment variants as sibling
+  # directories; do not overload the geometry name.
+  variant_id: reliable_only
+  noise:
+    ratio: 0.4
+    seed: 42
+    target_strategy: adjacent_cyclic
+  training:
+    # Default seed; use the launcher's --seeds 1,42,88 for a multi-seed run.
+    seeds: [42]
+  validation:
+    ratio: 0.10
+    seed: 20250726
+    official_test_selected_only: true
+    posthoc_oracle_test: false
+  pgdf:
+    dynamic_ratio: 0.8
+    prototype_keep_ratio: 0.4
+    warmup_epochs: 5
+    update_interval: 5
+
+# The roots are intentionally blank: supply them with --cub-root, --cars-root,
+# and --aircraft-root on the target server.
+datasets:
+  cub:
+    dataset_name: CUB-200-2011-asym40-s42
+    data_root: ""
+    layout: cub_metadata
+    train_split: train
+    eval_split: test
+    noise_prefix: cub_asym_r0p4_s42
+    input_version: v1_cub_asym_r0p4_s42
+    v1_graph:
+      knn_backend: auto
+      k_pool_class: 30
+      k_pool_global: 200
+      k_class: 10
+      k_global: 30
+      rrf_k0: 20
+  cars:
+    dataset_name: Stanford-Cars-asym40-s42
+    data_root: ""
+    layout: folder
+    train_split: train
+    eval_split: test
+    noise_prefix: stanford_cars_asym_r0p4_s42
+    input_version: v1_cars_asym_r0p4_s42
+    v1_graph:
+      knn_backend: auto
+      k_pool_class: 100
+      k_pool_global: 300
+      k_class: 20
+      k_global: 50
+      rrf_k0: 20
+  aircraft:
+    dataset_name: FGVC-Aircraft-asym40-s42
+    data_root: ""
+    layout: folder
+    train_split: train
+    eval_split: test
+    noise_prefix: fgvc_aircraft_asym_r0p4_s42
+    input_version: v1_aircraft_asym_r0p4_s42
+    v1_graph:
+      knn_backend: auto
+      k_pool_class: 100
+      k_pool_global: 300
+      k_class: 20
+      k_global: 50
+      rrf_k0: 20
+
+# Fresh V1 input protocol. This replaces dependencies on historical v1_*.yaml
+# files and regenerates frozen DINOv2 CLS/GAP/top feature caches.
+v1:
+  feature_batch_size: 128
+  selection:
+    otsu_bins: 256
+    clean_ratio_clip: [0.3, 0.9]
+    epsilon: 1.0e-8
+  linear_train:
+    epochs: 50
+    batch_size: 256
+    lr: 0.05
+    min_lr: 0.0
+    scheduler: cosine
+    seed: 42
+    feature: cls
+
+feature:
+  backend: dinov2_vitb14
+  local_repo: ""
+  device: auto
+  input_size: 448
+  top_patch_ratio: 0.2
+  random_dim: 128
+  reuse: false
+
+lora:
+  rank: 8
+  alpha: 16.0
+  dropout: 0.05
+  target_modules: qkv
+
+lora_train:
+  epochs: 30
+  batch_size: 80
+  eval_batch_size: 160
+  num_workers: 4
+  pin_memory: true
+  lora_lr: 1.0e-4
+  head_lr: 1.0e-3
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_ratio: 0.1
+  amp: true
+
 pgdf:
   geometry_mode: neighbor_margin
-  # Formal Neighbor-Margin experiments use the strict intersection only.
-  # Set true only for a separately labelled fallback ablation.
+  # Formal Neighbor-Margin uses the strict small-loss/intersection rule only.
   neighbor_margin_use_fallback: false
