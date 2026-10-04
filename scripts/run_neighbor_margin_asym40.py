@@ -1,9 +1,10 @@
 """Run a fresh, isolated cyclic-asym40 Neighbor-Margin experiment.
 
-This launcher consumes raw CUB/Cars/Aircraft data, regenerates deterministic
-noise indexes and V1 inputs, then runs validation-selected Neighbor-Margin
-PGDF. It does not read checkpoints, selections, manifests, or V1 outputs from
-an earlier experiment.
+This launcher regenerates deterministic noise indexes and the minimal
+path/label inputs consumed by dynamic LoRA PGDF, then runs the
+validation-selected Neighbor-Margin variant.  It intentionally does not run
+the unrelated V1 linear training, frozen DINO feature extraction, or graph
+selection stages, and does not reuse results from earlier experiments.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import yaml
 
 
@@ -24,27 +26,24 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from gcdd.data import build_verified_index
 from gcdd.io_utils import ensure_dir, write_csv, write_yaml
-from gcdd.pipeline_v1 import run_v1_web_bird
 from tools import build_cub_asym_noise_index as cub_noise
 from tools import build_folder_asym_noise_index as folder_noise
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "pgdf_neighbor_margin.yaml"
-V1_REQUIRED_FILES = (
+MINIMAL_INPUT_REQUIRED_FILES = (
     "paths.txt",
     "labels.npy",
     "eval_paths.txt",
     "eval_labels.npy",
-    "features_cls.npy",
-    "features_gap.npy",
-    "features_top.npy",
     "resolved_config.yaml",
 )
 
 
 class PreparedDataset:
-    """Fresh V1 inputs and noise provenance for one dataset."""
+    """Fresh minimal LoRA inputs and noise provenance for one dataset."""
 
     def __init__(self, *, key: str, spec: dict[str, Any], noise_index: Path, input_dir: Path) -> None:
         self.key = key
@@ -66,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cars-root", type=Path, help="Cars root containing train/ and test/.")
     parser.add_argument("--aircraft-root", type=Path, help="Aircraft root containing train/ and test/.")
     parser.add_argument("--run-root", type=Path, required=True, help="New root for all fresh generated inputs and results.")
-    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), help="Override feature.device for V1 and LoRA.")
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), help="Override the LoRA feature device.")
     parser.add_argument("--local-repo", help="Override feature.local_repo for an offline/local DINOv2 torch-hub checkout.")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for the LoRA runner.")
     parser.add_argument("--dry-run", action="store_true", help="Print the complete plan without creating files or training.")
@@ -99,8 +98,8 @@ def main() -> None:
         for key in ("cub", "cars", "aircraft"):
             spec = cfg["datasets"][key]
             noise_index = build_noise_index(key, spec, cfg, bundle_root)
-            input_dir = rebuild_v1_input(spec, cfg, bundle_root, noise_index)
-            verify_v1_input(input_dir)
+            input_dir = build_minimal_training_input(spec, cfg, bundle_root, noise_index)
+            verify_minimal_training_input(input_dir)
             prepared.append(PreparedDataset(key=key, spec=spec, noise_index=noise_index, input_dir=input_dir))
 
     ensure_dir(variant_root)
@@ -123,11 +122,7 @@ def load_standalone_config(path: Path) -> dict[str, Any]:
 
 
 def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
-    roots = {
-        "cub": args.cub_root,
-        "cars": args.cars_root,
-        "aircraft": args.aircraft_root,
-    }
+    roots = {"cub": args.cub_root, "cars": args.cars_root, "aircraft": args.aircraft_root}
     for key, root in roots.items():
         if root is not None:
             cfg["datasets"][key]["data_root"] = str(root.expanduser())
@@ -142,11 +137,16 @@ def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> No
 
 
 def validate_standalone_config(cfg: dict[str, Any]) -> None:
-    for section in ("protocol", "datasets", "v1", "feature", "lora", "lora_train", "pgdf"):
+    for section in ("protocol", "datasets", "feature", "lora", "lora_train", "pgdf"):
         if section not in cfg or not isinstance(cfg[section], dict):
             raise ValueError(f"Standalone config is missing mapping: {section}")
     if set(cfg["datasets"]) != {"cub", "cars", "aircraft"}:
         raise ValueError("Standalone config datasets must be exactly cub, cars, and aircraft.")
+    for key, spec in cfg["datasets"].items():
+        for field in ("dataset_name", "layout", "train_split", "eval_split", "noise_prefix", "input_id"):
+            if not str(spec.get(field, "")).strip():
+                raise ValueError(f"datasets.{key}.{field} must be a non-empty string.")
+
     protocol_name = str(cfg["protocol"].get("name", "")).strip()
     variant_id = str(cfg["protocol"].get("variant_id", "")).strip()
     for key, value in (("protocol.name", protocol_name), ("protocol.variant_id", variant_id)):
@@ -168,11 +168,13 @@ def validate_standalone_config(cfg: dict[str, Any]) -> None:
     if not training_seeds or any(seed <= 0 for seed in training_seeds) or len(set(training_seeds)) != len(training_seeds):
         raise ValueError("protocol.training.seeds must be a non-empty list of unique positive integers.")
     cfg["protocol"]["training"]["seeds"] = training_seeds
+
     validation = cfg["protocol"].get("validation", {})
     if float(validation.get("ratio", -1.0)) != 0.10 or int(validation.get("seed", -1)) != 20250726:
         raise ValueError("Formal validation must use ratio=0.10 and seed=20250726.")
     if not bool(validation.get("official_test_selected_only", False)):
         raise ValueError("Formal protocol requires official_test_selected_only: true.")
+
     pgdf_protocol = cfg["protocol"].get("pgdf", {})
     dynamic_ratio = float(pgdf_protocol.get("dynamic_ratio", -1.0))
     prototype_keep_ratio = float(pgdf_protocol.get("prototype_keep_ratio", -1.0))
@@ -182,10 +184,14 @@ def validate_standalone_config(cfg: dict[str, Any]) -> None:
     update_interval = int(pgdf_protocol.get("update_interval", -1))
     if warmup_epochs < 0 or update_interval <= 0:
         raise ValueError("protocol.pgdf warmup_epochs must be non-negative and update_interval must be positive.")
-    cfg["protocol"]["pgdf"]["dynamic_ratio"] = dynamic_ratio
-    cfg["protocol"]["pgdf"]["prototype_keep_ratio"] = prototype_keep_ratio
-    cfg["protocol"]["pgdf"]["warmup_epochs"] = warmup_epochs
-    cfg["protocol"]["pgdf"]["update_interval"] = update_interval
+    cfg["protocol"]["pgdf"].update(
+        {
+            "dynamic_ratio": dynamic_ratio,
+            "prototype_keep_ratio": prototype_keep_ratio,
+            "warmup_epochs": warmup_epochs,
+            "update_interval": update_interval,
+        }
+    )
     if cfg["pgdf"].get("geometry_mode") != "neighbor_margin":
         raise ValueError("Standalone config must set pgdf.geometry_mode: neighbor_margin.")
     if bool(cfg["pgdf"].get("neighbor_margin_use_fallback", True)):
@@ -230,9 +236,7 @@ def build_protocol_bundle_root(run_root: Path, cfg: dict[str, Any]) -> Path:
 def compact_ratio_token(value: float) -> str:
     """Format 0.8 and 0.4 as 08 and 04 in directory-safe protocol tags."""
     text = format(value, ".12g")
-    if text.startswith("0."):
-        return "0" + text[2:]
-    return text.replace(".", "p")
+    return "0" + text[2:] if text.startswith("0.") else text.replace(".", "p")
 
 
 def input_bundle_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -240,14 +244,12 @@ def input_bundle_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "noise": copy.deepcopy(cfg["protocol"]["noise"]),
         "datasets": copy.deepcopy(cfg["datasets"]),
-        "v1": copy.deepcopy(cfg["v1"]),
-        "feature": copy.deepcopy(cfg["feature"]),
     }
 
 
 def expected_prepared_paths(bundle_root: Path, key: str, spec: dict[str, Any]) -> tuple[Path, Path]:
     noise_index = bundle_root / "prepared_inputs" / "noise_indices" / key / f"{spec['noise_prefix']}_index.csv"
-    input_dir = bundle_root / "prepared_inputs" / "v1_inputs" / spec["dataset_name"] / spec["input_version"]
+    input_dir = bundle_root / "prepared_inputs" / "training_inputs" / spec["dataset_name"] / spec["input_id"]
     return noise_index, input_dir
 
 
@@ -262,7 +264,7 @@ def load_existing_prepared_bundle(bundle_root: Path, cfg: dict[str, Any]) -> lis
         recorded = yaml.safe_load(handle) or {}
     if recorded != input_bundle_config(cfg):
         raise ValueError(
-            f"Existing prepared inputs at {bundle_root} were built with a different noise/data/V1/feature configuration. "
+            f"Existing prepared inputs at {bundle_root} were built with a different noise/data configuration. "
             "Choose a different --run-root rather than mixing input bundles."
         )
 
@@ -272,7 +274,7 @@ def load_existing_prepared_bundle(bundle_root: Path, cfg: dict[str, Any]) -> lis
         noise_index, input_dir = expected_prepared_paths(bundle_root, key, spec)
         if not noise_index.is_file():
             raise FileNotFoundError(f"Existing protocol bundle is missing noise index: {noise_index}")
-        verify_v1_input(input_dir)
+        verify_minimal_training_input(input_dir)
         prepared.append(PreparedDataset(key=key, spec=spec, noise_index=noise_index, input_dir=input_dir))
     print(f"[prepared-inputs] Reusing verified immutable bundle: {bundle_root / 'prepared_inputs'}", flush=True)
     return prepared
@@ -330,38 +332,60 @@ def build_noise_index(key: str, spec: dict[str, Any], cfg: dict[str, Any], bundl
     return index_path
 
 
-def rebuild_v1_input(spec: dict[str, Any], cfg: dict[str, Any], bundle_root: Path, noise_index: Path) -> Path:
-    feature_cfg = copy.deepcopy(cfg["feature"])
-    feature_cfg["reuse"] = False
-    v1_cfg = {
-        "dataset": {
-            "name": spec["dataset_name"],
-            "root": str(Path(str(spec["data_root"])).expanduser()),
-            "index_file": str(noise_index),
-            "train_split": spec["train_split"],
-            "eval_split": spec["eval_split"],
-            "max_classes": None,
-            "max_train_per_class": None,
-            "max_eval_per_class": None,
-            "verify_images": True,
-        },
-        "output": {"root": str(bundle_root / "prepared_inputs" / "v1_inputs"), "version": spec["input_version"]},
-        "feature": feature_cfg,
-        "graph": copy.deepcopy(spec["v1_graph"]),
-        "selection": copy.deepcopy(cfg["v1"]["selection"]),
-        "train": copy.deepcopy(cfg["v1"]["linear_train"]),
+def build_minimal_training_input(spec: dict[str, Any], cfg: dict[str, Any], bundle_root: Path, noise_index: Path) -> Path:
+    """Build only index-aligned files consumed by dynamic LoRA PGDF.
+
+    Dynamic PGDF reconstructs current LoRA CLS features and prototypes inside
+    each selection update. It does not require a V1 linear classifier, frozen
+    feature cache, or graph-selection artifact.
+    """
+    input_cfg = copy.deepcopy(cfg)
+    input_cfg["dataset"] = {
+        "name": spec["dataset_name"],
+        "root": str(Path(str(spec["data_root"])).expanduser()),
+        "index_file": str(noise_index),
+        "train_split": spec["train_split"],
+        "eval_split": spec["eval_split"],
+        "max_classes": None,
+        "max_train_per_class": None,
+        "max_eval_per_class": None,
+        "verify_images": True,
     }
-    v1_cfg["feature"]["batch_size"] = int(cfg["v1"]["feature_batch_size"])
-    input_dir = Path(v1_cfg["output"]["root"]) / spec["dataset_name"] / spec["input_version"]
-    print(f"[v1] rebuilding {spec['dataset_name']} -> {input_dir}", flush=True)
-    run_v1_web_bird(v1_cfg)
+    input_dir = bundle_root / "prepared_inputs" / "training_inputs" / spec["dataset_name"] / spec["input_id"]
+    ensure_dir(input_dir)
+    print(f"[training-input] building {spec['dataset_name']} -> {input_dir}", flush=True)
+
+    train_records, train_bad_images = build_verified_index(
+        input_cfg, split=str(spec["train_split"]), samples_per_class=None, max_classes=None
+    )
+    eval_records, eval_bad_images = build_verified_index(
+        input_cfg, split=str(spec["eval_split"]), samples_per_class=None, max_classes=None
+    )
+    if not train_records:
+        raise ValueError(f"{spec['dataset_name']}: no valid training images after index verification.")
+    if not eval_records:
+        raise ValueError(f"{spec['dataset_name']}: no valid evaluation images after index verification.")
+
+    (input_dir / "paths.txt").write_text("\n".join(str(record.path) for record in train_records), encoding="utf-8")
+    np.save(input_dir / "labels.npy", np.asarray([record.label for record in train_records], dtype=str))
+    (input_dir / "eval_paths.txt").write_text("\n".join(str(record.path) for record in eval_records), encoding="utf-8")
+    np.save(input_dir / "eval_labels.npy", np.asarray([record.label for record in eval_records], dtype=str))
+    write_yaml(input_dir / "resolved_config.yaml", input_cfg)
+
+    bad_image_count = len(train_bad_images) + len(eval_bad_images)
+    if bad_image_count:
+        print(
+            f"[training-input] {spec['dataset_name']}: skipped {bad_image_count} unreadable images "
+            f"(train={len(train_bad_images)}, eval={len(eval_bad_images)}).",
+            flush=True,
+        )
     return input_dir
 
 
-def verify_v1_input(input_dir: Path) -> None:
-    missing = [name for name in V1_REQUIRED_FILES if not (input_dir / name).is_file()]
+def verify_minimal_training_input(input_dir: Path) -> None:
+    missing = [name for name in MINIMAL_INPUT_REQUIRED_FILES if not (input_dir / name).is_file()]
     if missing:
-        raise FileNotFoundError(f"V1 preparation is incomplete at {input_dir}: missing {missing}")
+        raise FileNotFoundError(f"Minimal training-input preparation is incomplete at {input_dir}: missing {missing}")
 
 
 def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root: Path, args: argparse.Namespace) -> None:
@@ -372,36 +396,22 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
     command = [
         args.python,
         "scripts/run_lora_checkpoint_validation.py",
-        "--input-dir",
-        str(item.input_dir),
-        "--noise-index",
-        str(item.noise_index),
-        "--config",
-        str(args.config),
-        "--output-dir",
-        str(output_dir),
-        "--run-layout",
-        "direct_seed",
-        "--methods",
-        "pgdf_dynamic_proto",
-        "--seeds",
-        ",".join(str(seed) for seed in protocol["training"]["seeds"]),
-        "--validation-ratio",
-        str(validation["ratio"]),
-        "--validation-seed",
-        str(validation["seed"]),
-        "--dynamic-ratio",
-        str(pgdf_protocol["dynamic_ratio"]),
-        "--fixed-p",
-        str(pgdf_protocol["prototype_keep_ratio"]),
-        "--warmup-epochs",
-        str(pgdf_protocol["warmup_epochs"]),
-        "--update-interval",
-        str(pgdf_protocol["update_interval"]),
+        "--input-dir", str(item.input_dir),
+        "--noise-index", str(item.noise_index),
+        "--config", str(args.config),
+        "--output-dir", str(output_dir),
+        "--run-layout", "direct_seed",
+        "--methods", "pgdf_dynamic_proto",
+        "--seeds", ",".join(str(seed) for seed in protocol["training"]["seeds"]),
+        "--validation-ratio", str(validation["ratio"]),
+        "--validation-seed", str(validation["seed"]),
+        "--dynamic-ratio", str(pgdf_protocol["dynamic_ratio"]),
+        "--fixed-p", str(pgdf_protocol["prototype_keep_ratio"]),
+        "--warmup-epochs", str(pgdf_protocol["warmup_epochs"]),
+        "--update-interval", str(pgdf_protocol["update_interval"]),
         "--official-test-selected-only",
         "--no-posthoc-oracle-test",
-        "--device",
-        str(cfg["feature"]["device"]),
+        "--device", str(cfg["feature"]["device"]),
     ]
     local_repo = str(cfg["feature"].get("local_repo", ""))
     if local_repo:
@@ -454,8 +464,7 @@ def print_plan(cfg: dict[str, Any], run_root: Path, args: argparse.Namespace) ->
         output_dir = variant_root / key
         print(
             f"[DRY RUN] {spec['dataset_name']}: raw={spec['data_root']}; "
-            f"noise -> {noise_index}; V1 -> {input_dir}; "
-            f"LoRA -> {output_dir}",
+            f"noise -> {noise_index}; training-input -> {input_dir}; LoRA -> {output_dir}",
             flush=True,
         )
     print(f"[DRY RUN] Python runner: {args.python}; device={cfg['feature']['device']}", flush=True)
