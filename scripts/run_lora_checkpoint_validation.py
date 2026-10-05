@@ -124,6 +124,19 @@ def parse_args() -> argparse.Namespace:
         help="Disable the experimental Neighbor-Margin fallback explicitly.",
     )
     parser.add_argument(
+        "--neighbor-margin-positive-only",
+        dest="neighbor_margin_positive_only",
+        action="store_true",
+        default=None,
+        help="Require margin > 0 after class-wise margin top-p ranking (default: YAML true).",
+    )
+    parser.add_argument(
+        "--no-neighbor-margin-positive-only",
+        dest="neighbor_margin_positive_only",
+        action="store_false",
+        help="Use class-wise margin top-p without a margin-sign restriction.",
+    )
+    parser.add_argument(
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
@@ -203,7 +216,7 @@ def main() -> None:
     apply_lora_defaults(cfg)
     apply_overrides(cfg, args)
     validate_args(args)
-    geometry_mode, neighbor_margin_use_fallback = resolve_pgdf_geometry_config(cfg)
+    geometry_mode, neighbor_margin_use_fallback, neighbor_margin_positive_only = resolve_pgdf_geometry_config(cfg)
     jal_params = resolve_jal_params(cfg, args)
     noise_metadata = load_noise_metadata(noise_index)
     cfg["checkpoint_validation"] = {
@@ -214,6 +227,7 @@ def main() -> None:
         "fixed_p": float(args.fixed_p),
         "geometry_mode": geometry_mode,
         "neighbor_margin_use_fallback": neighbor_margin_use_fallback,
+        "neighbor_margin_positive_only": neighbor_margin_positive_only,
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
@@ -359,6 +373,7 @@ def main() -> None:
                 prototype_mode = "fixed"
                 dynamic_geometry_mode = "prototype_similarity"
                 dynamic_neighbor_margin_use_fallback = False
+                dynamic_neighbor_margin_positive_only = True
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -435,6 +450,7 @@ def main() -> None:
                     retention_ratio = float(args.dynamic_ratio)
                     dynamic_geometry_mode = geometry_mode
                     dynamic_neighbor_margin_use_fallback = neighbor_margin_use_fallback
+                    dynamic_neighbor_margin_positive_only = neighbor_margin_positive_only
                     method_name = (
                         f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g} "
                         f"geometry={dynamic_geometry_mode}"
@@ -445,11 +461,14 @@ def main() -> None:
                     auto_proto_keep = None
                     selection_strategy = "loss_and_proto"
                     prototype_mode = "dynamic_lora"
-                    selection_mode = (
-                        "pgdf_dynamic_lora_neighbor_margin_reliable_only_training_pool"
-                        if dynamic_geometry_mode == "neighbor_margin"
-                        else "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
-                    )
+                    if dynamic_geometry_mode == "neighbor_margin":
+                        selection_mode = (
+                            "pgdf_dynamic_lora_neighbor_margin_reliable_only_training_pool"
+                            if dynamic_neighbor_margin_positive_only
+                            else "pgdf_dynamic_lora_margin_rank_training_pool"
+                        )
+                    else:
+                        selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
                 elif canonical_key == "fixed_proto_warmup_matched":
                     if pgdf_reference is None:
                         raise RuntimeError("Fixed prototype reference was not constructed.")
@@ -516,6 +535,7 @@ def main() -> None:
                     prototype_mode=prototype_mode,
                     geometry_mode=dynamic_geometry_mode,
                     neighbor_margin_use_fallback=dynamic_neighbor_margin_use_fallback,
+                    neighbor_margin_positive_only=dynamic_neighbor_margin_positive_only,
                 )
                 # The clean/noisy mask is intentionally attached only after
                 # all model fitting and selection are complete.  It is never
@@ -629,6 +649,7 @@ def main() -> None:
                     "prototype_mode": result.summary.get("prototype_mode", ""),
                     "geometry_mode": result.summary.get("geometry_mode", ""),
                     "neighbor_margin_use_fallback": result.summary.get("neighbor_margin_use_fallback", ""),
+                    "neighbor_margin_positive_only": result.summary.get("neighbor_margin_positive_only", ""),
                 },
             )
             all_results.append(result_row)
@@ -821,8 +842,11 @@ def attach_posthoc_noise_diagnostics(
             reliable = state == "reliable"
             ambiguous = state == "ambiguous"
             suspicious = state == "suspicious"
-            if not np.array_equal(reliable, active):
+            positive_only = str(update.get("neighbor_margin_positive_only", "yes")) == "yes"
+            if positive_only and not np.array_equal(reliable, active):
                 raise RuntimeError("Post-hoc diagnostic found a non-Reliable Neighbor-Margin training sample.")
+            if not positive_only and np.any(active & ~(reliable | ambiguous | suspicious)):
+                raise RuntimeError("Post-hoc diagnostic found a Margin-Rank sample without a diagnostic state.")
             update.update(
                 {
                     "reliable_purity": ratio(int(np.sum(reliable & clean)), int(np.sum(reliable))),
@@ -1071,6 +1095,7 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
     cfg.setdefault("pgdf", {})
     cfg["pgdf"].setdefault("geometry_mode", "prototype_similarity")
     cfg["pgdf"].setdefault("neighbor_margin_use_fallback", False)
+    cfg["pgdf"].setdefault("neighbor_margin_positive_only", True)
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1101,9 +1126,11 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg["pgdf"]["geometry_mode"] = args.geometry_mode
     if args.neighbor_margin_use_fallback is not None:
         cfg["pgdf"]["neighbor_margin_use_fallback"] = bool(args.neighbor_margin_use_fallback)
+    if args.neighbor_margin_positive_only is not None:
+        cfg["pgdf"]["neighbor_margin_positive_only"] = bool(args.neighbor_margin_positive_only)
 
 
-def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool]:
+def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool, bool]:
     """Validate the dynamic-PGDF geometry switch after YAML/CLI resolution."""
     pgdf_cfg = cfg.get("pgdf", {})
     geometry_mode = str(pgdf_cfg.get("geometry_mode", "prototype_similarity"))
@@ -1114,7 +1141,10 @@ def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool]:
     fallback = pgdf_cfg.get("neighbor_margin_use_fallback", False)
     if not isinstance(fallback, bool):
         raise ValueError("pgdf.neighbor_margin_use_fallback must be boolean.")
-    return geometry_mode, fallback
+    positive_only = pgdf_cfg.get("neighbor_margin_positive_only", True)
+    if not isinstance(positive_only, bool):
+        raise ValueError("pgdf.neighbor_margin_positive_only must be boolean.")
+    return geometry_mode, fallback, positive_only
 
 
 def configure_jal(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1314,7 +1344,7 @@ def result_fields() -> list[str]:
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
         "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
-        "geometry_mode", "neighbor_margin_use_fallback",
+        "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1332,7 +1362,7 @@ def summary_fields() -> list[str]:
 
 def selection_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "epoch",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "neighbor_margin_positive_only", "epoch",
         "index", "path", "web_label", "loss", "confidence", "proto_score", "loss_selected", "proto_pass", "geometry_candidate", "neighbor_margin_candidate",
         "neighbor_margin", "observed_similarity", "competitor_similarity", "competitor_class", "active_training", "state",
         "posthoc_is_clean", "posthoc_is_noisy",
@@ -1348,13 +1378,13 @@ def dual_selection_fields() -> list[str]:
 
 def update_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "geometry_mode", "neighbor_margin_use_fallback", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
-        "num_proto_pass", "num_neighbor_margin_candidate", "num_selected", "fallback_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
+        "num_proto_pass", "num_neighbor_margin_candidate", "strict_intersection_count", "num_selected", "fallback_count", "selected_negative_margin_count", "selected_negative_margin_ratio", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected", "overlap_with_previous_selection", "overlap_with_centroid",
         "prototype_feature_source", "prototype_feature_dim", "prototype_checksum", "prototype_gate_membership_hash",
         "prototype_mean", "prototype_std", "selection_model_state_checksum", "prototype_model_state_checksum",
         "same_model_state_for_loss_and_prototype", "lora_updated_since_initial",
-        "reliable_count", "ambiguous_count", "suspicious_count", "reliable_ratio", "ambiguous_ratio", "suspicious_ratio", "reliable_zero_class_count",
+        "reliable_count", "ambiguous_count", "suspicious_count", "reliable_ratio", "ambiguous_ratio", "suspicious_ratio", "reliable_zero_class_count", "selected_zero_class_count",
         "margin_mean", "margin_std", "margin_min", "margin_max", "margin_median", "mean_observed_similarity", "mean_competitor_similarity",
         "reliable_purity", "reliable_noisy_retention", "suspicious_noise_ratio", "ambiguous_clean_ratio", "ambiguous_noisy_ratio",
         "prototype_candidate_purity", "neighbor_margin_candidate_purity",
@@ -1363,7 +1393,7 @@ def update_fields() -> list[str]:
 
 def per_class_fields() -> list[str]:
     return [
-        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "epoch", "web_label", "total_count", "loss_selected_count",
+        "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "geometry_mode", "neighbor_margin_positive_only", "epoch", "web_label", "total_count", "loss_selected_count",
         "proto_pass_count", "selected_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected",
         "neighbor_margin_candidate_count", "reliable_count", "ambiguous_count", "suspicious_count", "reliable_zero", "mean_neighbor_margin", "mean_observed_similarity", "mean_competitor_similarity",
