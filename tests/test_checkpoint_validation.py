@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -41,6 +42,12 @@ from scripts.run_lora_checkpoint_validation import (
     result_fields,
     validate_official_test_request,
     verify_observed_budget_match,
+)
+from scripts.run_neighbor_margin_asym40 import (
+    DEFAULT_CONFIG as NEIGHBOR_MARGIN_STANDALONE_CONFIG,
+    apply_machine_overrides as apply_neighbor_margin_standalone_overrides,
+    load_standalone_config,
+    validate_standalone_config,
 )
 
 
@@ -110,6 +117,49 @@ class CheckpointValidationTests(unittest.TestCase):
         self.assertFalse(np.any(reliable & suspicious))
         self.assertFalse(np.any(ambiguous & suspicious))
         np.testing.assert_array_equal(reliable | ambiguous | suspicious, training_pool)
+
+    def test_standalone_launcher_routes_selection_methods_to_separate_variants(self) -> None:
+        def make_args(
+            *,
+            positive_only: bool | None,
+            use_fallback: bool | None,
+            selection_method: str | None = None,
+        ) -> SimpleNamespace:
+            return SimpleNamespace(
+                cub_root=None,
+                cars_root=None,
+                aircraft_root=None,
+                device=None,
+                local_repo=None,
+                seeds="1,42,88",
+                neighbor_margin_positive_only=positive_only,
+                neighbor_margin_use_fallback=use_fallback,
+                selection_method=selection_method,
+            )
+
+        strict_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
+        apply_neighbor_margin_standalone_overrides(strict_cfg, make_args(positive_only=None, use_fallback=None))
+        validate_standalone_config(strict_cfg)
+        self.assertEqual("reliable_only", strict_cfg["protocol"]["variant_id"])
+        self.assertTrue(strict_cfg["pgdf"]["neighbor_margin_positive_only"])
+        self.assertFalse(strict_cfg["pgdf"]["neighbor_margin_use_fallback"])
+
+        margin_rank_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
+        apply_neighbor_margin_standalone_overrides(margin_rank_cfg, make_args(positive_only=False, use_fallback=True))
+        validate_standalone_config(margin_rank_cfg)
+        self.assertEqual("margin_rank", margin_rank_cfg["protocol"]["variant_id"])
+        self.assertEqual("neighbor_margin_margin_rank_cyclic_asym40", margin_rank_cfg["protocol"]["name"])
+        self.assertFalse(margin_rank_cfg["pgdf"]["neighbor_margin_positive_only"])
+        self.assertTrue(margin_rank_cfg["pgdf"]["neighbor_margin_use_fallback"])
+
+        prototype_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
+        apply_neighbor_margin_standalone_overrides(
+            prototype_cfg,
+            make_args(positive_only=None, use_fallback=None, selection_method="prototype_similarity"),
+        )
+        validate_standalone_config(prototype_cfg)
+        self.assertEqual("prototype_similarity", prototype_cfg["protocol"]["variant_id"])
+        self.assertEqual("prototype_similarity", prototype_cfg["pgdf"]["geometry_mode"])
 
     def test_methods_all_expands_all_thirteen_once(self) -> None:
         methods = parse_methods("all")

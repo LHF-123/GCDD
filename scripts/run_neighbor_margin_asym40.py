@@ -33,6 +33,11 @@ from tools import build_folder_asym_noise_index as folder_noise
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "pgdf_neighbor_margin.yaml"
+SELECTION_METHODS = (
+    "prototype_similarity",
+    "neighbor_margin_strict",
+    "margin_rank",
+)
 MINIMAL_INPUT_REQUIRED_FILES = (
     "paths.txt",
     "labels.npy",
@@ -67,6 +72,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, required=True, help="New root for all fresh generated inputs and results.")
     parser.add_argument("--device", choices=("auto", "cuda", "cpu"), help="Override the LoRA feature device.")
     parser.add_argument("--local-repo", help="Override feature.local_repo for an offline/local DINOv2 torch-hub checkout.")
+    parser.add_argument(
+        "--selection-method",
+        choices=SELECTION_METHODS,
+        help=(
+            "Formal selection variant: prototype_similarity (original PGDF), "
+            "neighbor_margin_strict, or margin_rank. Defaults to the strict "
+            "Neighbor-Margin YAML mode."
+        ),
+    )
+    parser.add_argument(
+        "--neighbor-margin-use-fallback",
+        dest="neighbor_margin_use_fallback",
+        action="store_true",
+        default=None,
+        help="Run Margin-Rank with the original PGDF class-preserving fallback.",
+    )
+    parser.add_argument(
+        "--no-neighbor-margin-use-fallback",
+        dest="neighbor_margin_use_fallback",
+        action="store_false",
+        help="Use strict Neighbor-Margin intersection without fallback (default).",
+    )
+    parser.add_argument(
+        "--neighbor-margin-positive-only",
+        dest="neighbor_margin_positive_only",
+        action="store_true",
+        default=None,
+        help="Require margin > 0 after class-wise margin top-p ranking (default).",
+    )
+    parser.add_argument(
+        "--no-neighbor-margin-positive-only",
+        dest="neighbor_margin_positive_only",
+        action="store_false",
+        help="Use Margin-Rank: class-wise margin top-p without a sign restriction.",
+    )
     parser.add_argument("--python", default=sys.executable, help="Python executable used for the LoRA runner.")
     parser.add_argument("--dry-run", action="store_true", help="Print the complete plan without creating files or training.")
     return parser.parse_args()
@@ -134,6 +174,81 @@ def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> No
         cfg.setdefault("protocol", {}).setdefault("training", {})["seeds"] = [
             token.strip() for token in args.seeds.split(",") if token.strip()
         ]
+    selection_method = getattr(args, "selection_method", None)
+    if selection_method is not None and (
+        args.neighbor_margin_use_fallback is not None
+        or args.neighbor_margin_positive_only is not None
+    ):
+        raise ValueError(
+            "--selection-method cannot be combined with low-level Neighbor-Margin mode flags."
+        )
+    if selection_method is not None:
+        apply_selection_method(cfg, selection_method)
+    if args.neighbor_margin_use_fallback is not None:
+        cfg["pgdf"]["neighbor_margin_use_fallback"] = bool(args.neighbor_margin_use_fallback)
+    if args.neighbor_margin_positive_only is not None:
+        cfg["pgdf"]["neighbor_margin_positive_only"] = bool(args.neighbor_margin_positive_only)
+    resolve_selection_variant(cfg)
+
+
+def apply_selection_method(cfg: dict[str, Any], selection_method: str) -> None:
+    """Map the standalone method selector onto the shared PGDF controls."""
+    if selection_method == "prototype_similarity":
+        cfg["pgdf"].update(
+            {
+                "geometry_mode": "prototype_similarity",
+                "neighbor_margin_positive_only": True,
+                "neighbor_margin_use_fallback": False,
+            }
+        )
+        return
+    if selection_method == "neighbor_margin_strict":
+        cfg["pgdf"].update(
+            {
+                "geometry_mode": "neighbor_margin",
+                "neighbor_margin_positive_only": True,
+                "neighbor_margin_use_fallback": False,
+            }
+        )
+        return
+    if selection_method == "margin_rank":
+        cfg["pgdf"].update(
+            {
+                "geometry_mode": "neighbor_margin",
+                "neighbor_margin_positive_only": False,
+                "neighbor_margin_use_fallback": True,
+            }
+        )
+        return
+    raise ValueError(f"Unsupported standalone selection method: {selection_method!r}")
+
+
+def resolve_selection_variant(cfg: dict[str, Any]) -> None:
+    """Resolve formal PGDF variants without requiring separate YAML files."""
+    pgdf_cfg = cfg["pgdf"]
+    geometry_mode = pgdf_cfg.get("geometry_mode", "neighbor_margin")
+    positive_only = pgdf_cfg.setdefault("neighbor_margin_positive_only", True)
+    use_fallback = pgdf_cfg.setdefault("neighbor_margin_use_fallback", False)
+    if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
+        raise ValueError("Standalone geometry_mode must be prototype_similarity or neighbor_margin.")
+    if not isinstance(positive_only, bool) or not isinstance(use_fallback, bool):
+        raise ValueError("Neighbor-Margin mode flags must be boolean.")
+    if geometry_mode == "prototype_similarity":
+        cfg["protocol"]["name"] = "pgdf_prototype_similarity_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = "prototype_similarity"
+        return
+    if positive_only and not use_fallback:
+        cfg["protocol"]["name"] = "neighbor_margin_strict_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = "reliable_only"
+        return
+    if not positive_only and use_fallback:
+        cfg["protocol"]["name"] = "neighbor_margin_margin_rank_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = "margin_rank"
+        return
+    raise ValueError(
+        "The standalone formal launcher supports only Strict Margin-Positive "
+        "(positive-only + no fallback) or Margin-Rank (no positive-only + fallback)."
+    )
 
 
 def validate_standalone_config(cfg: dict[str, Any]) -> None:
@@ -192,10 +307,7 @@ def validate_standalone_config(cfg: dict[str, Any]) -> None:
             "update_interval": update_interval,
         }
     )
-    if cfg["pgdf"].get("geometry_mode") != "neighbor_margin":
-        raise ValueError("Standalone config must set pgdf.geometry_mode: neighbor_margin.")
-    if bool(cfg["pgdf"].get("neighbor_margin_use_fallback", True)):
-        raise ValueError("Formal Neighbor-Margin requires neighbor_margin_use_fallback: false.")
+    resolve_selection_variant(cfg)
 
 
 def validate_raw_roots(cfg: dict[str, Any]) -> None:
@@ -412,7 +524,17 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
         "--official-test-selected-only",
         "--no-posthoc-oracle-test",
         "--device", str(cfg["feature"]["device"]),
+        "--geometry-mode", str(cfg["pgdf"]["geometry_mode"]),
     ]
+    if cfg["pgdf"]["geometry_mode"] == "neighbor_margin":
+        if cfg["pgdf"]["neighbor_margin_positive_only"]:
+            command.append("--neighbor-margin-positive-only")
+        else:
+            command.append("--no-neighbor-margin-positive-only")
+        if cfg["pgdf"]["neighbor_margin_use_fallback"]:
+            command.append("--neighbor-margin-use-fallback")
+        else:
+            command.append("--no-neighbor-margin-use-fallback")
     local_repo = str(cfg["feature"].get("local_repo", ""))
     if local_repo:
         command.extend(["--local-repo", local_repo])
@@ -455,7 +577,8 @@ def print_plan(cfg: dict[str, Any], run_root: Path, args: argparse.Namespace) ->
         f"noise_seed={protocol['noise']['seed']}, train_seeds={protocol['training']['seeds']}, "
         f"validation_seed={protocol['validation']['seed']}, "
         f"r={protocol['pgdf']['dynamic_ratio']}, p={protocol['pgdf']['prototype_keep_ratio']}, "
-        f"warmup={protocol['pgdf']['warmup_epochs']}, interval={protocol['pgdf']['update_interval']}",
+        f"warmup={protocol['pgdf']['warmup_epochs']}, interval={protocol['pgdf']['update_interval']}, "
+        f"geometry={cfg['pgdf']['geometry_mode']}, variant={protocol['variant_id']}",
         flush=True,
     )
     for key in ("cub", "cars", "aircraft"):
