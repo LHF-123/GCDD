@@ -667,11 +667,23 @@ def main() -> None:
             )
 
     log_stage("[4/5] Writing validation-selected result tables.")
-    write_csv(output_dir / "train_log.csv", all_logs, train_log_fields())
-    write_csv(output_dir / "checkpoint_validation_results.csv", all_results, result_fields())
-    write_csv(output_dir / "checkpoint_validation_updates.csv", all_updates, update_fields())
-    write_csv(output_dir / "run_index.csv", run_index, ["method_key", "seed", "run_dir", "best_val_checkpoint", "last_checkpoint", "selection_record", "status"])
-    summary = summarize_methods(all_results)
+    merged_logs = merge_csv_rows(
+        output_dir / "train_log.csv", all_logs, ("method", "seed", "epoch")
+    )
+    merged_results = merge_csv_rows(
+        output_dir / "checkpoint_validation_results.csv", all_results, ("method_key", "seed")
+    )
+    merged_updates = merge_csv_rows(
+        output_dir / "checkpoint_validation_updates.csv", all_updates, ("method", "dataset", "seed", "epoch")
+    )
+    merged_run_index = merge_csv_rows(
+        output_dir / "run_index.csv", run_index, ("method_key", "seed")
+    )
+    write_csv(output_dir / "train_log.csv", merged_logs, train_log_fields())
+    write_csv(output_dir / "checkpoint_validation_results.csv", merged_results, result_fields())
+    write_csv(output_dir / "checkpoint_validation_updates.csv", merged_updates, update_fields())
+    write_csv(output_dir / "run_index.csv", merged_run_index, ["method_key", "seed", "run_dir", "best_val_checkpoint", "last_checkpoint", "selection_record", "status"])
+    summary = summarize_methods(merged_results)
     write_csv(output_dir / "checkpoint_validation_summary.csv", summary, summary_fields())
     write_json(
         output_dir / "checkpoint_validation_summary.json",
@@ -681,11 +693,11 @@ def main() -> None:
             "noise_index": str(noise_index),
             "noise_realization": noise_metadata,
             "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
-            "methods": methods,
-            "seeds": seeds,
+            "methods": sorted({str(row["method_key"]) for row in merged_results}),
+            "seeds": sorted({int(row["seed"]) for row in merged_results}),
             "validation_manifest": split.metadata,
             "posthoc_oracle_test": bool(args.posthoc_oracle_test),
-            "results": all_results,
+            "results": merged_results,
             "summary": summary,
         },
     )
@@ -1032,6 +1044,22 @@ def require_fresh_run_dir(run_dir: Path) -> None:
             f"Run directory is not empty and will not be overwritten: {run_dir}. "
             "Choose a new --output-dir or remove/move the partial run explicitly."
         )
+
+
+def merge_csv_rows(
+    path: Path,
+    new_rows: list[dict[str, Any]],
+    key_fields: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Append unseen run records without dropping prior seed-level summaries."""
+    existing_rows = read_csv(path) if path.is_file() else []
+    merged: dict[tuple[str, ...], dict[str, Any]] = {}
+    for row in [*existing_rows, *new_rows]:
+        key = tuple(str(row.get(field, "")) for field in key_fields)
+        if any(value == "" for value in key):
+            raise ValueError(f"Cannot merge {path.name}: missing key values for {key_fields}.")
+        merged[key] = dict(row)
+    return [merged[key] for key in sorted(merged)]
 
 
 def validate_run_layout_request(methods: list[str], run_layout: str) -> None:

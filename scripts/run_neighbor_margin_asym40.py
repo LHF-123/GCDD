@@ -122,7 +122,8 @@ def main() -> None:
     bundle_root = build_protocol_bundle_root(run_root, cfg)
     variant_root = bundle_root / "variants" / str(cfg["protocol"]["variant_id"])
     if variant_root.exists():
-        raise FileExistsError(f"Refusing to reuse an existing variant output: {variant_root}")
+        verify_existing_variant_config(variant_root, cfg)
+    preflight_variant_seed_dirs(variant_root, cfg)
 
     if args.dry_run:
         print_plan(cfg, run_root, args)
@@ -142,8 +143,9 @@ def main() -> None:
             verify_minimal_training_input(input_dir)
             prepared.append(PreparedDataset(key=key, spec=spec, noise_index=noise_index, input_dir=input_dir))
 
-    ensure_dir(variant_root)
-    write_yaml(variant_root / "experiment_config.yaml", cfg)
+    if not variant_root.exists():
+        ensure_dir(variant_root)
+        write_yaml(variant_root / "experiment_config.yaml", cfg)
     for item in prepared:
         run_lora_experiment(item, cfg, variant_root, args)
 
@@ -159,6 +161,53 @@ def load_standalone_config(path: Path) -> dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError("Standalone config must contain a YAML mapping.")
     return cfg
+
+
+def variant_config_identity(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the variant-defining configuration, excluding requested seeds."""
+    identity = copy.deepcopy(cfg)
+    identity.setdefault("protocol", {}).setdefault("training", {}).pop("seeds", None)
+    for spec in identity.get("datasets", {}).values():
+        if "data_root" in spec:
+            # Persisted bundles may have been produced on Linux while this
+            # launcher is inspected from Windows; path separators do not
+            # change the dataset or experimental protocol.
+            spec["data_root"] = str(spec["data_root"]).replace("\\", "/")
+    return identity
+
+
+def verify_existing_variant_config(variant_root: Path, cfg: dict[str, Any]) -> None:
+    """Allow appending unseen seeds only to the same formal variant."""
+    config_path = variant_root / "experiment_config.yaml"
+    if not config_path.is_file():
+        raise FileExistsError(
+            f"Existing variant directory is incomplete: missing {config_path}. "
+            "Choose a new --run-root or repair the incomplete directory explicitly."
+        )
+    existing = load_standalone_config(config_path)
+    resolve_selection_variant(existing)
+    if variant_config_identity(existing) != variant_config_identity(cfg):
+        raise ValueError(
+            f"Existing variant configuration differs from the requested configuration: {variant_root}. "
+            "Use a separate --run-root or a distinct selection method."
+        )
+
+
+def preflight_variant_seed_dirs(variant_root: Path, cfg: dict[str, Any]) -> None:
+    """Fail before any training if any requested dataset/seed output exists."""
+    if not variant_root.exists():
+        return
+    existing: list[Path] = []
+    for key in ("cub", "cars", "aircraft"):
+        for seed in cfg["protocol"]["training"]["seeds"]:
+            run_dir = variant_root / key / f"seed{int(seed)}"
+            if run_dir.exists() and any(run_dir.iterdir()):
+                existing.append(run_dir)
+    if existing:
+        raise FileExistsError(
+            "Requested seed output already exists and will not be overwritten: "
+            f"{existing[0]}. Request only unseen seeds or use a distinct --run-root."
+        )
 
 
 def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -543,8 +592,22 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
 
 
 def write_provenance(variant_root: Path, bundle_root: Path, config_path: Path, cfg: dict[str, Any], prepared: list[PreparedDataset]) -> None:
+    provenance_path = variant_root / "provenance.json"
+    previous: dict[str, Any] = {}
+    if provenance_path.is_file():
+        with provenance_path.open("r", encoding="utf-8") as handle:
+            previous = json.load(handle)
+    previous_seeds = previous.get(
+        "completed_training_seeds",
+        previous.get("protocol", {}).get("training", {}).get("seeds", []),
+    )
+    completed_seeds = sorted(
+        {int(seed) for seed in previous_seeds}
+        | {int(seed) for seed in cfg["protocol"]["training"]["seeds"]}
+    )
     payload: dict[str, Any] = {
         "protocol": cfg["protocol"],
+        "completed_training_seeds": completed_seeds,
         "standalone_config": str(config_path),
         "standalone_config_sha256": sha256_file(config_path),
         "noise_indices": {item.key: {"path": str(item.noise_index), "sha256": sha256_file(item.noise_index)} for item in prepared},
@@ -552,7 +615,7 @@ def write_provenance(variant_root: Path, bundle_root: Path, config_path: Path, c
         "input_bundle_root": str(bundle_root),
         "git_commit": git_commit(),
     }
-    (variant_root / "provenance.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    provenance_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def sha256_file(path: Path) -> str:

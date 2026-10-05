@@ -35,6 +35,7 @@ from scripts.run_lora_checkpoint_validation import (
     METHODS,
     apply_lora_defaults,
     apply_overrides,
+    merge_csv_rows,
     parse_args,
     parse_methods,
     resolve_pgdf_geometry_config,
@@ -47,6 +48,7 @@ from scripts.run_neighbor_margin_asym40 import (
     DEFAULT_CONFIG as NEIGHBOR_MARGIN_STANDALONE_CONFIG,
     apply_machine_overrides as apply_neighbor_margin_standalone_overrides,
     load_standalone_config,
+    preflight_variant_seed_dirs,
     validate_standalone_config,
 )
 
@@ -160,6 +162,52 @@ class CheckpointValidationTests(unittest.TestCase):
         validate_standalone_config(prototype_cfg)
         self.assertEqual("prototype_similarity", prototype_cfg["protocol"]["variant_id"])
         self.assertEqual("prototype_similarity", prototype_cfg["pgdf"]["geometry_mode"])
+
+    def test_standalone_variant_allows_unseen_seed_but_rejects_existing_seed(self) -> None:
+        cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
+        apply_neighbor_margin_standalone_overrides(
+            cfg,
+            SimpleNamespace(
+                cub_root=None,
+                cars_root=None,
+                aircraft_root=None,
+                device=None,
+                local_repo=None,
+                seeds="1",
+                neighbor_margin_positive_only=None,
+                neighbor_margin_use_fallback=None,
+                selection_method="margin_rank",
+            ),
+        )
+        validate_standalone_config(cfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            variant_root = Path(tmp) / "margin_rank"
+            (variant_root / "cub" / "seed42").mkdir(parents=True)
+            (variant_root / "cub" / "seed42" / "result.json").write_text("{}", encoding="utf-8")
+            preflight_variant_seed_dirs(variant_root, cfg)
+
+            cfg["protocol"]["training"]["seeds"] = [42]
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                preflight_variant_seed_dirs(variant_root, cfg)
+
+    def test_merge_csv_rows_preserves_prior_seed_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "checkpoint_validation_results.csv"
+            path.write_text(
+                "method_key,seed,score\npgdf_dynamic_proto,42,0.8\n",
+                encoding="utf-8",
+            )
+            merged = merge_csv_rows(
+                path,
+                [
+                    {"method_key": "pgdf_dynamic_proto", "seed": 1, "score": 0.7},
+                    {"method_key": "pgdf_dynamic_proto", "seed": 88, "score": 0.9},
+                ],
+                ("method_key", "seed"),
+            )
+
+        self.assertEqual(["1", "42", "88"], [str(row["seed"]) for row in merged])
+        self.assertEqual("0.8", str(merged[1]["score"]))
 
     def test_methods_all_expands_all_thirteen_once(self) -> None:
         methods = parse_methods("all")
