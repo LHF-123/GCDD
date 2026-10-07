@@ -39,6 +39,7 @@ from scripts.run_lora_checkpoint_validation import (
     parse_args,
     parse_methods,
     resolve_ambiguous_consistency_config,
+    resolve_consistency_execution_config,
     resolve_pgdf_geometry_config,
     resolve_retention_ratio,
     result_fields,
@@ -93,6 +94,8 @@ class CheckpointValidationTests(unittest.TestCase):
                 "--neighbor-margin-use-fallback",
                 "--ambiguous-consistency",
                 "--consistency-weight", "0.5",
+                "--consistency-backward-mode", "sequential",
+                "--ambiguous-micro-batch-size", "20",
             ],
         ):
             args = parse_args()
@@ -100,6 +103,7 @@ class CheckpointValidationTests(unittest.TestCase):
         enabled, weight = resolve_ambiguous_consistency_config(base)
         self.assertTrue(enabled)
         self.assertEqual(0.5, weight)
+        self.assertEqual(("sequential", 20), resolve_consistency_execution_config(base))
         validate_ambiguous_consistency_request(["pgdf_dynamic_proto"], enabled, "neighbor_margin", False)
         with self.assertRaisesRegex(ValueError, "Margin-Rank"):
             validate_ambiguous_consistency_request(["pgdf_dynamic_proto"], True, "prototype_similarity", True)
@@ -159,6 +163,8 @@ class CheckpointValidationTests(unittest.TestCase):
             selection_method: str | None = None,
             ambiguous_consistency: bool | None = None,
             consistency_weight: float | None = None,
+            consistency_backward_mode: str | None = None,
+            ambiguous_micro_batch_size: int | None = None,
         ) -> SimpleNamespace:
             return SimpleNamespace(
                 cub_root=None,
@@ -172,6 +178,8 @@ class CheckpointValidationTests(unittest.TestCase):
                 selection_method=selection_method,
                 ambiguous_consistency=ambiguous_consistency,
                 consistency_weight=consistency_weight,
+                consistency_backward_mode=consistency_backward_mode,
+                ambiguous_micro_batch_size=ambiguous_micro_batch_size,
             )
 
         strict_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
@@ -207,10 +215,12 @@ class CheckpointValidationTests(unittest.TestCase):
                 selection_method="margin_rank",
                 ambiguous_consistency=True,
                 consistency_weight=0.5,
+                consistency_backward_mode="microbatch",
+                ambiguous_micro_batch_size=20,
             ),
         )
         validate_standalone_config(consistency_cfg)
-        self.assertEqual("margin_rank_ambiguous_consistency", consistency_cfg["protocol"]["variant_id"])
+        self.assertEqual("margin_rank_ambiguous_consistency_microbatch20", consistency_cfg["protocol"]["variant_id"])
         self.assertTrue(consistency_cfg["pgdf"]["ambiguous_consistency"])
         self.assertEqual(0.5, consistency_cfg["pgdf"]["consistency_weight"])
 

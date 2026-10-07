@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 
 from gcdd.data import build_verified_index
 from gcdd.io_utils import ensure_dir, write_csv, write_yaml
+from gcdd.lora_dynamic import CONSISTENCY_BACKWARD_MODES
 from tools import build_cub_asym_noise_index as cub_noise
 from tools import build_folder_asym_noise_index as folder_noise
 
@@ -124,6 +125,16 @@ def parse_args() -> argparse.Namespace:
         "--consistency-weight",
         type=float,
         help="KL consistency weight lambda_u (default: 0.5).",
+    )
+    parser.add_argument(
+        "--consistency-backward-mode",
+        choices=CONSISTENCY_BACKWARD_MODES,
+        help="Choose joint, sequential, or microbatch consistency backward execution.",
+    )
+    parser.add_argument(
+        "--ambiguous-micro-batch-size",
+        type=int,
+        help="GPU micro-batch size for microbatch consistency mode (default: 20).",
     )
     parser.add_argument("--python", default=sys.executable, help="Python executable used for the LoRA runner.")
     parser.add_argument("--dry-run", action="store_true", help="Print the complete plan without creating files or training.")
@@ -259,6 +270,10 @@ def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> No
         cfg["pgdf"]["ambiguous_consistency"] = bool(args.ambiguous_consistency)
     if getattr(args, "consistency_weight", None) is not None:
         cfg["pgdf"]["consistency_weight"] = float(args.consistency_weight)
+    if getattr(args, "consistency_backward_mode", None) is not None:
+        cfg["pgdf"]["consistency_backward_mode"] = str(args.consistency_backward_mode)
+    if getattr(args, "ambiguous_micro_batch_size", None) is not None:
+        cfg["pgdf"]["ambiguous_micro_batch_size"] = int(args.ambiguous_micro_batch_size)
     resolve_selection_variant(cfg)
 
 
@@ -302,20 +317,34 @@ def resolve_selection_variant(cfg: dict[str, Any]) -> None:
     use_fallback = pgdf_cfg.setdefault("neighbor_margin_use_fallback", False)
     ambiguous_consistency = pgdf_cfg.setdefault("ambiguous_consistency", False)
     consistency_weight = float(pgdf_cfg.setdefault("consistency_weight", 0.5))
+    consistency_backward_mode = str(pgdf_cfg.setdefault("consistency_backward_mode", "joint"))
+    ambiguous_micro_batch_size = int(pgdf_cfg.setdefault("ambiguous_micro_batch_size", 20))
     if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
         raise ValueError("Standalone geometry_mode must be prototype_similarity or neighbor_margin.")
     if not isinstance(positive_only, bool) or not isinstance(use_fallback, bool) or not isinstance(ambiguous_consistency, bool):
         raise ValueError("Neighbor-Margin mode flags must be boolean.")
     if not np.isfinite(consistency_weight) or consistency_weight < 0.0:
         raise ValueError("consistency_weight must be finite and non-negative.")
+    if consistency_backward_mode not in CONSISTENCY_BACKWARD_MODES:
+        raise ValueError(
+            "consistency_backward_mode must be one of "
+            f"{', '.join(CONSISTENCY_BACKWARD_MODES)}."
+        )
+    if ambiguous_micro_batch_size <= 0:
+        raise ValueError("ambiguous_micro_batch_size must be positive.")
     if ambiguous_consistency:
         if not (geometry_mode == "neighbor_margin" and not positive_only and use_fallback):
             raise ValueError(
                 "Standalone Ambiguous consistency requires Margin-Rank "
                 "(neighbor_margin, no positive-only, and PGDF fallback enabled)."
             )
-        cfg["protocol"]["name"] = "neighbor_margin_margin_rank_ambiguous_consistency_cyclic_asym40"
-        cfg["protocol"]["variant_id"] = "margin_rank_ambiguous_consistency"
+        variant_suffix = (
+            f"microbatch{ambiguous_micro_batch_size}"
+            if consistency_backward_mode == "microbatch"
+            else consistency_backward_mode
+        )
+        cfg["protocol"]["name"] = f"neighbor_margin_margin_rank_ambiguous_consistency_{variant_suffix}_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = f"margin_rank_ambiguous_consistency_{variant_suffix}"
         return
     if geometry_mode == "prototype_similarity":
         cfg["protocol"]["name"] = "pgdf_prototype_similarity_cyclic_asym40"
@@ -621,7 +650,12 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
             command.append("--no-neighbor-margin-use-fallback")
     if bool(cfg["pgdf"].get("ambiguous_consistency", False)):
         command.extend(
-            ["--ambiguous-consistency", "--consistency-weight", str(cfg["pgdf"].get("consistency_weight", 0.5))]
+            [
+                "--ambiguous-consistency",
+                "--consistency-weight", str(cfg["pgdf"].get("consistency_weight", 0.5)),
+                "--consistency-backward-mode", str(cfg["pgdf"].get("consistency_backward_mode", "joint")),
+                "--ambiguous-micro-batch-size", str(cfg["pgdf"].get("ambiguous_micro_batch_size", 20)),
+            ]
         )
     local_repo = str(cfg["feature"].get("local_repo", ""))
     if local_repo:
@@ -682,6 +716,7 @@ def print_plan(cfg: dict[str, Any], run_root: Path, args: argparse.Namespace) ->
         f"warmup={protocol['pgdf']['warmup_epochs']}, interval={protocol['pgdf']['update_interval']}, "
         f"geometry={cfg['pgdf']['geometry_mode']}, "
         f"ambiguous_consistency={cfg['pgdf'].get('ambiguous_consistency', False)}, "
+        f"consistency_backward_mode={cfg['pgdf'].get('consistency_backward_mode', 'joint')}, "
         f"variant={protocol['variant_id']}",
         flush=True,
     )

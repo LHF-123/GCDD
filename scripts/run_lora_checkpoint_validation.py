@@ -32,7 +32,7 @@ from gcdd.checkpoint_validation import (
 from gcdd.budget_matching import ClassBudgetSchedule, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
-from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
+from gcdd.lora_dynamic import CONSISTENCY_BACKWARD_MODES, selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
@@ -155,6 +155,20 @@ def parse_args() -> argparse.Namespace:
         help="KL consistency weight lambda_u (YAML/default: 0.5).",
     )
     parser.add_argument(
+        "--consistency-backward-mode",
+        choices=CONSISTENCY_BACKWARD_MODES,
+        help=(
+            "Consistency memory strategy: joint (legacy single backward), "
+            "sequential (release Reliable CE graph first), or microbatch "
+            "(sequential plus Ambiguous GPU micro-batches)."
+        ),
+    )
+    parser.add_argument(
+        "--ambiguous-micro-batch-size",
+        type=int,
+        help="GPU micro-batch size only for --consistency-backward-mode microbatch (YAML/default: 20).",
+    )
+    parser.add_argument(
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
@@ -236,6 +250,7 @@ def main() -> None:
     validate_args(args)
     geometry_mode, neighbor_margin_use_fallback, neighbor_margin_positive_only = resolve_pgdf_geometry_config(cfg)
     ambiguous_consistency, consistency_weight = resolve_ambiguous_consistency_config(cfg)
+    consistency_backward_mode, ambiguous_micro_batch_size = resolve_consistency_execution_config(cfg)
     validate_ambiguous_consistency_request(
         methods,
         ambiguous_consistency,
@@ -255,6 +270,8 @@ def main() -> None:
         "neighbor_margin_positive_only": neighbor_margin_positive_only,
         "ambiguous_consistency": ambiguous_consistency,
         "consistency_weight": consistency_weight,
+        "consistency_backward_mode": consistency_backward_mode,
+        "ambiguous_micro_batch_size": ambiguous_micro_batch_size,
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
@@ -403,6 +420,8 @@ def main() -> None:
                 dynamic_neighbor_margin_positive_only = True
                 dynamic_ambiguous_consistency = False
                 dynamic_consistency_weight = 0.5
+                dynamic_consistency_backward_mode = "joint"
+                dynamic_ambiguous_micro_batch_size = 20
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -482,6 +501,8 @@ def main() -> None:
                     dynamic_neighbor_margin_positive_only = neighbor_margin_positive_only
                     dynamic_ambiguous_consistency = ambiguous_consistency
                     dynamic_consistency_weight = consistency_weight
+                    dynamic_consistency_backward_mode = consistency_backward_mode
+                    dynamic_ambiguous_micro_batch_size = ambiguous_micro_batch_size
                     method_name = (
                         f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g} "
                         f"geometry={dynamic_geometry_mode}"
@@ -572,6 +593,8 @@ def main() -> None:
                     neighbor_margin_positive_only=dynamic_neighbor_margin_positive_only,
                     ambiguous_consistency=dynamic_ambiguous_consistency,
                     consistency_weight=dynamic_consistency_weight,
+                    consistency_backward_mode=dynamic_consistency_backward_mode,
+                    ambiguous_micro_batch_size=dynamic_ambiguous_micro_batch_size,
                 )
                 # The clean/noisy mask is intentionally attached only after
                 # all model fitting and selection are complete.  It is never
@@ -688,6 +711,8 @@ def main() -> None:
                     "neighbor_margin_positive_only": result.summary.get("neighbor_margin_positive_only", ""),
                     "ambiguous_consistency": result.summary.get("ambiguous_consistency", ""),
                     "consistency_weight": result.summary.get("consistency_weight", ""),
+                    "consistency_backward_mode": result.summary.get("consistency_backward_mode", ""),
+                    "ambiguous_micro_batch_size": result.summary.get("ambiguous_micro_batch_size", ""),
                 },
             )
             all_results.append(result_row)
@@ -1164,6 +1189,8 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
     cfg["pgdf"].setdefault("neighbor_margin_positive_only", True)
     cfg["pgdf"].setdefault("ambiguous_consistency", False)
     cfg["pgdf"].setdefault("consistency_weight", 0.5)
+    cfg["pgdf"].setdefault("consistency_backward_mode", "joint")
+    cfg["pgdf"].setdefault("ambiguous_micro_batch_size", 20)
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1200,6 +1227,10 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg["pgdf"]["ambiguous_consistency"] = bool(args.ambiguous_consistency)
     if args.consistency_weight is not None:
         cfg["pgdf"]["consistency_weight"] = float(args.consistency_weight)
+    if args.consistency_backward_mode is not None:
+        cfg["pgdf"]["consistency_backward_mode"] = str(args.consistency_backward_mode)
+    if args.ambiguous_micro_batch_size is not None:
+        cfg["pgdf"]["ambiguous_micro_batch_size"] = int(args.ambiguous_micro_batch_size)
 
 
 def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool, bool]:
@@ -1229,6 +1260,21 @@ def resolve_ambiguous_consistency_config(cfg: dict[str, Any]) -> tuple[bool, flo
     if not np.isfinite(weight) or weight < 0.0:
         raise ValueError("pgdf.consistency_weight must be finite and non-negative.")
     return enabled, weight
+
+
+def resolve_consistency_execution_config(cfg: dict[str, Any]) -> tuple[str, int]:
+    """Resolve the memory strategy without changing the selected method."""
+    pgdf_cfg = cfg.get("pgdf", {})
+    mode = str(pgdf_cfg.get("consistency_backward_mode", "joint"))
+    if mode not in CONSISTENCY_BACKWARD_MODES:
+        raise ValueError(
+            "pgdf.consistency_backward_mode must be one of "
+            f"{', '.join(CONSISTENCY_BACKWARD_MODES)}."
+        )
+    micro_batch_size = int(pgdf_cfg.get("ambiguous_micro_batch_size", 20))
+    if micro_batch_size <= 0:
+        raise ValueError("pgdf.ambiguous_micro_batch_size must be positive.")
+    return mode, micro_batch_size
 
 
 def validate_ambiguous_consistency_request(
@@ -1433,7 +1479,7 @@ def train_log_fields() -> list[str]:
         "method", "seed", "epoch", "lr_lora", "lr_head", "loss", "train_loss", "top1", "top5", "val_top1", "val_top5",
         "best_top1", "best_epoch", "train_samples", "candidate_samples", "selected_ratio", "eval_samples", "trainable_params", "total_params",
         "supervised_ce_loss", "consistency_loss", "total_loss", "ambiguous_consistency_enabled", "consistency_computed", "consistency_reason", "consistency_weight",
-        "optimizer_steps", "scheduler_steps", "ambiguous_batch_count", "ambiguous_sample_exposures",
+        "consistency_backward_mode", "ambiguous_micro_batch_size", "optimizer_steps", "scheduler_steps", "ambiguous_batch_count", "consistency_micro_batch_count", "ambiguous_sample_exposures",
         "weak_prediction_max_probability_mean", "weak_prediction_entropy_mean", "weak_strong_prediction_agreement",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
@@ -1450,7 +1496,7 @@ def result_fields() -> list[str]:
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
         "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
-        "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only", "ambiguous_consistency", "consistency_weight",
+        "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only", "ambiguous_consistency", "consistency_weight", "consistency_backward_mode", "ambiguous_micro_batch_size",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",

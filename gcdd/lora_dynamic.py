@@ -32,6 +32,9 @@ from .lora_training import (
 from .progress import log_stage, progress_iter
 
 
+CONSISTENCY_BACKWARD_MODES = ("joint", "sequential", "microbatch")
+
+
 @dataclass
 class DynamicLossRunResult:
     logs: list[dict[str, Any]]
@@ -139,6 +142,8 @@ def train_dynamic_loss_lora(
     neighbor_margin_positive_only: bool = True,
     ambiguous_consistency: bool = False,
     consistency_weight: float = 0.5,
+    consistency_backward_mode: str = "joint",
+    ambiguous_micro_batch_size: int = 20,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -171,6 +176,8 @@ def train_dynamic_loss_lora(
         neighbor_margin_positive_only=neighbor_margin_positive_only,
         ambiguous_consistency=ambiguous_consistency,
         consistency_weight=consistency_weight,
+        consistency_backward_mode=consistency_backward_mode,
+        ambiguous_micro_batch_size=ambiguous_micro_batch_size,
     )
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
@@ -426,6 +433,7 @@ def train_dynamic_loss_lora(
         seen = 0
         ambiguous_sample_exposures = 0
         ambiguous_batch_count = 0
+        consistency_micro_batch_count = 0
         optimizer_steps = 0
         scheduler_steps = 0
         ambiguous_iter = iter(ambiguous_loader) if ambiguous_loader is not None else None
@@ -437,63 +445,90 @@ def train_dynamic_loss_lora(
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 logits = model(images)
                 supervised_loss = criterion(logits, labels)
-            consistency_loss = None
-            weak_prob = None
-            weak_logits = None
-            strong_logits = None
+            if not bool(torch.isfinite(supervised_loss).item()):
+                raise FloatingPointError("Supervised CE loss is NaN or Inf.")
+
+            # ``sequential`` and ``microbatch`` deliberately release the
+            # Reliable CE graph before allocating an Ambiguous strong graph.
+            # No parameter/scheduler update occurs between the two backwards.
+            if consistency_backward_mode in {"sequential", "microbatch"}:
+                scaler.scale(supervised_loss).backward()
+
+            logical_consistency_loss = 0.0
+            logical_ambiguous_size = 0
             if ambiguous_iter is not None:
                 try:
-                    weak_images, strong_images, ambiguous_indices = next(ambiguous_iter)
+                    weak_images_cpu, strong_images_cpu, ambiguous_indices = next(ambiguous_iter)
                 except StopIteration:
                     ambiguous_iter = iter(ambiguous_loader)
-                    weak_images, strong_images, ambiguous_indices = next(ambiguous_iter)
+                    weak_images_cpu, strong_images_cpu, ambiguous_indices = next(ambiguous_iter)
                 expected_ambiguous = ambiguous_training_mask[ambiguous_indices.cpu().numpy().astype(np.int64)]
                 if not np.all(expected_ambiguous):
                     raise RuntimeError("Ambiguous loader emitted a sample outside the current Ambiguous consistency set.")
-                weak_images = weak_images.to(device, non_blocking=True)
-                strong_images = strong_images.to(device, non_blocking=True)
-                # Use eval/no_grad for the weak target so it creates neither
-                # gradients nor dropout/normalization-state updates.  Restore
-                # the exact prior mode before the trainable strong branch.
-                was_training = bool(model.training)
-                try:
-                    model.eval()
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                            weak_logits = model(weak_images)
-                        weak_prob = torch.softmax(weak_logits.float(), dim=-1).detach()
-                finally:
-                    model.train(was_training)
-                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                    strong_logits = model(strong_images)
-                consistency_loss = compute_soft_consistency_loss(torch, weak_logits, strong_logits)
-                if not bool(torch.isfinite(consistency_loss).item()):
-                    raise FloatingPointError("Ambiguous consistency loss is NaN or Inf.")
-                loss = supervised_loss + float(consistency_weight) * consistency_loss
+                logical_ambiguous_size = int(weak_images_cpu.shape[0])
+                if logical_ambiguous_size <= 0:
+                    raise RuntimeError("Ambiguous loader emitted an empty logical batch.")
+                micro_batch_size = (
+                    min(int(ambiguous_micro_batch_size), logical_ambiguous_size)
+                    if consistency_backward_mode == "microbatch"
+                    else logical_ambiguous_size
+                )
+                joint_loss = None
+                for start in range(0, logical_ambiguous_size, micro_batch_size):
+                    stop = min(start + micro_batch_size, logical_ambiguous_size)
+                    micro_size = int(stop - start)
+                    # Keep the logical batch on CPU and move only the current
+                    # micro-batch to CUDA; moving all 80 first would defeat
+                    # the purpose of the memory-safe path.
+                    weak_images = weak_images_cpu[start:stop].to(device, non_blocking=True)
+                    strong_images = strong_images_cpu[start:stop].to(device, non_blocking=True)
+                    consistency_loss, weak_prob, strong_logits = forward_ambiguous_consistency(
+                        torch,
+                        model,
+                        weak_images,
+                        strong_images,
+                        amp_enabled=scaler.is_enabled(),
+                    )
+                    if not bool(torch.isfinite(consistency_loss).item()):
+                        raise FloatingPointError("Ambiguous consistency loss is NaN or Inf.")
+                    fraction = float(micro_size) / float(logical_ambiguous_size)
+                    if consistency_backward_mode == "joint":
+                        # joint mode has exactly one micro-batch and keeps the
+                        # original single-backward implementation intact.
+                        joint_loss = supervised_loss + float(consistency_weight) * consistency_loss
+                    else:
+                        scaler.scale(float(consistency_weight) * fraction * consistency_loss).backward()
+                    logical_consistency_loss += fraction * float(consistency_loss.detach().cpu())
+                    weak_confidence_sum += float(weak_prob.max(dim=-1).values.sum().detach().cpu())
+                    weak_entropy_sum += float((-(weak_prob * weak_prob.clamp_min(1.0e-12).log()).sum(dim=-1)).sum().detach().cpu())
+                    weak_strong_agreement_sum += float(
+                        (weak_prob.argmax(dim=-1) == strong_logits.detach().float().argmax(dim=-1)).sum().detach().cpu()
+                    )
+                    consistency_micro_batch_count += 1
+                if consistency_backward_mode == "joint":
+                    if joint_loss is None:
+                        raise RuntimeError("Joint consistency path did not build a loss.")
+                    if not bool(torch.isfinite(joint_loss).item()):
+                        raise FloatingPointError("Dynamic training loss is NaN or Inf.")
+                    scaler.scale(joint_loss).backward()
+                ambiguous_batch_count += 1
+                ambiguous_sample_exposures += logical_ambiguous_size
+                total_loss_value = float(supervised_loss.detach().cpu()) + float(consistency_weight) * logical_consistency_loss
             else:
-                loss = supervised_loss
-            if not bool(torch.isfinite(loss).item()):
-                raise FloatingPointError("Dynamic training loss is NaN or Inf.")
-            scaler.scale(loss).backward()
+                if consistency_backward_mode == "joint":
+                    scaler.scale(supervised_loss).backward()
+                total_loss_value = float(supervised_loss.detach().cpu())
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             current_batch = int(images.shape[0])
-            loss_sum += float(loss.detach().cpu()) * current_batch
+            loss_sum += total_loss_value * current_batch
             supervised_loss_sum += float(supervised_loss.detach().cpu()) * current_batch
             seen += current_batch
             optimizer_steps += 1
             scheduler_steps += 1
-            if consistency_loss is not None and weak_prob is not None and strong_logits is not None:
-                ambiguous_batch_size = int(weak_prob.shape[0])
-                consistency_loss_sum += float(consistency_loss.detach().cpu())
-                weak_confidence_sum += float(weak_prob.max(dim=-1).values.sum().detach().cpu())
-                weak_entropy_sum += float((-(weak_prob * weak_prob.clamp_min(1.0e-12).log()).sum(dim=-1)).sum().detach().cpu())
-                weak_strong_agreement_sum += float(
-                    (weak_prob.argmax(dim=-1) == strong_logits.detach().float().argmax(dim=-1)).sum().detach().cpu()
-                )
-                ambiguous_batch_count += 1
-                ambiguous_sample_exposures += ambiguous_batch_size
+            if logical_ambiguous_size:
+                consistency_loss_sum += logical_consistency_loss
 
         top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
         row = {
@@ -510,9 +545,12 @@ def train_dynamic_loss_lora(
             "consistency_computed": "yes" if ambiguous_batch_count else "no",
             "consistency_reason": consistency_reason,
             "consistency_weight": float(consistency_weight),
+            "consistency_backward_mode": consistency_backward_mode,
+            "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
             "optimizer_steps": int(optimizer_steps),
             "scheduler_steps": int(scheduler_steps),
             "ambiguous_batch_count": int(ambiguous_batch_count),
+            "consistency_micro_batch_count": int(consistency_micro_batch_count),
             "ambiguous_sample_exposures": int(ambiguous_sample_exposures),
             "weak_prediction_max_probability_mean": safe_ratio(weak_confidence_sum, ambiguous_sample_exposures),
             "weak_prediction_entropy_mean": safe_ratio(weak_entropy_sum, ambiguous_sample_exposures),
@@ -934,6 +972,8 @@ def train_dynamic_loss_lora(
                 "neighbor_margin_positive_only": bool(neighbor_margin_positive_only),
                 "ambiguous_consistency": bool(ambiguous_consistency),
                 "consistency_weight": float(consistency_weight),
+                "consistency_backward_mode": consistency_backward_mode,
+                "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -963,6 +1003,8 @@ def train_dynamic_loss_lora(
                 "neighbor_margin_positive_only": bool(neighbor_margin_positive_only),
                 "ambiguous_consistency": bool(ambiguous_consistency),
                 "consistency_weight": float(consistency_weight),
+                "consistency_backward_mode": consistency_backward_mode,
+                "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -998,6 +1040,8 @@ def train_dynamic_loss_lora(
             "neighbor_margin_positive_only": "yes" if neighbor_margin_positive_only else "no",
             "ambiguous_consistency": "yes" if ambiguous_consistency else "no",
             "consistency_weight": float(consistency_weight),
+            "consistency_backward_mode": consistency_backward_mode,
+            "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
             "backbone_frozen": "yes",
             "lora_updated_before_selection": (
                 "yes" if any(row.get("lora_updated_since_initial") == "yes" for row in update_rows) else "no"
@@ -1030,6 +1074,8 @@ def validate_dynamic_args(
     neighbor_margin_positive_only: bool = True,
     ambiguous_consistency: bool = False,
     consistency_weight: float = 0.5,
+    consistency_backward_mode: str = "joint",
+    ambiguous_micro_batch_size: int = 20,
 ) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
@@ -1053,6 +1099,13 @@ def validate_dynamic_args(
         raise ValueError("ambiguous_consistency must be boolean.")
     if not math.isfinite(float(consistency_weight)) or float(consistency_weight) < 0.0:
         raise ValueError("consistency_weight must be finite and non-negative.")
+    if consistency_backward_mode not in CONSISTENCY_BACKWARD_MODES:
+        raise ValueError(
+            "consistency_backward_mode must be one of "
+            f"{', '.join(CONSISTENCY_BACKWARD_MODES)}."
+        )
+    if int(ambiguous_micro_batch_size) <= 0:
+        raise ValueError("ambiguous_micro_batch_size must be positive.")
     if ambiguous_consistency and not (
         geometry_mode == "neighbor_margin" and not neighbor_margin_positive_only
     ):
@@ -1573,6 +1626,35 @@ def compute_soft_consistency_loss(torch: Any, weak_logits: Any, strong_logits: A
     if not bool(torch.isfinite(loss).item()):
         raise FloatingPointError("Consistency KL is NaN or Inf.")
     return loss
+
+
+def forward_ambiguous_consistency(
+    torch: Any,
+    model: Any,
+    weak_images: Any,
+    strong_images: Any,
+    *,
+    amp_enabled: bool,
+) -> tuple[Any, Any, Any]:
+    """Return label-free weak-target/strong-prediction consistency tensors.
+
+    The weak branch temporarily enters eval mode and runs without autograd, so
+    it cannot retain a gradient graph or update normalization state.  The
+    caller remains responsible for backpropagating the returned KL term.
+    """
+    was_training = bool(model.training)
+    try:
+        model.eval()
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                weak_logits = model(weak_images)
+            weak_prob = torch.softmax(weak_logits.float(), dim=-1).detach()
+    finally:
+        model.train(was_training)
+    with torch.cuda.amp.autocast(enabled=amp_enabled):
+        strong_logits = model(strong_images)
+    consistency_loss = compute_soft_consistency_loss(torch, weak_logits, strong_logits)
+    return consistency_loss, weak_prob, strong_logits
 
 
 def count_empty_reliable_classes(
