@@ -12,8 +12,10 @@ from .features import resolve_device
 from .lora_training import (
     DINOv2LoRAClassifier,
     ImageSplitDataset,
+    WeakStrongImageSplitDataset,
     build_scheduler,
     build_transforms,
+    build_weak_strong_transforms,
     count_total_params,
     count_trainable_params,
     evaluate_lora,
@@ -83,6 +85,26 @@ class NeighborMarginSnapshot:
     candidate_mask: np.ndarray
 
 
+@dataclass(frozen=True)
+class DualEvidenceStrata:
+    """Update-local Margin-Rank strata derived solely from the L/G gates.
+
+    ``strict_reliable`` remains the mathematical L intersection G.  The
+    original PGDF fallback may enlarge ``actual_active`` for supervised
+    training, but those fallback samples are intentionally excluded from
+    ``ambiguous_for_consistency`` so a sample never receives both objectives.
+    """
+
+    strict_reliable: np.ndarray
+    ambiguous_l: np.ndarray
+    ambiguous_g: np.ndarray
+    ambiguous: np.ndarray
+    suspicious: np.ndarray
+    actual_active: np.ndarray
+    fallback: np.ndarray
+    ambiguous_for_consistency: np.ndarray
+
+
 def train_dynamic_loss_lora(
     train_paths: list[str],
     train_labels: np.ndarray,
@@ -115,6 +137,8 @@ def train_dynamic_loss_lora(
     geometry_mode: str = "prototype_similarity",
     neighbor_margin_use_fallback: bool = False,
     neighbor_margin_positive_only: bool = True,
+    ambiguous_consistency: bool = False,
+    consistency_weight: float = 0.5,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -145,6 +169,8 @@ def train_dynamic_loss_lora(
         geometry_mode=geometry_mode,
         neighbor_margin_use_fallback=neighbor_margin_use_fallback,
         neighbor_margin_positive_only=neighbor_margin_positive_only,
+        ambiguous_consistency=ambiguous_consistency,
+        consistency_weight=consistency_weight,
     )
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
@@ -190,6 +216,13 @@ def train_dynamic_loss_lora(
             "neighbor_margin geometry is defined only for dynamic_lora PGDF "
             "loss_and_proto selection."
         )
+    if ambiguous_consistency and not (
+        geometry_mode == "neighbor_margin" and not neighbor_margin_positive_only
+    ):
+        raise ValueError(
+            "ambiguous_consistency is supported only for Margin-Rank "
+            "(geometry_mode='neighbor_margin' with neighbor_margin_positive_only=False)."
+        )
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -207,6 +240,12 @@ def train_dynamic_loss_lora(
 
     input_size = int(feature_cfg["input_size"])
     train_transform, eval_transform = build_transforms(transforms, input_size)
+    weak_transform = None
+    strong_transform = None
+    if ambiguous_consistency:
+        # Construct these only for the opt-in branch.  The default Margin-Rank
+        # path therefore keeps its original transform/randomness lifecycle.
+        weak_transform, strong_transform = build_weak_strong_transforms(transforms, input_size)
     eval_dataset = ImageSplitDataset(eval_paths, eval_labels, eval_idx, label_to_id, eval_transform, path_maps)
     eval_loader = DataLoader(
         eval_dataset,
@@ -314,6 +353,7 @@ def train_dynamic_loss_lora(
     auto_proto_jaccard: float | None = None
 
     selected_mask = candidate_mask.copy()
+    ambiguous_training_mask = np.zeros(len(train_labels), dtype=bool)
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
     initial_trainable_checksum = trainable_model_checksum(model)
@@ -329,6 +369,11 @@ def train_dynamic_loss_lora(
 
     for epoch in range(1, epochs + 1):
         epoch_train_idx = np.where(selected_mask)[0]
+        if len(epoch_train_idx) == 0:
+            raise RuntimeError(
+                "Dynamic selection produced an empty active subset; training cannot continue. "
+                "This does not alter fallback semantics."
+            )
         train_dataset = ImageSplitDataset(train_paths, train_labels, epoch_train_idx, label_to_id, train_transform, path_maps)
         train_loader = DataLoader(
             train_dataset,
@@ -339,9 +384,51 @@ def train_dynamic_loss_lora(
             drop_last=False,
         )
 
+        consistency_reason = "disabled"
+        ambiguous_loader = None
+        ambiguous_train_idx = np.asarray([], dtype=np.int64)
+        if ambiguous_consistency:
+            if epoch <= warmup_epochs:
+                consistency_reason = "warmup"
+            elif consistency_weight == 0.0:
+                consistency_reason = "weight_zero"
+            else:
+                ambiguous_train_idx = np.where(ambiguous_training_mask)[0]
+                if len(ambiguous_train_idx) == 0:
+                    consistency_reason = "empty_ambiguous"
+                else:
+                    if weak_transform is None or strong_transform is None:
+                        raise RuntimeError("Ambiguous consistency transforms were not initialized.")
+                    ambiguous_dataset = WeakStrongImageSplitDataset(
+                        train_paths,
+                        ambiguous_train_idx,
+                        weak_transform,
+                        strong_transform,
+                        path_maps,
+                    )
+                    ambiguous_loader = DataLoader(
+                        ambiguous_dataset,
+                        batch_size=batch_size,
+                        shuffle=True,
+                        num_workers=int(train_cfg.get("num_workers", 4)),
+                        pin_memory=bool(train_cfg.get("pin_memory", True)),
+                        drop_last=False,
+                    )
+                    consistency_reason = "active"
+
         model.train()
         loss_sum = 0.0
+        supervised_loss_sum = 0.0
+        consistency_loss_sum = 0.0
+        weak_confidence_sum = 0.0
+        weak_entropy_sum = 0.0
+        weak_strong_agreement_sum = 0.0
         seen = 0
+        ambiguous_sample_exposures = 0
+        ambiguous_batch_count = 0
+        optimizer_steps = 0
+        scheduler_steps = 0
+        ambiguous_iter = iter(ambiguous_loader) if ambiguous_loader is not None else None
         progress = progress_iter(train_loader, total=len(train_loader), desc=f"Dynamic LoRA {method} seed={seed} epoch {epoch}/{epochs}")
         for images, labels, _ in progress:
             images = images.to(device, non_blocking=True)
@@ -349,14 +436,64 @@ def train_dynamic_loss_lora(
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 logits = model(images)
-                loss = criterion(logits, labels)
+                supervised_loss = criterion(logits, labels)
+            consistency_loss = None
+            weak_prob = None
+            weak_logits = None
+            strong_logits = None
+            if ambiguous_iter is not None:
+                try:
+                    weak_images, strong_images, ambiguous_indices = next(ambiguous_iter)
+                except StopIteration:
+                    ambiguous_iter = iter(ambiguous_loader)
+                    weak_images, strong_images, ambiguous_indices = next(ambiguous_iter)
+                expected_ambiguous = ambiguous_training_mask[ambiguous_indices.cpu().numpy().astype(np.int64)]
+                if not np.all(expected_ambiguous):
+                    raise RuntimeError("Ambiguous loader emitted a sample outside the current Ambiguous consistency set.")
+                weak_images = weak_images.to(device, non_blocking=True)
+                strong_images = strong_images.to(device, non_blocking=True)
+                # Use eval/no_grad for the weak target so it creates neither
+                # gradients nor dropout/normalization-state updates.  Restore
+                # the exact prior mode before the trainable strong branch.
+                was_training = bool(model.training)
+                try:
+                    model.eval()
+                    with torch.no_grad():
+                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                            weak_logits = model(weak_images)
+                        weak_prob = torch.softmax(weak_logits.float(), dim=-1).detach()
+                finally:
+                    model.train(was_training)
+                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                    strong_logits = model(strong_images)
+                consistency_loss = compute_soft_consistency_loss(torch, weak_logits, strong_logits)
+                if not bool(torch.isfinite(consistency_loss).item()):
+                    raise FloatingPointError("Ambiguous consistency loss is NaN or Inf.")
+                loss = supervised_loss + float(consistency_weight) * consistency_loss
+            else:
+                loss = supervised_loss
+            if not bool(torch.isfinite(loss).item()):
+                raise FloatingPointError("Dynamic training loss is NaN or Inf.")
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             current_batch = int(images.shape[0])
             loss_sum += float(loss.detach().cpu()) * current_batch
+            supervised_loss_sum += float(supervised_loss.detach().cpu()) * current_batch
             seen += current_batch
+            optimizer_steps += 1
+            scheduler_steps += 1
+            if consistency_loss is not None and weak_prob is not None and strong_logits is not None:
+                ambiguous_batch_size = int(weak_prob.shape[0])
+                consistency_loss_sum += float(consistency_loss.detach().cpu())
+                weak_confidence_sum += float(weak_prob.max(dim=-1).values.sum().detach().cpu())
+                weak_entropy_sum += float((-(weak_prob * weak_prob.clamp_min(1.0e-12).log()).sum(dim=-1)).sum().detach().cpu())
+                weak_strong_agreement_sum += float(
+                    (weak_prob.argmax(dim=-1) == strong_logits.detach().float().argmax(dim=-1)).sum().detach().cpu()
+                )
+                ambiguous_batch_count += 1
+                ambiguous_sample_exposures += ambiguous_batch_size
 
         top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
         row = {
@@ -366,6 +503,20 @@ def train_dynamic_loss_lora(
             "lr_lora": float(optimizer.param_groups[0]["lr"]),
             "lr_head": float(optimizer.param_groups[1]["lr"]),
             "loss": safe_ratio(loss_sum, seen),
+            "supervised_ce_loss": safe_ratio(supervised_loss_sum, seen),
+            "consistency_loss": safe_ratio(consistency_loss_sum, ambiguous_batch_count),
+            "total_loss": safe_ratio(loss_sum, seen),
+            "ambiguous_consistency_enabled": "yes" if ambiguous_consistency else "no",
+            "consistency_computed": "yes" if ambiguous_batch_count else "no",
+            "consistency_reason": consistency_reason,
+            "consistency_weight": float(consistency_weight),
+            "optimizer_steps": int(optimizer_steps),
+            "scheduler_steps": int(scheduler_steps),
+            "ambiguous_batch_count": int(ambiguous_batch_count),
+            "ambiguous_sample_exposures": int(ambiguous_sample_exposures),
+            "weak_prediction_max_probability_mean": safe_ratio(weak_confidence_sum, ambiguous_sample_exposures),
+            "weak_prediction_entropy_mean": safe_ratio(weak_entropy_sum, ambiguous_sample_exposures),
+            "weak_strong_prediction_agreement": safe_ratio(weak_strong_agreement_sum, ambiguous_sample_exposures),
             "top1": float(top1),
             "top5": float(top5),
             "train_samples": int(len(epoch_train_idx)),
@@ -404,6 +555,7 @@ def train_dynamic_loss_lora(
             reliable_mask: np.ndarray | None = None
             ambiguous_mask: np.ndarray | None = None
             suspicious_mask: np.ndarray | None = None
+            dual_evidence_strata: DualEvidenceStrata | None = None
             fallback_count = 0
 
             # Dynamic Prototype Gate Only intentionally never runs this block:
@@ -545,6 +697,17 @@ def train_dynamic_loss_lora(
                         candidate_mask,
                         positive_only=neighbor_margin_positive_only,
                     )
+                    if not neighbor_margin_positive_only:
+                        dual_evidence_strata = build_dual_evidence_strata(
+                            loss_selected_mask,
+                            neighbor_margin_candidate_mask,
+                            candidate_mask,
+                            selected_mask,
+                        )
+                        if ambiguous_consistency:
+                            # Fallback samples remain supervised active but
+                            # are removed from consistency to prevent dual use.
+                            ambiguous_training_mask = dual_evidence_strata.ambiguous_for_consistency.copy()
                 else:
                     # This is the original PGDF path.  Keep its selection and
                     # class-preserving fallback byte-for-byte independent of
@@ -595,6 +758,7 @@ def train_dynamic_loss_lora(
                     reliable_mask=reliable_mask,
                     ambiguous_mask=ambiguous_mask,
                     suspicious_mask=suspicious_mask,
+                    dual_evidence_strata=dual_evidence_strata,
                 )
             )
             selection_rows.extend(
@@ -768,6 +932,8 @@ def train_dynamic_loss_lora(
                 "geometry_mode": geometry_mode,
                 "neighbor_margin_use_fallback": bool(neighbor_margin_use_fallback),
                 "neighbor_margin_positive_only": bool(neighbor_margin_positive_only),
+                "ambiguous_consistency": bool(ambiguous_consistency),
+                "consistency_weight": float(consistency_weight),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -795,6 +961,8 @@ def train_dynamic_loss_lora(
                 "geometry_mode": geometry_mode,
                 "neighbor_margin_use_fallback": bool(neighbor_margin_use_fallback),
                 "neighbor_margin_positive_only": bool(neighbor_margin_positive_only),
+                "ambiguous_consistency": bool(ambiguous_consistency),
+                "consistency_weight": float(consistency_weight),
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -828,6 +996,8 @@ def train_dynamic_loss_lora(
             "geometry_mode": geometry_mode,
             "neighbor_margin_use_fallback": "yes" if neighbor_margin_use_fallback else "no",
             "neighbor_margin_positive_only": "yes" if neighbor_margin_positive_only else "no",
+            "ambiguous_consistency": "yes" if ambiguous_consistency else "no",
+            "consistency_weight": float(consistency_weight),
             "backbone_frozen": "yes",
             "lora_updated_before_selection": (
                 "yes" if any(row.get("lora_updated_since_initial") == "yes" for row in update_rows) else "no"
@@ -858,6 +1028,8 @@ def validate_dynamic_args(
     geometry_mode: str = "prototype_similarity",
     neighbor_margin_use_fallback: bool = False,
     neighbor_margin_positive_only: bool = True,
+    ambiguous_consistency: bool = False,
+    consistency_weight: float = 0.5,
 ) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
@@ -877,6 +1049,17 @@ def validate_dynamic_args(
         raise ValueError("neighbor_margin_use_fallback must be boolean.")
     if not isinstance(neighbor_margin_positive_only, bool):
         raise ValueError("neighbor_margin_positive_only must be boolean.")
+    if not isinstance(ambiguous_consistency, bool):
+        raise ValueError("ambiguous_consistency must be boolean.")
+    if not math.isfinite(float(consistency_weight)) or float(consistency_weight) < 0.0:
+        raise ValueError("consistency_weight must be finite and non-negative.")
+    if ambiguous_consistency and not (
+        geometry_mode == "neighbor_margin" and not neighbor_margin_positive_only
+    ):
+        raise ValueError(
+            "ambiguous_consistency requires Margin-Rank "
+            "(geometry_mode='neighbor_margin', neighbor_margin_positive_only=False)."
+        )
     if selection_strategy in {"proto_only", "loss_and_proto"} and proto_keep_ratio is None:
         raise ValueError("Prototype selection requires proto_keep_ratio.")
     if selection_strategy == "proto_only" and auto_proto_keep is not None:
@@ -1317,6 +1500,81 @@ def stratify_neighbor_margin_samples(
     return reliable, ambiguous, suspicious
 
 
+def build_dual_evidence_strata(
+    loss_selected_mask: np.ndarray,
+    geometry_candidate_mask: np.ndarray,
+    candidate_mask: np.ndarray,
+    actual_active_mask: np.ndarray,
+) -> DualEvidenceStrata:
+    """Construct the Margin-Rank L/G diagnostic partition without reranking.
+
+    The four diagnostic groups are defined by the already-computed class-wise
+    L (small loss) and G (Neighbor-Margin) masks.  ``actual_active_mask`` is
+    supplied by the unchanged original PGDF combine/fallback helper; it is not
+    used to redefine strict Reliable.
+    """
+    loss_selected_mask = np.asarray(loss_selected_mask, dtype=bool)
+    geometry_candidate_mask = np.asarray(geometry_candidate_mask, dtype=bool)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    actual_active_mask = np.asarray(actual_active_mask, dtype=bool)
+    if not (
+        loss_selected_mask.shape
+        == geometry_candidate_mask.shape
+        == candidate_mask.shape
+        == actual_active_mask.shape
+    ):
+        raise ValueError("Dual-evidence masks must have identical shapes.")
+    if np.any((loss_selected_mask | geometry_candidate_mask | actual_active_mask) & ~candidate_mask):
+        raise RuntimeError("Dual-evidence masks contain a non-training-pool sample.")
+
+    strict_reliable = candidate_mask & loss_selected_mask & geometry_candidate_mask
+    ambiguous_l = candidate_mask & loss_selected_mask & ~geometry_candidate_mask
+    ambiguous_g = candidate_mask & geometry_candidate_mask & ~loss_selected_mask
+    ambiguous = ambiguous_l | ambiguous_g
+    suspicious = candidate_mask & ~loss_selected_mask & ~geometry_candidate_mask
+    groups = (strict_reliable, ambiguous_l, ambiguous_g, suspicious)
+    for left_index, left in enumerate(groups):
+        for right in groups[left_index + 1 :]:
+            if np.any(left & right):
+                raise RuntimeError("Dual-evidence strata must be mutually exclusive.")
+    if not np.array_equal(strict_reliable | ambiguous_l | ambiguous_g | suspicious, candidate_mask):
+        raise RuntimeError("Dual-evidence strata must cover the full training pool.")
+    if np.any(strict_reliable & ~actual_active_mask):
+        raise RuntimeError("Actual active subset dropped a strict L/G intersection sample.")
+
+    fallback = actual_active_mask & ~strict_reliable
+    ambiguous_for_consistency = ambiguous & ~actual_active_mask
+    if np.any(ambiguous_for_consistency & actual_active_mask):
+        raise RuntimeError("An Ambiguous consistency sample also belongs to the active supervised subset.")
+    return DualEvidenceStrata(
+        strict_reliable=strict_reliable,
+        ambiguous_l=ambiguous_l,
+        ambiguous_g=ambiguous_g,
+        ambiguous=ambiguous,
+        suspicious=suspicious,
+        actual_active=actual_active_mask,
+        fallback=fallback,
+        ambiguous_for_consistency=ambiguous_for_consistency,
+    )
+
+
+def compute_soft_consistency_loss(torch: Any, weak_logits: Any, strong_logits: Any) -> Any:
+    """KL(softmax(stopgrad(weak)) || softmax(strong)) in stable float32."""
+    if weak_logits.shape != strong_logits.shape:
+        raise ValueError("Weak and strong logits must have identical shapes for consistency learning.")
+    target = torch.softmax(weak_logits.float(), dim=-1).detach()
+    if not bool(torch.isfinite(target).all().item()) or not bool(torch.isfinite(strong_logits).all().item()):
+        raise FloatingPointError("Weak or strong logits are NaN or Inf.")
+    loss = torch.nn.functional.kl_div(
+        torch.nn.functional.log_softmax(strong_logits.float(), dim=-1),
+        target,
+        reduction="batchmean",
+    )
+    if not bool(torch.isfinite(loss).item()):
+        raise FloatingPointError("Consistency KL is NaN or Inf.")
+    return loss
+
+
 def count_empty_reliable_classes(
     reliable_mask: np.ndarray,
     candidate_mask: np.ndarray,
@@ -1540,6 +1798,7 @@ def build_update_row(
     reliable_mask: np.ndarray | None = None,
     ambiguous_mask: np.ndarray | None = None,
     suspicious_mask: np.ndarray | None = None,
+    dual_evidence_strata: DualEvidenceStrata | None = None,
 ) -> dict[str, Any]:
     selected_losses = losses[selected_mask] if losses is not None else np.asarray([], dtype=np.float32)
     unselected_mask = candidate_mask & ~selected_mask
@@ -1657,6 +1916,26 @@ def build_update_row(
         "margin_median": float(np.median(margin[candidate_mask])) if margin is not None else "",
         "mean_observed_similarity": float(np.mean(observed_similarity[candidate_mask])) if observed_similarity is not None else "",
         "mean_competitor_similarity": float(np.mean(competitor_similarity[candidate_mask])) if competitor_similarity is not None else "",
+        # L/G dual-evidence diagnostics are intentionally additive.  The
+        # historical Neighbor-Margin state fields above retain their original
+        # meaning for strict-mode and pre-consistency comparisons.
+        "dual_evidence_reliable_count": int(dual_evidence_strata.strict_reliable.sum()) if dual_evidence_strata is not None else "",
+        "ambiguous_l_count": int(dual_evidence_strata.ambiguous_l.sum()) if dual_evidence_strata is not None else "",
+        "ambiguous_g_count": int(dual_evidence_strata.ambiguous_g.sum()) if dual_evidence_strata is not None else "",
+        "ambiguous_total_count": int(dual_evidence_strata.ambiguous.sum()) if dual_evidence_strata is not None else "",
+        "dual_evidence_suspicious_count": int(dual_evidence_strata.suspicious.sum()) if dual_evidence_strata is not None else "",
+        "actual_active_count": int(dual_evidence_strata.actual_active.sum()) if dual_evidence_strata is not None else "",
+        "fallback_sample_count": int(dual_evidence_strata.fallback.sum()) if dual_evidence_strata is not None else "",
+        "ambiguous_excluded_active_count": (
+            int((dual_evidence_strata.ambiguous & dual_evidence_strata.actual_active).sum())
+            if dual_evidence_strata is not None
+            else ""
+        ),
+        "ambiguous_for_consistency_count": (
+            int(dual_evidence_strata.ambiguous_for_consistency.sum())
+            if dual_evidence_strata is not None
+            else ""
+        ),
     }
 
 

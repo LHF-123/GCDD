@@ -38,10 +38,12 @@ from scripts.run_lora_checkpoint_validation import (
     merge_csv_rows,
     parse_args,
     parse_methods,
+    resolve_ambiguous_consistency_config,
     resolve_pgdf_geometry_config,
     resolve_retention_ratio,
     result_fields,
     validate_official_test_request,
+    validate_ambiguous_consistency_request,
     verify_observed_budget_match,
 )
 from scripts.run_neighbor_margin_asym40 import (
@@ -74,6 +76,35 @@ class CheckpointValidationTests(unittest.TestCase):
             args = parse_args()
         apply_overrides(base, args)
         self.assertEqual(("neighbor_margin", True, False), resolve_pgdf_geometry_config(base))
+
+    def test_ambiguous_consistency_cli_is_opt_in_and_margin_rank_only(self) -> None:
+        base = {"feature": {}, "lora": {}, "lora_train": {}, "pgdf": {"geometry_mode": "neighbor_margin"}}
+        apply_lora_defaults(base)
+        self.assertEqual((False, 0.5), resolve_ambiguous_consistency_config(base))
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "run_lora_checkpoint_validation.py",
+                "--input-dir", "fixture-input",
+                "--noise-index", "fixture-noise.csv",
+                "--geometry-mode", "neighbor_margin",
+                "--no-neighbor-margin-positive-only",
+                "--neighbor-margin-use-fallback",
+                "--ambiguous-consistency",
+                "--consistency-weight", "0.5",
+            ],
+        ):
+            args = parse_args()
+        apply_overrides(base, args)
+        enabled, weight = resolve_ambiguous_consistency_config(base)
+        self.assertTrue(enabled)
+        self.assertEqual(0.5, weight)
+        validate_ambiguous_consistency_request(["pgdf_dynamic_proto"], enabled, "neighbor_margin", False)
+        with self.assertRaisesRegex(ValueError, "Margin-Rank"):
+            validate_ambiguous_consistency_request(["pgdf_dynamic_proto"], True, "prototype_similarity", True)
+        with self.assertRaisesRegex(ValueError, "pgdf_dynamic_proto only"):
+            validate_ambiguous_consistency_request(["all_noisy"], True, "neighbor_margin", False)
 
     def test_margin_rank_keeps_negative_margin_top_p_and_reuses_pgdf_fallback(self) -> None:
         """Margin-Rank changes only the geometry ranking score of PGDF."""
@@ -126,6 +157,8 @@ class CheckpointValidationTests(unittest.TestCase):
             positive_only: bool | None,
             use_fallback: bool | None,
             selection_method: str | None = None,
+            ambiguous_consistency: bool | None = None,
+            consistency_weight: float | None = None,
         ) -> SimpleNamespace:
             return SimpleNamespace(
                 cub_root=None,
@@ -137,6 +170,8 @@ class CheckpointValidationTests(unittest.TestCase):
                 neighbor_margin_positive_only=positive_only,
                 neighbor_margin_use_fallback=use_fallback,
                 selection_method=selection_method,
+                ambiguous_consistency=ambiguous_consistency,
+                consistency_weight=consistency_weight,
             )
 
         strict_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
@@ -162,6 +197,22 @@ class CheckpointValidationTests(unittest.TestCase):
         validate_standalone_config(prototype_cfg)
         self.assertEqual("prototype_similarity", prototype_cfg["protocol"]["variant_id"])
         self.assertEqual("prototype_similarity", prototype_cfg["pgdf"]["geometry_mode"])
+
+        consistency_cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)
+        apply_neighbor_margin_standalone_overrides(
+            consistency_cfg,
+            make_args(
+                positive_only=None,
+                use_fallback=None,
+                selection_method="margin_rank",
+                ambiguous_consistency=True,
+                consistency_weight=0.5,
+            ),
+        )
+        validate_standalone_config(consistency_cfg)
+        self.assertEqual("margin_rank_ambiguous_consistency", consistency_cfg["protocol"]["variant_id"])
+        self.assertTrue(consistency_cfg["pgdf"]["ambiguous_consistency"])
+        self.assertEqual(0.5, consistency_cfg["pgdf"]["consistency_weight"])
 
     def test_standalone_variant_allows_unseen_seed_but_rejects_existing_seed(self) -> None:
         cfg = load_standalone_config(NEIGHBOR_MARGIN_STANDALONE_CONFIG)

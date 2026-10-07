@@ -66,6 +66,41 @@ class ImageSplitDataset:
         return image, int(self.label_to_id[str(self.labels[idx])]), idx
 
 
+class WeakStrongImageSplitDataset:
+    """Return two independently augmented views of one stable training sample.
+
+    This intentionally carries no class target.  It is used only by the
+    optional Ambiguous consistency branch, whose loss must not consume the
+    noisy observed label.
+    """
+
+    def __init__(
+        self,
+        paths: list[str],
+        indices: np.ndarray,
+        weak_transform: Any,
+        strong_transform: Any,
+        path_maps: list[tuple[str, str]],
+    ) -> None:
+        self.paths = paths
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.weak_transform = weak_transform
+        self.strong_transform = strong_transform
+        self.path_maps = path_maps
+
+    def __len__(self) -> int:
+        return int(len(self.indices))
+
+    def __getitem__(self, position: int) -> tuple[Any, Any, int]:
+        idx = int(self.indices[position])
+        path = resolve_image_path(self.paths[idx], self.path_maps)
+        with Image.open(path) as img:
+            image = img.convert("RGB")
+            weak_image = self.weak_transform(image)
+            strong_image = self.strong_transform(image)
+        return weak_image, strong_image, idx
+
+
 class DINOv2LoRAClassifier:
     @staticmethod
     def make(torch: Any, cfg: dict[str, Any], num_classes: int) -> Any:
@@ -438,6 +473,35 @@ def build_transforms(transforms: Any, input_size: int) -> tuple[Any, Any]:
         ]
     )
     return train_transform, eval_transform
+
+
+def build_weak_strong_transforms(transforms: Any, input_size: int) -> tuple[Any, Any]:
+    """Build DINOv2-compatible views for label-free consistency training.
+
+    The weak view deliberately matches the project's existing training
+    transform.  The strong view changes only the pre-normalization image
+    perturbation by adding a modest RandAugment; it does not use MixUp,
+    CutMix, or RandomErasing, which could obscure fine-grained cues.
+    """
+    normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+    weak_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(input_size, scale=(0.6, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    strong_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(input_size, scale=(0.6, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandAugment(num_ops=2, magnitude=5),
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    return weak_transform, strong_transform
 
 
 def inject_lora(torch: Any, module: Any, target_modules: list[str], rank: int, alpha: float, dropout: float) -> list[str]:

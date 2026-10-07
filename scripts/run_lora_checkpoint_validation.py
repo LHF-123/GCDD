@@ -137,6 +137,24 @@ def parse_args() -> argparse.Namespace:
         help="Use class-wise margin top-p without a margin-sign restriction.",
     )
     parser.add_argument(
+        "--ambiguous-consistency",
+        dest="ambiguous_consistency",
+        action="store_true",
+        default=None,
+        help="Enable weak/strong soft consistency for Margin-Rank Ambiguous samples.",
+    )
+    parser.add_argument(
+        "--no-ambiguous-consistency",
+        dest="ambiguous_consistency",
+        action="store_false",
+        help="Disable Ambiguous consistency explicitly (the default).",
+    )
+    parser.add_argument(
+        "--consistency-weight",
+        type=float,
+        help="KL consistency weight lambda_u (YAML/default: 0.5).",
+    )
+    parser.add_argument(
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
@@ -217,6 +235,13 @@ def main() -> None:
     apply_overrides(cfg, args)
     validate_args(args)
     geometry_mode, neighbor_margin_use_fallback, neighbor_margin_positive_only = resolve_pgdf_geometry_config(cfg)
+    ambiguous_consistency, consistency_weight = resolve_ambiguous_consistency_config(cfg)
+    validate_ambiguous_consistency_request(
+        methods,
+        ambiguous_consistency,
+        geometry_mode,
+        neighbor_margin_positive_only,
+    )
     jal_params = resolve_jal_params(cfg, args)
     noise_metadata = load_noise_metadata(noise_index)
     cfg["checkpoint_validation"] = {
@@ -228,6 +253,8 @@ def main() -> None:
         "geometry_mode": geometry_mode,
         "neighbor_margin_use_fallback": neighbor_margin_use_fallback,
         "neighbor_margin_positive_only": neighbor_margin_positive_only,
+        "ambiguous_consistency": ambiguous_consistency,
+        "consistency_weight": consistency_weight,
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
@@ -374,6 +401,8 @@ def main() -> None:
                 dynamic_geometry_mode = "prototype_similarity"
                 dynamic_neighbor_margin_use_fallback = False
                 dynamic_neighbor_margin_positive_only = True
+                dynamic_ambiguous_consistency = False
+                dynamic_consistency_weight = 0.5
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -451,6 +480,8 @@ def main() -> None:
                     dynamic_geometry_mode = geometry_mode
                     dynamic_neighbor_margin_use_fallback = neighbor_margin_use_fallback
                     dynamic_neighbor_margin_positive_only = neighbor_margin_positive_only
+                    dynamic_ambiguous_consistency = ambiguous_consistency
+                    dynamic_consistency_weight = consistency_weight
                     method_name = (
                         f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g} "
                         f"geometry={dynamic_geometry_mode}"
@@ -467,6 +498,9 @@ def main() -> None:
                             if dynamic_neighbor_margin_positive_only
                             else "pgdf_dynamic_lora_margin_rank_training_pool"
                         )
+                        if dynamic_ambiguous_consistency:
+                            method_name += " + Ambiguous Consistency"
+                            selection_mode += "_ambiguous_consistency"
                     else:
                         selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
                 elif canonical_key == "fixed_proto_warmup_matched":
@@ -536,6 +570,8 @@ def main() -> None:
                     geometry_mode=dynamic_geometry_mode,
                     neighbor_margin_use_fallback=dynamic_neighbor_margin_use_fallback,
                     neighbor_margin_positive_only=dynamic_neighbor_margin_positive_only,
+                    ambiguous_consistency=dynamic_ambiguous_consistency,
+                    consistency_weight=dynamic_consistency_weight,
                 )
                 # The clean/noisy mask is intentionally attached only after
                 # all model fitting and selection are complete.  It is never
@@ -650,6 +686,8 @@ def main() -> None:
                     "geometry_mode": result.summary.get("geometry_mode", ""),
                     "neighbor_margin_use_fallback": result.summary.get("neighbor_margin_use_fallback", ""),
                     "neighbor_margin_positive_only": result.summary.get("neighbor_margin_positive_only", ""),
+                    "ambiguous_consistency": result.summary.get("ambiguous_consistency", ""),
+                    "consistency_weight": result.summary.get("consistency_weight", ""),
                 },
             )
             all_results.append(result_row)
@@ -1124,6 +1162,8 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
     cfg["pgdf"].setdefault("geometry_mode", "prototype_similarity")
     cfg["pgdf"].setdefault("neighbor_margin_use_fallback", False)
     cfg["pgdf"].setdefault("neighbor_margin_positive_only", True)
+    cfg["pgdf"].setdefault("ambiguous_consistency", False)
+    cfg["pgdf"].setdefault("consistency_weight", 0.5)
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1156,6 +1196,10 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg["pgdf"]["neighbor_margin_use_fallback"] = bool(args.neighbor_margin_use_fallback)
     if args.neighbor_margin_positive_only is not None:
         cfg["pgdf"]["neighbor_margin_positive_only"] = bool(args.neighbor_margin_positive_only)
+    if args.ambiguous_consistency is not None:
+        cfg["pgdf"]["ambiguous_consistency"] = bool(args.ambiguous_consistency)
+    if args.consistency_weight is not None:
+        cfg["pgdf"]["consistency_weight"] = float(args.consistency_weight)
 
 
 def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool, bool]:
@@ -1173,6 +1217,37 @@ def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool, bool]:
     if not isinstance(positive_only, bool):
         raise ValueError("pgdf.neighbor_margin_positive_only must be boolean.")
     return geometry_mode, fallback, positive_only
+
+
+def resolve_ambiguous_consistency_config(cfg: dict[str, Any]) -> tuple[bool, float]:
+    """Resolve the opt-in consistency settings after YAML/CLI precedence."""
+    pgdf_cfg = cfg.get("pgdf", {})
+    enabled = pgdf_cfg.get("ambiguous_consistency", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("pgdf.ambiguous_consistency must be boolean.")
+    weight = float(pgdf_cfg.get("consistency_weight", 0.5))
+    if not np.isfinite(weight) or weight < 0.0:
+        raise ValueError("pgdf.consistency_weight must be finite and non-negative.")
+    return enabled, weight
+
+
+def validate_ambiguous_consistency_request(
+    methods: list[str],
+    enabled: bool,
+    geometry_mode: str,
+    neighbor_margin_positive_only: bool,
+) -> None:
+    """Fail closed instead of silently enabling consistency for another method."""
+    if not enabled:
+        return
+    canonical_methods = [canonical_method_key(method) for method in methods]
+    if canonical_methods != ["pgdf_dynamic_proto"]:
+        raise ValueError("--ambiguous-consistency requires --methods pgdf_dynamic_proto only.")
+    if geometry_mode != "neighbor_margin" or neighbor_margin_positive_only:
+        raise ValueError(
+            "--ambiguous-consistency requires Margin-Rank: "
+            "--geometry-mode neighbor_margin --no-neighbor-margin-positive-only."
+        )
 
 
 def configure_jal(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1357,6 +1432,9 @@ def train_log_fields() -> list[str]:
     return [
         "method", "seed", "epoch", "lr_lora", "lr_head", "loss", "train_loss", "top1", "top5", "val_top1", "val_top5",
         "best_top1", "best_epoch", "train_samples", "candidate_samples", "selected_ratio", "eval_samples", "trainable_params", "total_params",
+        "supervised_ce_loss", "consistency_loss", "total_loss", "ambiguous_consistency_enabled", "consistency_computed", "consistency_reason", "consistency_weight",
+        "optimizer_steps", "scheduler_steps", "ambiguous_batch_count", "ambiguous_sample_exposures",
+        "weak_prediction_max_probability_mean", "weak_prediction_entropy_mean", "weak_strong_prediction_agreement",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
     ]
@@ -1372,7 +1450,7 @@ def result_fields() -> list[str]:
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
         "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
-        "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only",
+        "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only", "ambiguous_consistency", "consistency_weight",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1414,6 +1492,8 @@ def update_fields() -> list[str]:
         "same_model_state_for_loss_and_prototype", "lora_updated_since_initial",
         "reliable_count", "ambiguous_count", "suspicious_count", "reliable_ratio", "ambiguous_ratio", "suspicious_ratio", "reliable_zero_class_count", "selected_zero_class_count",
         "margin_mean", "margin_std", "margin_min", "margin_max", "margin_median", "mean_observed_similarity", "mean_competitor_similarity",
+        "dual_evidence_reliable_count", "ambiguous_l_count", "ambiguous_g_count", "ambiguous_total_count", "dual_evidence_suspicious_count",
+        "actual_active_count", "fallback_sample_count", "ambiguous_excluded_active_count", "ambiguous_for_consistency_count",
         "reliable_purity", "reliable_noisy_retention", "suspicious_noise_ratio", "ambiguous_clean_ratio", "ambiguous_noisy_ratio",
         "prototype_candidate_purity", "neighbor_margin_candidate_purity",
     ]

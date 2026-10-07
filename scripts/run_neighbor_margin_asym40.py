@@ -107,6 +107,24 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Use Margin-Rank: class-wise margin top-p without a sign restriction.",
     )
+    parser.add_argument(
+        "--ambiguous-consistency",
+        dest="ambiguous_consistency",
+        action="store_true",
+        default=None,
+        help="Enable weak/strong soft consistency for Margin-Rank Ambiguous samples.",
+    )
+    parser.add_argument(
+        "--no-ambiguous-consistency",
+        dest="ambiguous_consistency",
+        action="store_false",
+        help="Disable Ambiguous consistency explicitly (the default).",
+    )
+    parser.add_argument(
+        "--consistency-weight",
+        type=float,
+        help="KL consistency weight lambda_u (default: 0.5).",
+    )
     parser.add_argument("--python", default=sys.executable, help="Python executable used for the LoRA runner.")
     parser.add_argument("--dry-run", action="store_true", help="Print the complete plan without creating files or training.")
     return parser.parse_args()
@@ -237,6 +255,10 @@ def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> No
         cfg["pgdf"]["neighbor_margin_use_fallback"] = bool(args.neighbor_margin_use_fallback)
     if args.neighbor_margin_positive_only is not None:
         cfg["pgdf"]["neighbor_margin_positive_only"] = bool(args.neighbor_margin_positive_only)
+    if getattr(args, "ambiguous_consistency", None) is not None:
+        cfg["pgdf"]["ambiguous_consistency"] = bool(args.ambiguous_consistency)
+    if getattr(args, "consistency_weight", None) is not None:
+        cfg["pgdf"]["consistency_weight"] = float(args.consistency_weight)
     resolve_selection_variant(cfg)
 
 
@@ -278,10 +300,23 @@ def resolve_selection_variant(cfg: dict[str, Any]) -> None:
     geometry_mode = pgdf_cfg.get("geometry_mode", "neighbor_margin")
     positive_only = pgdf_cfg.setdefault("neighbor_margin_positive_only", True)
     use_fallback = pgdf_cfg.setdefault("neighbor_margin_use_fallback", False)
+    ambiguous_consistency = pgdf_cfg.setdefault("ambiguous_consistency", False)
+    consistency_weight = float(pgdf_cfg.setdefault("consistency_weight", 0.5))
     if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
         raise ValueError("Standalone geometry_mode must be prototype_similarity or neighbor_margin.")
-    if not isinstance(positive_only, bool) or not isinstance(use_fallback, bool):
+    if not isinstance(positive_only, bool) or not isinstance(use_fallback, bool) or not isinstance(ambiguous_consistency, bool):
         raise ValueError("Neighbor-Margin mode flags must be boolean.")
+    if not np.isfinite(consistency_weight) or consistency_weight < 0.0:
+        raise ValueError("consistency_weight must be finite and non-negative.")
+    if ambiguous_consistency:
+        if not (geometry_mode == "neighbor_margin" and not positive_only and use_fallback):
+            raise ValueError(
+                "Standalone Ambiguous consistency requires Margin-Rank "
+                "(neighbor_margin, no positive-only, and PGDF fallback enabled)."
+            )
+        cfg["protocol"]["name"] = "neighbor_margin_margin_rank_ambiguous_consistency_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = "margin_rank_ambiguous_consistency"
+        return
     if geometry_mode == "prototype_similarity":
         cfg["protocol"]["name"] = "pgdf_prototype_similarity_cyclic_asym40"
         cfg["protocol"]["variant_id"] = "prototype_similarity"
@@ -584,6 +619,10 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
             command.append("--neighbor-margin-use-fallback")
         else:
             command.append("--no-neighbor-margin-use-fallback")
+    if bool(cfg["pgdf"].get("ambiguous_consistency", False)):
+        command.extend(
+            ["--ambiguous-consistency", "--consistency-weight", str(cfg["pgdf"].get("consistency_weight", 0.5))]
+        )
     local_repo = str(cfg["feature"].get("local_repo", ""))
     if local_repo:
         command.extend(["--local-repo", local_repo])
@@ -641,7 +680,9 @@ def print_plan(cfg: dict[str, Any], run_root: Path, args: argparse.Namespace) ->
         f"validation_seed={protocol['validation']['seed']}, "
         f"r={protocol['pgdf']['dynamic_ratio']}, p={protocol['pgdf']['prototype_keep_ratio']}, "
         f"warmup={protocol['pgdf']['warmup_epochs']}, interval={protocol['pgdf']['update_interval']}, "
-        f"geometry={cfg['pgdf']['geometry_mode']}, variant={protocol['variant_id']}",
+        f"geometry={cfg['pgdf']['geometry_mode']}, "
+        f"ambiguous_consistency={cfg['pgdf'].get('ambiguous_consistency', False)}, "
+        f"variant={protocol['variant_id']}",
         flush=True,
     )
     for key in ("cub", "cars", "aircraft"):
