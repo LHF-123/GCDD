@@ -78,6 +78,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=80)
     parser.add_argument("--ambiguous-micro-batch-size", type=int, default=20)
     parser.add_argument(
+        "--reliable-gradient-mode",
+        choices=("auto", "full", "micro"),
+        default="auto",
+        help=(
+            "Reliable CE physical-batch policy. auto first uses a complete AMP batch, then retries "
+            "with weighted micro-batches only after CUDA OOM; full never falls back; micro always micro-batches."
+        ),
+    )
+    parser.add_argument(
+        "--reliable-micro-batch-size",
+        type=int,
+        default=20,
+        help="Physical Reliable CE micro-batch size used by auto fallback or --reliable-gradient-mode micro.",
+    )
+    parser.add_argument(
         "--path-map",
         action="append",
         default=[],
@@ -451,6 +466,7 @@ def compute_weighted_kl_snapshot(
     *,
     consistency_weight: float,
     micro_batch_size: int,
+    amp_enabled: bool,
 ) -> tuple[list[Any], float, float, list[Any], list[Any]]:
     """Return weighted effective-batch KL gradient, using bounded physical batches."""
     from gcdd.lora_dynamic import forward_ambiguous_consistency
@@ -471,7 +487,7 @@ def compute_weighted_kl_snapshot(
             model,
             weak_images[start:end],
             strong_images[start:end],
-            amp_enabled=False,
+            amp_enabled=amp_enabled,
         )
         scaled_loss = float(consistency_weight) * microbatch_scale(count, total) * kl_loss
         addition = autograd_snapshot(torch, scaled_loss, parameters)
@@ -481,6 +497,119 @@ def compute_weighted_kl_snapshot(
         all_weak_prob.append(weak_prob.detach().cpu())
         all_strong_logits.append(strong_logits.detach().cpu())
     return accumulator, loss_sum, weighted_loss_sum, all_weak_prob, all_strong_logits
+
+
+def compute_weighted_ce_snapshot(
+    torch: Any,
+    model: Any,
+    images: Any,
+    labels: Any,
+    criterion: Any,
+    parameters: Sequence[Any],
+    *,
+    micro_batch_size: int,
+    amp_enabled: bool,
+) -> tuple[list[Any], float]:
+    """CE gradient for one effective Reliable batch with no retained prior graph.
+
+    CrossEntropyLoss defaults to a mean reduction.  Scaling each physical
+    micro-batch by ``n_micro / N_effective`` therefore preserves the gradient
+    of the mean CE over the original Reliable effective batch.
+    """
+    total = int(images.shape[0])
+    if total != int(labels.shape[0]) or total < 1:
+        raise ValueError("Reliable images and labels must have the same non-zero effective batch size.")
+    if micro_batch_size < 1 or micro_batch_size > total:
+        raise ValueError(f"Reliable micro-batch size must be within [1, {total}], got {micro_batch_size}.")
+    accumulator = zeros_for_parameters(torch, parameters)
+    loss_sum = 0.0
+    for start in range(0, total, micro_batch_size):
+        end = min(total, start + micro_batch_size)
+        count = end - start
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            logits = model(images[start:end])
+            ce_loss = criterion(logits, labels[start:end])
+        scaled_loss = microbatch_scale(count, total) * ce_loss
+        accumulator = add_gradient_snapshots(
+            torch,
+            accumulator,
+            autograd_snapshot(torch, scaled_loss, parameters),
+        )
+        loss_sum += float(ce_loss.detach().cpu().item()) * microbatch_scale(count, total)
+        del logits, ce_loss, scaled_loss
+    return accumulator, loss_sum
+
+
+def restore_buffers(torch: Any, model: Any, buffers: dict[str, Any]) -> None:
+    """Restore persistent buffers after a failed full-batch forward attempt."""
+    with torch.no_grad():
+        for name, buffer in model.named_buffers():
+            if name not in buffers:
+                raise RuntimeError(f"Model buffer inventory changed after failed diagnostic forward: {name}")
+            buffer.copy_(buffers[name].to(device=buffer.device, dtype=buffer.dtype))
+
+
+def compute_reliable_ce_snapshot(
+    torch: Any,
+    model: Any,
+    images: Any,
+    labels: Any,
+    criterion: Any,
+    parameters: Sequence[Any],
+    *,
+    requested_mode: str,
+    micro_batch_size: int,
+    amp_enabled: bool,
+    retry_seed: int,
+) -> tuple[list[Any], float, str]:
+    """Compute Reliable CE gradients while preserving the effective batch size.
+
+    In ``auto`` mode, a full effective batch is attempted first under AMP to
+    match production training.  CUDA OOM alone triggers a state-safe retry in
+    weighted micro-batches; no optimizer state or model tensor is updated.
+    """
+    total = int(images.shape[0])
+    if requested_mode not in {"auto", "full", "micro"}:
+        raise ValueError(f"Unsupported Reliable gradient mode: {requested_mode}")
+    full_label = "full_amp" if amp_enabled else "full_fp32"
+    micro_label = "microbatch_amp" if amp_enabled else "microbatch_fp32"
+    if requested_mode in {"auto", "full"}:
+        buffer_snapshot = {name: buffer.detach().cpu().clone() for name, buffer in model.named_buffers()}
+        try:
+            snapshot, loss = compute_weighted_ce_snapshot(
+                torch,
+                model,
+                images,
+                labels,
+                criterion,
+                parameters,
+                micro_batch_size=total,
+                amp_enabled=amp_enabled,
+            )
+            return snapshot, loss, full_label
+        except torch.OutOfMemoryError:
+            if requested_mode == "full":
+                raise
+            restore_buffers(torch, model, buffer_snapshot)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            set_all_seeds(torch, retry_seed)
+            print(
+                "[gradient-audit] Reliable full effective batch OOM under AMP; "
+                f"retrying with weighted Reliable micro-batches of {micro_batch_size}."
+            )
+    snapshot, loss = compute_weighted_ce_snapshot(
+        torch,
+        model,
+        images,
+        labels,
+        criterion,
+        parameters,
+        micro_batch_size=micro_batch_size,
+        amp_enabled=amp_enabled,
+    )
+    return snapshot, loss, micro_label
 
 
 def gradient_rows_for_batch(
@@ -494,7 +623,9 @@ def gradient_rows_for_batch(
     device: str,
     output_sampling_rows: list[dict[str, Any]],
     ambiguous_micro_batch_size: int,
-) -> list[dict[str, Any]]:
+    reliable_gradient_mode: str,
+    reliable_micro_batch_size: int,
+) -> tuple[list[dict[str, Any]], str]:
     from torchvision import transforms
 
     from gcdd.lora_training import ImageSplitDataset, WeakStrongImageSplitDataset, build_criterion, build_transforms, build_weak_strong_transforms
@@ -544,13 +675,22 @@ def gradient_rows_for_batch(
     parameter_groups = split_parameter_groups(model.named_parameters())
     all_parameters = [parameter for _, parameter in parameter_groups["all_trainable"]]
     model.train(True)
-    set_all_seeds(torch, diagnostic_batch.seed + 10_000)
-    ce_logits = model(reliable_images)
+    reliable_forward_seed = diagnostic_batch.seed + 10_000
+    set_all_seeds(torch, reliable_forward_seed)
     criterion = build_criterion(torch, cfg)
-    ce_loss = criterion(ce_logits, reliable_labels)
-    ce_loss_value = float(ce_loss.detach().cpu().item())
-    ce_snapshot = autograd_snapshot(torch, ce_loss, all_parameters)
-    del ce_logits, ce_loss
+    amp_enabled = bool(cfg.get("lora_train", {}).get("amp", True)) and device.startswith("cuda")
+    ce_snapshot, ce_loss_value, reliable_mode_used = compute_reliable_ce_snapshot(
+        torch,
+        model,
+        reliable_images,
+        reliable_labels,
+        criterion,
+        all_parameters,
+        requested_mode=reliable_gradient_mode,
+        micro_batch_size=reliable_micro_batch_size,
+        amp_enabled=amp_enabled,
+        retry_seed=reliable_forward_seed,
+    )
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
@@ -564,6 +704,7 @@ def gradient_rows_for_batch(
         all_parameters,
         consistency_weight=consistency_weight,
         micro_batch_size=micro_batch_size,
+        amp_enabled=amp_enabled,
     )
     if not all(bool(torch.isfinite(value).all().item()) for value in (*weak_prob, *strong_logits)):
         raise FloatingPointError("Weak/strong diagnostic outputs are not finite.")
@@ -585,9 +726,12 @@ def gradient_rows_for_batch(
                 "diagnostic_batch_id": diagnostic_batch.batch_id,
                 "parameter_group": group_name,
                 "reliable_batch_size": len(diagnostic_batch.reliable_indices),
+                "reliable_gradient_mode": reliable_mode_used,
+                "reliable_micro_batch_size": reliable_micro_batch_size if reliable_mode_used.startswith("microbatch") else len(diagnostic_batch.reliable_indices),
                 "ambiguous_batch_size": len(diagnostic_batch.ambiguous_indices),
                 "ambiguous_micro_batch_size": micro_batch_size,
                 "consistency_weight": consistency_weight,
+                "amp_enabled": "yes" if amp_enabled else "no",
                 "ce_loss": ce_loss_value,
                 "kl_loss": kl_loss,
                 "weighted_kl_loss": weighted_kl_loss,
@@ -601,7 +745,7 @@ def gradient_rows_for_batch(
     gc.collect()
     if device.startswith("cuda"):
         torch.cuda.empty_cache()
-    return rows
+    return rows, reliable_mode_used
 
 
 def finite_or_na(value: float | None) -> str:
@@ -694,7 +838,16 @@ def image_access_preflight(specs: Sequence[CheckpointSpec], path_maps: list[tupl
     return rows
 
 
-def write_integrity_report(output_dir: Path, *, device: str, micro_batch_size: int, completed: bool, peak_bytes: int | None) -> None:
+def write_integrity_report(
+    output_dir: Path,
+    *,
+    device: str,
+    ambiguous_micro_batch_size: int,
+    reliable_gradient_mode: str,
+    reliable_micro_batch_size: int,
+    completed: bool,
+    peak_bytes: int | None,
+) -> None:
     peak = "NA" if peak_bytes is None else f"{peak_bytes} bytes ({peak_bytes / 1024**3:.3f} GiB)"
     body = f"""# Gradient integrity check
 
@@ -703,6 +856,8 @@ def write_integrity_report(output_dir: Path, *, device: str, micro_batch_size: i
 - KL uses production `forward_ambiguous_consistency` and production `compute_soft_consistency_loss`.
 - Weak view is evaluated under `eval() + no_grad()` by that helper; strong view runs in restored train state.
 - Each physical Ambiguous micro-batch is multiplied by `n_micro / N_effective`; therefore the accumulated gradient corresponds to one effective-batch mean KL.
+- Reliable CE policy: `{reliable_gradient_mode}`.  In auto mode, a complete AMP Reliable batch is attempted first and only CUDA OOM triggers the weighted `{reliable_micro_batch_size}`-sample micro-batch fallback.  Actual per-batch policy is recorded in `gradient_per_batch.csv`.
+- Ambiguous physical micro-batch size: {ambiguous_micro_batch_size}.
 - No optimizer or scheduler is constructed by this script, and no model state is saved.
 - Parameter and persistent-buffer equality is asserted after every checkpoint diagnostic.
 - Peak CUDA allocation: {peak}.
@@ -755,6 +910,8 @@ def run_checkpoint(
     batch_size: int,
     diagnostic_seed: int,
     ambiguous_micro_batch_size: int,
+    reliable_gradient_mode: str,
+    reliable_micro_batch_size: int,
     sampling_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
     cfg = read_yaml(spec.cfg_path)
@@ -772,21 +929,25 @@ def run_checkpoint(
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     rows: list[dict[str, Any]] = []
+    runtime_reliable_mode = reliable_gradient_mode
     for batch in batches:
-        rows.extend(
-            gradient_rows_for_batch(
-                torch,
-                spec,
-                batch,
-                model,
-                cfg,
-                groups,
-                path_maps,
-                device,
-                sampling_rows,
-                ambiguous_micro_batch_size,
-            )
+        batch_rows, mode_used = gradient_rows_for_batch(
+            torch,
+            spec,
+            batch,
+            model,
+            cfg,
+            groups,
+            path_maps,
+            device,
+            sampling_rows,
+            ambiguous_micro_batch_size,
+            runtime_reliable_mode,
+            reliable_micro_batch_size,
         )
+        rows.extend(batch_rows)
+        if reliable_gradient_mode == "auto" and mode_used.startswith("microbatch"):
+            runtime_reliable_mode = "micro"
         assert_model_state_unchanged(model, state)
     peak = int(torch.cuda.max_memory_allocated()) if device.startswith("cuda") else 0
     del model
@@ -800,6 +961,10 @@ def main() -> None:
     args = parse_args()
     if args.ambiguous_micro_batch_size < 1:
         raise ValueError("--ambiguous-micro-batch-size must be positive.")
+    if args.reliable_micro_batch_size < 1:
+        raise ValueError("--reliable-micro-batch-size must be positive.")
+    if args.reliable_micro_batch_size > args.batch_size:
+        raise ValueError("--reliable-micro-batch-size cannot exceed --batch-size.")
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     path_maps = parse_path_maps(args.path_map)
@@ -826,7 +991,15 @@ def main() -> None:
                             }
                         )
         write_csv(output_dir / "diagnostic_sampling_manifest.csv", sampling_rows)
-        write_integrity_report(output_dir, device=args.device, micro_batch_size=args.ambiguous_micro_batch_size, completed=False, peak_bytes=None)
+        write_integrity_report(
+            output_dir,
+            device=args.device,
+            ambiguous_micro_batch_size=args.ambiguous_micro_batch_size,
+            reliable_gradient_mode=args.reliable_gradient_mode,
+            reliable_micro_batch_size=args.reliable_micro_batch_size,
+            completed=False,
+            peak_bytes=None,
+        )
         if image_access_missing:
             (output_dir / "preflight_status.md").write_text(
                 "# Gradient audit preflight status\n\n"
@@ -858,6 +1031,8 @@ def main() -> None:
             args.batch_size,
             args.diagnostic_seed,
             args.ambiguous_micro_batch_size,
+            args.reliable_gradient_mode,
+            args.reliable_micro_batch_size,
             sampling_rows,
         )
         all_rows.extend(rows)
@@ -867,7 +1042,15 @@ def main() -> None:
     summary = summarize_rows(all_rows)
     write_csv(output_dir / "gradient_summary.csv", summary)
     write_reports(output_dir, summary)
-    write_integrity_report(output_dir, device=args.device, micro_batch_size=args.ambiguous_micro_batch_size, completed=True, peak_bytes=peak_bytes)
+    write_integrity_report(
+        output_dir,
+        device=args.device,
+        ambiguous_micro_batch_size=args.ambiguous_micro_batch_size,
+        reliable_gradient_mode=args.reliable_gradient_mode,
+        reliable_micro_batch_size=args.reliable_micro_batch_size,
+        completed=True,
+        peak_bytes=peak_bytes,
+    )
     print(f"Gradient audit completed: {output_dir}")
 
 
