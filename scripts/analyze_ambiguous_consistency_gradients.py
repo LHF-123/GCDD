@@ -398,7 +398,11 @@ def stack_ambiguous_samples(dataset: Any, index_to_position: dict[int, int], ind
 def reconstruct_index_aligned_inputs(groups: SelectionGroups) -> tuple[list[str], np.ndarray]:
     largest = max(groups.pool)
     paths = [""] * (largest + 1)
-    labels = np.full(largest + 1, "", dtype=str)
+    # ``np.full(..., "", dtype=str)`` creates a U1 array and silently turns
+    # folder-style labels such as "Mercedes-Benz ..." into "M".  Keep the
+    # exact observed strings saved by this historical run instead.
+    labels = np.empty(largest + 1, dtype=object)
+    labels.fill("")
     for index in groups.pool:
         paths[index] = groups.paths[index]
         labels[index] = groups.labels[index]
