@@ -679,6 +679,14 @@ def extract_and_score_queries(
     return rows, evidence_by_index
 
 
+def attach_dataset_identity(rows: Iterable[dict[str, Any]], dataset: str) -> None:
+    """Attach the run identity required by every downstream audit artifact."""
+    if not dataset:
+        raise ValueError("Dataset identity cannot be empty.")
+    for row in rows:
+        row["dataset"] = dataset
+
+
 def mean_or_na(values: Sequence[float]) -> float | str:
     return float(statistics.mean(values)) if values else ""
 
@@ -1083,6 +1091,9 @@ def run_dataset(
         batch_size=args.feature_batch_size, device=args.device, max_reference_patches=args.max_reference_patches_per_class,
         top_fraction=args.top_patch_fraction, random_repeats=args.random_patch_repeats, random_seed=args.diagnostic_seed,
     )
+    # score_query is deliberately dataset-agnostic; attach the resolved run
+    # identity once here so all downstream audit artifacts carry it.
+    attach_dataset_identity(query_rows, spec.dataset)
     occlusion_rows = run_occlusion_control(
         torch,
         model,
