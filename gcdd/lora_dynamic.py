@@ -33,6 +33,7 @@ from .progress import log_stage, progress_iter
 
 
 CONSISTENCY_BACKWARD_MODES = ("joint", "sequential", "microbatch")
+COMPETITION_MODES = ("none", "geometry", "logit_snapshot")
 
 
 @dataclass
@@ -45,6 +46,7 @@ class DynamicLossRunResult:
     selection_rows: list[dict[str, Any]]
     update_rows: list[dict[str, Any]]
     per_class_rows: list[dict[str, Any]]
+    competition_rows: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,9 @@ def train_dynamic_loss_lora(
     consistency_weight: float = 0.5,
     consistency_backward_mode: str = "joint",
     ambiguous_micro_batch_size: int = 20,
+    competition_mode: str = "none",
+    competition_weight: float = 0.2,
+    competition_margin: float = 1.0,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -178,6 +183,9 @@ def train_dynamic_loss_lora(
         consistency_weight=consistency_weight,
         consistency_backward_mode=consistency_backward_mode,
         ambiguous_micro_batch_size=ambiguous_micro_batch_size,
+        competition_mode=competition_mode,
+        competition_weight=competition_weight,
+        competition_margin=competition_margin,
     )
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
@@ -230,6 +238,20 @@ def train_dynamic_loss_lora(
             "ambiguous_consistency is supported only for Margin-Rank "
             "(geometry_mode='neighbor_margin' with neighbor_margin_positive_only=False)."
         )
+    if competition_mode != "none" and ambiguous_consistency:
+        raise ValueError(
+            "Competition-aware loss and ambiguous_consistency are mutually exclusive in this implementation."
+        )
+    if competition_mode != "none" and not (
+        geometry_mode == "neighbor_margin"
+        and not neighbor_margin_positive_only
+        and neighbor_margin_use_fallback
+    ):
+        raise ValueError(
+            "competition_mode requires Margin-Rank "
+            "(geometry_mode='neighbor_margin', neighbor_margin_positive_only=False, "
+            "neighbor_margin_use_fallback=True)."
+        )
 
     lora_cfg = cfg["lora"]
     train_cfg = cfg["lora_train"]
@@ -240,6 +262,7 @@ def train_dynamic_loss_lora(
 
     classes = sorted(set(train_labels.tolist()))
     label_to_id = {label: i for i, label in enumerate(classes)}
+    observed_label_ids = np.asarray([label_to_id[str(label)] for label in train_labels], dtype=np.int64)
     eval_known = np.array([label in label_to_id for label in eval_labels], dtype=bool)
     eval_idx = np.where(eval_known)[0]
     if len(eval_idx) == 0:
@@ -352,6 +375,7 @@ def train_dynamic_loss_lora(
     selection_rows: list[dict[str, Any]] = []
     update_rows: list[dict[str, Any]] = []
     per_class_rows: list[dict[str, Any]] = []
+    competition_rows: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
     last5_states: list[tuple[int, dict[str, Any]]] = []
@@ -361,6 +385,12 @@ def train_dynamic_loss_lora(
 
     selected_mask = candidate_mask.copy()
     ambiguous_training_mask = np.zeros(len(train_labels), dtype=bool)
+    # These arrays are indexed by the original, stable training-pool index
+    # emitted by ImageSplitDataset, never by shuffled batch position.
+    competition_eligible_mask = np.zeros(len(train_labels), dtype=bool)
+    competition_competitor_by_index = np.full(len(train_labels), -1, dtype=np.int64)
+    competition_snapshot_epoch: int | None = None
+    competition_snapshot_history: list[dict[str, Any]] = []
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
     initial_trainable_checksum = trainable_model_checksum(model)
@@ -371,6 +401,7 @@ def train_dynamic_loss_lora(
         f"{'not_used' if selection_strategy == 'proto_only' else f'{retention_ratio:.3f}'}, "
         f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
         f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, geometry_mode={geometry_mode}, "
+        f"competition_mode={competition_mode}, "
         f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
     )
 
@@ -392,6 +423,18 @@ def train_dynamic_loss_lora(
         )
 
         consistency_reason = "disabled"
+        competition_reason = "disabled"
+        if competition_mode != "none":
+            if epoch <= warmup_epochs:
+                competition_reason = "warmup"
+            elif competition_weight == 0.0:
+                competition_reason = "weight_zero"
+            elif competition_snapshot_epoch is None:
+                competition_reason = "missing_snapshot"
+            elif not np.any(competition_eligible_mask):
+                competition_reason = "empty_strict_reliable"
+            else:
+                competition_reason = "active"
         ambiguous_loader = None
         ambiguous_train_idx = np.asarray([], dtype=np.int64)
         if ambiguous_consistency:
@@ -434,13 +477,17 @@ def train_dynamic_loss_lora(
         ambiguous_sample_exposures = 0
         ambiguous_batch_count = 0
         consistency_micro_batch_count = 0
+        competition_loss_sum = 0.0
+        competition_sample_exposures = 0
+        competition_batch_count = 0
         optimizer_steps = 0
         scheduler_steps = 0
         ambiguous_iter = iter(ambiguous_loader) if ambiguous_loader is not None else None
         progress = progress_iter(train_loader, total=len(train_loader), desc=f"Dynamic LoRA {method} seed={seed} epoch {epoch}/{epochs}")
-        for images, labels, _ in progress:
+        for images, labels, indices in progress:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
+            original_indices = indices.cpu().numpy().astype(np.int64)
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 logits = model(images)
@@ -448,11 +495,37 @@ def train_dynamic_loss_lora(
             if not bool(torch.isfinite(supervised_loss).item()):
                 raise FloatingPointError("Supervised CE loss is NaN or Inf.")
 
+            competition_loss = None
+            eligible_competition = np.zeros(len(original_indices), dtype=bool)
+            if competition_reason == "active":
+                eligible_competition = competition_eligible_mask[original_indices]
+                if np.any(eligible_competition):
+                    competitors = competition_competitor_by_index[original_indices[eligible_competition]]
+                    if np.any(competitors < 0):
+                        raise RuntimeError(
+                            "Competition competitor mapping is missing for a strict Reliable training sample."
+                        )
+                    eligible_positions = torch.from_numpy(np.where(eligible_competition)[0]).to(device=device)
+                    competitor_tensor = torch.from_numpy(competitors.astype(np.int64, copy=False)).to(device=device)
+                    eligible_logits = logits.index_select(0, eligible_positions)
+                    competition_loss = competition_softplus_margin_loss(
+                        torch,
+                        eligible_logits,
+                        labels.index_select(0, eligible_positions),
+                        competitor_tensor,
+                        competition_margin,
+                    )
+                    if not bool(torch.isfinite(competition_loss).item()):
+                        raise FloatingPointError("Competition loss is NaN or Inf.")
+
             # ``sequential`` and ``microbatch`` deliberately release the
             # Reliable CE graph before allocating an Ambiguous strong graph.
             # No parameter/scheduler update occurs between the two backwards.
             if consistency_backward_mode in {"sequential", "microbatch"}:
-                scaler.scale(supervised_loss).backward()
+                reliable_objective = supervised_loss
+                if competition_loss is not None:
+                    reliable_objective = reliable_objective + float(competition_weight) * competition_loss
+                scaler.scale(reliable_objective).backward()
 
             logical_consistency_loss = 0.0
             logical_ambiguous_size = 0
@@ -496,6 +569,8 @@ def train_dynamic_loss_lora(
                         # joint mode has exactly one micro-batch and keeps the
                         # original single-backward implementation intact.
                         joint_loss = supervised_loss + float(consistency_weight) * consistency_loss
+                        if competition_loss is not None:
+                            joint_loss = joint_loss + float(competition_weight) * competition_loss
                     else:
                         scaler.scale(float(consistency_weight) * fraction * consistency_loss).backward()
                     logical_consistency_loss += fraction * float(consistency_loss.detach().cpu())
@@ -514,16 +589,27 @@ def train_dynamic_loss_lora(
                 ambiguous_batch_count += 1
                 ambiguous_sample_exposures += logical_ambiguous_size
                 total_loss_value = float(supervised_loss.detach().cpu()) + float(consistency_weight) * logical_consistency_loss
+                if competition_loss is not None:
+                    total_loss_value += float(competition_weight) * float(competition_loss.detach().cpu())
             else:
                 if consistency_backward_mode == "joint":
-                    scaler.scale(supervised_loss).backward()
+                    reliable_objective = supervised_loss
+                    if competition_loss is not None:
+                        reliable_objective = reliable_objective + float(competition_weight) * competition_loss
+                    scaler.scale(reliable_objective).backward()
                 total_loss_value = float(supervised_loss.detach().cpu())
+                if competition_loss is not None:
+                    total_loss_value += float(competition_weight) * float(competition_loss.detach().cpu())
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             current_batch = int(images.shape[0])
             loss_sum += total_loss_value * current_batch
             supervised_loss_sum += float(supervised_loss.detach().cpu()) * current_batch
+            if competition_loss is not None:
+                competition_loss_sum += float(competition_loss.detach().cpu()) * int(eligible_competition.sum())
+                competition_sample_exposures += int(eligible_competition.sum())
+                competition_batch_count += 1
             seen += current_batch
             optimizer_steps += 1
             scheduler_steps += 1
@@ -547,6 +633,20 @@ def train_dynamic_loss_lora(
             "consistency_weight": float(consistency_weight),
             "consistency_backward_mode": consistency_backward_mode,
             "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
+            "competition_mode": competition_mode,
+            "competition_weight": float(competition_weight),
+            "competition_margin": float(competition_margin),
+            "competition_loss": safe_ratio(competition_loss_sum, competition_sample_exposures),
+            "weighted_competition_loss": (
+                float(competition_weight) * safe_ratio(competition_loss_sum, competition_sample_exposures)
+                if competition_sample_exposures
+                else 0.0
+            ),
+            "competition_computed": "yes" if competition_batch_count else "no",
+            "competition_reason": competition_reason,
+            "competition_batch_count": int(competition_batch_count),
+            "competition_sample_exposures": int(competition_sample_exposures),
+            "competition_snapshot_epoch": competition_snapshot_epoch if competition_snapshot_epoch is not None else "",
             "optimizer_steps": int(optimizer_steps),
             "scheduler_steps": int(scheduler_steps),
             "ambiguous_batch_count": int(ambiguous_batch_count),
@@ -584,6 +684,7 @@ def train_dynamic_loss_lora(
             selection_model_checksum = trainable_model_checksum(model)
             losses: np.ndarray | None = None
             confidence: np.ndarray | None = None
+            selection_logits: np.ndarray | None = None
             loss_selected_mask: np.ndarray | None = None
             proto_pass_mask = None
             current_proto_scores: np.ndarray | None = proto_scores
@@ -595,18 +696,24 @@ def train_dynamic_loss_lora(
             suspicious_mask: np.ndarray | None = None
             dual_evidence_strata: DualEvidenceStrata | None = None
             fallback_count = 0
+            competition_snapshot_stats: dict[str, Any] | None = None
 
             # Dynamic Prototype Gate Only intentionally never runs this block:
             # no CE ranking is computed or used for its selection decision.
             if selection_strategy in {"loss_only", "loss_and_proto"}:
-                losses, confidence = compute_train_losses(
+                loss_result = compute_train_losses(
                     torch,
                     model,
                     loss_loader,
                     device,
                     len(train_labels),
                     bool(train_cfg.get("amp", True)),
+                    return_logits=competition_mode != "none",
                 )
+                if competition_mode != "none":
+                    losses, confidence, selection_logits = loss_result
+                else:
+                    losses, confidence = loss_result
                 if trainable_model_checksum(model) != selection_model_checksum:
                     raise RuntimeError("Model parameters changed during deterministic small-loss evaluation.")
                 if class_budget_schedule is not None:
@@ -765,6 +872,78 @@ def train_dynamic_loss_lora(
                     )
             else:
                 raise RuntimeError(f"Unsupported selection_strategy: {selection_strategy}")
+
+            if competition_mode != "none":
+                if (
+                    geometry_mode != "neighbor_margin"
+                    or neighbor_margin_snapshot is None
+                    or dual_evidence_strata is None
+                    or selection_logits is None
+                ):
+                    raise RuntimeError(
+                        "Competition-aware training requires the current Margin-Rank geometry, "
+                        "dual-evidence strata, and same-snapshot logits."
+                    )
+                geometry_competitors = geometry_competitor_ids_from_snapshot(
+                    neighbor_margin_snapshot,
+                    train_labels,
+                    candidate_mask,
+                    label_to_id,
+                )
+                logit_competitors, logit_margin = compute_logit_snapshot_competitors(
+                    selection_logits,
+                    observed_label_ids,
+                    candidate_mask,
+                )
+                strict_reliable = dual_evidence_strata.strict_reliable
+                if np.any(geometry_competitors[strict_reliable] < 0) or np.any(logit_competitors[strict_reliable] < 0):
+                    raise RuntimeError("A strict Reliable sample is missing a competition snapshot competitor.")
+                competition_eligible_mask = strict_reliable.copy()
+                competition_competitor_by_index = (
+                    geometry_competitors.copy()
+                    if competition_mode == "geometry"
+                    else logit_competitors.copy()
+                )
+                competition_snapshot_epoch = int(epoch)
+                competition_rows.extend(
+                    build_competition_snapshot_rows(
+                        method=method,
+                        dataset=dataset_name,
+                        seed=seed,
+                        epoch=epoch,
+                        labels=train_labels,
+                        candidate_mask=candidate_mask,
+                        strict_reliable_mask=strict_reliable,
+                        geometry_competitors=geometry_competitors,
+                        logit_competitors=logit_competitors,
+                        geometry_margin=neighbor_margin_snapshot.margin,
+                        logit_margin=logit_margin,
+                        classes=classes,
+                        competition_mode=competition_mode,
+                    )
+                )
+                competition_snapshot_history.append(
+                    {
+                        "selection_epoch": int(epoch),
+                        "eligible_mask": competition_eligible_mask.astype(np.uint8),
+                        "competitor_by_index": competition_competitor_by_index.astype(np.int64),
+                        "geometry_competitor_by_index": geometry_competitors.astype(np.int64),
+                        "logit_competitor_by_index": logit_competitors.astype(np.int64),
+                    }
+                )
+                strict_count = int(strict_reliable.sum())
+                strict_match_count = int(np.sum(
+                    strict_reliable & (geometry_competitors == logit_competitors)
+                ))
+                competition_snapshot_stats = {
+                    "competition_mode": competition_mode,
+                    "competition_snapshot_epoch": int(epoch),
+                    "competition_strict_reliable_count": strict_count,
+                    "competition_geometry_logit_match_count": strict_match_count,
+                    "competition_geometry_logit_match_ratio": safe_ratio(strict_match_count, strict_count),
+                    "competition_geometry_complete": "yes",
+                    "competition_logit_complete": "yes",
+                }
             update_rows.append(
                 build_update_row(
                     method,
@@ -799,6 +978,8 @@ def train_dynamic_loss_lora(
                     dual_evidence_strata=dual_evidence_strata,
                 )
             )
+            if competition_snapshot_stats is not None:
+                update_rows[-1].update(competition_snapshot_stats)
             selection_rows.extend(
                 build_selection_rows(
                     method,
@@ -974,6 +1155,10 @@ def train_dynamic_loss_lora(
                 "consistency_weight": float(consistency_weight),
                 "consistency_backward_mode": consistency_backward_mode,
                 "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
+                "competition_mode": competition_mode,
+                "competition_weight": float(competition_weight),
+                "competition_margin": float(competition_margin),
+                "competition_snapshot_history": competition_snapshot_history,
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -1005,6 +1190,10 @@ def train_dynamic_loss_lora(
                 "consistency_weight": float(consistency_weight),
                 "consistency_backward_mode": consistency_backward_mode,
                 "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
+                "competition_mode": competition_mode,
+                "competition_weight": float(competition_weight),
+                "competition_margin": float(competition_margin),
+                "competition_snapshot_history": competition_snapshot_history,
                 "checkpoint_protocol": checkpoint_protocol,
                 **protocol_metrics,
             },
@@ -1042,6 +1231,10 @@ def train_dynamic_loss_lora(
             "consistency_weight": float(consistency_weight),
             "consistency_backward_mode": consistency_backward_mode,
             "ambiguous_micro_batch_size": int(ambiguous_micro_batch_size),
+            "competition_mode": competition_mode,
+            "competition_weight": float(competition_weight),
+            "competition_margin": float(competition_margin),
+            "competition_snapshot_updates": len(competition_snapshot_history),
             "backbone_frozen": "yes",
             "lora_updated_before_selection": (
                 "yes" if any(row.get("lora_updated_since_initial") == "yes" for row in update_rows) else "no"
@@ -1057,6 +1250,7 @@ def train_dynamic_loss_lora(
         selection_rows=selection_rows,
         update_rows=update_rows,
         per_class_rows=per_class_rows,
+        competition_rows=competition_rows,
     )
 
 
@@ -1076,6 +1270,9 @@ def validate_dynamic_args(
     consistency_weight: float = 0.5,
     consistency_backward_mode: str = "joint",
     ambiguous_micro_batch_size: int = 20,
+    competition_mode: str = "none",
+    competition_weight: float = 0.2,
+    competition_margin: float = 1.0,
 ) -> None:
     if not 0.0 < retention_ratio <= 1.0:
         raise ValueError("retention_ratio must satisfy 0 < ratio <= 1.")
@@ -1106,6 +1303,12 @@ def validate_dynamic_args(
         )
     if int(ambiguous_micro_batch_size) <= 0:
         raise ValueError("ambiguous_micro_batch_size must be positive.")
+    if competition_mode not in COMPETITION_MODES:
+        raise ValueError(f"competition_mode must be one of {', '.join(COMPETITION_MODES)}.")
+    if not math.isfinite(float(competition_weight)) or float(competition_weight) < 0.0:
+        raise ValueError("competition_weight must be finite and non-negative.")
+    if not math.isfinite(float(competition_margin)):
+        raise ValueError("competition_margin must be finite.")
     if ambiguous_consistency and not (
         geometry_mode == "neighbor_margin" and not neighbor_margin_positive_only
     ):
@@ -1113,6 +1316,8 @@ def validate_dynamic_args(
             "ambiguous_consistency requires Margin-Rank "
             "(geometry_mode='neighbor_margin', neighbor_margin_positive_only=False)."
         )
+    if competition_mode != "none" and ambiguous_consistency:
+        raise ValueError("competition_mode and ambiguous_consistency are mutually exclusive.")
     if selection_strategy in {"proto_only", "loss_and_proto"} and proto_keep_ratio is None:
         raise ValueError("Prototype selection requires proto_keep_ratio.")
     if selection_strategy == "proto_only" and auto_proto_keep is not None:
@@ -1193,11 +1398,29 @@ def choose_auto_proto_keep_ratio(jaccard: float, rule: dict[str, float]) -> floa
     return float(rule["p_very_low"])
 
 
-def compute_train_losses(torch: Any, model: Any, loader: Any, device: str, total_train: int, amp: bool) -> tuple[np.ndarray, np.ndarray]:
+def compute_train_losses(
+    torch: Any,
+    model: Any,
+    loader: Any,
+    device: str,
+    total_train: int,
+    amp: bool,
+    *,
+    return_logits: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate observed-label loss, optionally retaining same-pass logits.
+
+    ``return_logits=False`` preserves the original PGDF path exactly.  The
+    opt-in competition branch needs snapshot logits at the identical eval
+    pass/time used for small-loss ranking; storing them here avoids a second
+    forward and leaves the default branch untouched.
+    """
     was_training = bool(model.training)
     model.eval()
     losses = np.full(total_train, np.nan, dtype=np.float32)
     confidence = np.full(total_train, np.nan, dtype=np.float32)
+    snapshot_logits: np.ndarray | None = None
+    evaluated = np.zeros(total_train, dtype=bool)
     try:
         with torch.no_grad():
             for images, labels, indices in progress_iter(loader, total=len(loader), desc="Dynamic loss eval"):
@@ -1211,9 +1434,159 @@ def compute_train_losses(torch: Any, model: Any, loader: Any, device: str, total
                 idx = indices.cpu().numpy().astype(np.int64)
                 losses[idx] = ce.detach().cpu().numpy().astype(np.float32)
                 confidence[idx] = conf.detach().cpu().numpy().astype(np.float32)
+                evaluated[idx] = True
+                if return_logits:
+                    if snapshot_logits is None:
+                        snapshot_logits = np.full(
+                            (total_train, int(logits.shape[1])), np.nan, dtype=np.float32
+                        )
+                    snapshot_logits[idx] = logits.detach().float().cpu().numpy().astype(np.float32)
     finally:
         model.train(was_training)
+    if return_logits:
+        if snapshot_logits is None or np.any(~np.isfinite(snapshot_logits[evaluated])):
+            raise RuntimeError("Selection-snapshot logits are missing or non-finite.")
+        return losses, confidence, snapshot_logits
     return losses, confidence
+
+
+def compute_logit_snapshot_competitors(
+    snapshot_logits: np.ndarray,
+    observed_label_ids: np.ndarray,
+    candidate_mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return fixed same-snapshot classifier hard negatives and logit gaps.
+
+    The selection evaluation is deterministic/eval-mode and occurs at the
+    same point as small-loss ranking.  Only candidates receive a competitor;
+    all excluded positions retain ``-1``/NaN and cannot enter training.
+    """
+    logits = np.asarray(snapshot_logits, dtype=np.float32)
+    observed = np.asarray(observed_label_ids, dtype=np.int64)
+    mask = np.asarray(candidate_mask, dtype=bool)
+    if logits.ndim != 2 or logits.shape[0] != len(observed):
+        raise ValueError("snapshot_logits must be [num_train_samples, num_classes].")
+    if mask.shape != observed.shape:
+        raise ValueError("candidate_mask must align with observed_label_ids.")
+    num_classes = int(logits.shape[1])
+    if num_classes < 2:
+        raise ValueError("Logit hard-negative competition requires at least two classes.")
+    candidate_idx = np.where(mask)[0]
+    if np.any(observed[candidate_idx] < 0) or np.any(observed[candidate_idx] >= num_classes):
+        raise ValueError("Observed label ids are outside the snapshot logit class range.")
+    if np.any(~np.isfinite(logits[candidate_idx])):
+        raise ValueError("Selection-snapshot logits contain NaN or Inf for candidates.")
+    masked = logits[candidate_idx].copy()
+    masked[np.arange(len(candidate_idx)), observed[candidate_idx]] = -np.inf
+    competitors = np.full(len(observed), -1, dtype=np.int64)
+    competitor_ids = np.argmax(masked, axis=1).astype(np.int64)
+    if np.any(competitor_ids == observed[candidate_idx]):
+        raise RuntimeError("Logit snapshot competitor must differ from the observed class.")
+    competitors[candidate_idx] = competitor_ids
+    gaps = np.full(len(observed), np.nan, dtype=np.float32)
+    gaps[candidate_idx] = (
+        logits[candidate_idx, observed[candidate_idx]]
+        - logits[candidate_idx, competitor_ids]
+    ).astype(np.float32)
+    return competitors, gaps
+
+
+def geometry_competitor_ids_from_snapshot(
+    snapshot: NeighborMarginSnapshot,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    label_to_id: dict[str, int],
+) -> np.ndarray:
+    """Map the production Neighbor-Margin competitor labels to head ids."""
+    labels = np.asarray(labels).astype(str)
+    mask = np.asarray(candidate_mask, dtype=bool)
+    result = np.full(len(labels), -1, dtype=np.int64)
+    for index in np.where(mask)[0]:
+        competitor = str(snapshot.competitor_class[int(index)])
+        if competitor not in label_to_id:
+            raise ValueError(f"Geometry competitor class {competitor!r} has no classifier id.")
+        competitor_id = int(label_to_id[competitor])
+        if competitor == str(labels[int(index)]):
+            raise RuntimeError("Geometry competitor must differ from observed class.")
+        result[int(index)] = competitor_id
+    return result
+
+
+def competition_softplus_margin_loss(
+    torch: Any,
+    logits: Any,
+    observed_labels: Any,
+    competitor_labels: Any,
+    margin: float,
+) -> Any:
+    """Shared stable pairwise margin loss for both competition modes."""
+    if logits.ndim != 2:
+        raise ValueError("Competition logits must be [batch, classes].")
+    if observed_labels.ndim != 1 or competitor_labels.ndim != 1:
+        raise ValueError("Competition labels must be one-dimensional.")
+    if len(observed_labels) != len(competitor_labels) or len(observed_labels) != int(logits.shape[0]):
+        raise ValueError("Competition logits and label vectors must have matching batch sizes.")
+    if len(observed_labels) == 0:
+        return logits.sum() * 0.0
+    num_classes = int(logits.shape[1])
+    if bool(torch.any(observed_labels < 0).item()) or bool(torch.any(observed_labels >= num_classes).item()):
+        raise ValueError("Observed competition label is outside the logit class range.")
+    if bool(torch.any(competitor_labels < 0).item()) or bool(torch.any(competitor_labels >= num_classes).item()):
+        raise ValueError("Competition competitor is outside the logit class range.")
+    if bool(torch.any(observed_labels == competitor_labels).item()):
+        raise ValueError("Competition competitor must differ from observed label.")
+    observed_logits = logits.gather(1, observed_labels[:, None]).squeeze(1)
+    competing_logits = logits.gather(1, competitor_labels[:, None]).squeeze(1)
+    return torch.nn.functional.softplus(float(margin) - (observed_logits - competing_logits)).mean()
+
+
+def build_competition_snapshot_rows(
+    *,
+    method: str,
+    dataset: str,
+    seed: int,
+    epoch: int,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    strict_reliable_mask: np.ndarray,
+    geometry_competitors: np.ndarray,
+    logit_competitors: np.ndarray,
+    geometry_margin: np.ndarray,
+    logit_margin: np.ndarray,
+    classes: list[str],
+    competition_mode: str,
+) -> list[dict[str, Any]]:
+    """Persist update-local competitor identities without any clean labels."""
+    rows: list[dict[str, Any]] = []
+    for index in np.where(np.asarray(candidate_mask, dtype=bool))[0]:
+        index = int(index)
+        geometry_id = int(geometry_competitors[index])
+        logit_id = int(logit_competitors[index])
+        observed = str(labels[index])
+        if geometry_id < 0 or logit_id < 0:
+            raise RuntimeError("Competition snapshot did not cover a candidate training sample.")
+        geometry_class = str(classes[geometry_id])
+        logit_class = str(classes[logit_id])
+        if geometry_class == observed or logit_class == observed:
+            raise RuntimeError("Competition snapshot includes an observed-class competitor.")
+        rows.append(
+            {
+                "method": method,
+                "dataset": dataset,
+                "seed": int(seed),
+                "selection_epoch": int(epoch),
+                "index": index,
+                "observed_label": observed,
+                "is_strict_reliable": "yes" if strict_reliable_mask[index] else "no",
+                "geometry_competitor": geometry_class,
+                "logit_competitor": logit_class,
+                "geometry_margin": float(geometry_margin[index]),
+                "logit_margin": float(logit_margin[index]),
+                "competitors_match": "yes" if geometry_id == logit_id else "no",
+                "competition_mode": competition_mode,
+            }
+        )
+    return rows
 
 
 def extract_current_lora_cls_features(

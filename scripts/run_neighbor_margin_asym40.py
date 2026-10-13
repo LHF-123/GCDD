@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
 
 from gcdd.data import build_verified_index
 from gcdd.io_utils import ensure_dir, write_csv, write_yaml
-from gcdd.lora_dynamic import CONSISTENCY_BACKWARD_MODES
+from gcdd.lora_dynamic import COMPETITION_MODES, CONSISTENCY_BACKWARD_MODES
 from tools import build_cub_asym_noise_index as cub_noise
 from tools import build_folder_asym_noise_index as folder_noise
 
@@ -136,6 +136,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="GPU micro-batch size for microbatch consistency mode (default: 20).",
     )
+    parser.add_argument(
+        "--competition-mode",
+        choices=COMPETITION_MODES,
+        help="Reliable-only competition auxiliary loss: none, geometry, or logit_snapshot.",
+    )
+    parser.add_argument("--competition-weight", type=float, help="Competition loss weight lambda_comp (default: 0.2).")
+    parser.add_argument("--competition-margin", type=float, help="Pairwise softplus margin delta (default: 1.0).")
     parser.add_argument("--python", default=sys.executable, help="Python executable used for the LoRA runner.")
     parser.add_argument("--dry-run", action="store_true", help="Print the complete plan without creating files or training.")
     return parser.parse_args()
@@ -274,6 +281,12 @@ def apply_machine_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> No
         cfg["pgdf"]["consistency_backward_mode"] = str(args.consistency_backward_mode)
     if getattr(args, "ambiguous_micro_batch_size", None) is not None:
         cfg["pgdf"]["ambiguous_micro_batch_size"] = int(args.ambiguous_micro_batch_size)
+    if getattr(args, "competition_mode", None) is not None:
+        cfg["pgdf"]["competition_mode"] = str(args.competition_mode)
+    if getattr(args, "competition_weight", None) is not None:
+        cfg["pgdf"]["competition_weight"] = float(args.competition_weight)
+    if getattr(args, "competition_margin", None) is not None:
+        cfg["pgdf"]["competition_margin"] = float(args.competition_margin)
     resolve_selection_variant(cfg)
 
 
@@ -319,6 +332,9 @@ def resolve_selection_variant(cfg: dict[str, Any]) -> None:
     consistency_weight = float(pgdf_cfg.setdefault("consistency_weight", 0.5))
     consistency_backward_mode = str(pgdf_cfg.setdefault("consistency_backward_mode", "joint"))
     ambiguous_micro_batch_size = int(pgdf_cfg.setdefault("ambiguous_micro_batch_size", 20))
+    competition_mode = str(pgdf_cfg.setdefault("competition_mode", "none"))
+    competition_weight = float(pgdf_cfg.setdefault("competition_weight", 0.2))
+    competition_margin = float(pgdf_cfg.setdefault("competition_margin", 1.0))
     if geometry_mode not in {"prototype_similarity", "neighbor_margin"}:
         raise ValueError("Standalone geometry_mode must be prototype_similarity or neighbor_margin.")
     if not isinstance(positive_only, bool) or not isinstance(use_fallback, bool) or not isinstance(ambiguous_consistency, bool):
@@ -332,6 +348,19 @@ def resolve_selection_variant(cfg: dict[str, Any]) -> None:
         )
     if ambiguous_micro_batch_size <= 0:
         raise ValueError("ambiguous_micro_batch_size must be positive.")
+    if competition_mode not in COMPETITION_MODES:
+        raise ValueError(f"competition_mode must be one of {', '.join(COMPETITION_MODES)}.")
+    if not np.isfinite(competition_weight) or competition_weight < 0.0:
+        raise ValueError("competition_weight must be finite and non-negative.")
+    if not np.isfinite(competition_margin):
+        raise ValueError("competition_margin must be finite.")
+    if competition_mode != "none" and ambiguous_consistency:
+        raise ValueError("Competition-aware loss and Ambiguous consistency are mutually exclusive.")
+    if competition_mode != "none" and not (geometry_mode == "neighbor_margin" and not positive_only and use_fallback):
+        raise ValueError(
+            "Competition-aware loss requires Margin-Rank "
+            "(neighbor_margin, no positive-only, PGDF fallback enabled)."
+        )
     if ambiguous_consistency:
         if not (geometry_mode == "neighbor_margin" and not positive_only and use_fallback):
             raise ValueError(
@@ -345,6 +374,10 @@ def resolve_selection_variant(cfg: dict[str, Any]) -> None:
         )
         cfg["protocol"]["name"] = f"neighbor_margin_margin_rank_ambiguous_consistency_{variant_suffix}_cyclic_asym40"
         cfg["protocol"]["variant_id"] = f"margin_rank_ambiguous_consistency_{variant_suffix}"
+        return
+    if competition_mode != "none":
+        cfg["protocol"]["name"] = f"neighbor_margin_margin_rank_competition_{competition_mode}_cyclic_asym40"
+        cfg["protocol"]["variant_id"] = f"margin_rank_competition_{competition_mode}"
         return
     if geometry_mode == "prototype_similarity":
         cfg["protocol"]["name"] = "pgdf_prototype_similarity_cyclic_asym40"
@@ -657,6 +690,14 @@ def run_lora_experiment(item: PreparedDataset, cfg: dict[str, Any], variant_root
                 "--ambiguous-micro-batch-size", str(cfg["pgdf"].get("ambiguous_micro_batch_size", 20)),
             ]
         )
+    if str(cfg["pgdf"].get("competition_mode", "none")) != "none":
+        command.extend(
+            [
+                "--competition-mode", str(cfg["pgdf"]["competition_mode"]),
+                "--competition-weight", str(cfg["pgdf"].get("competition_weight", 0.2)),
+                "--competition-margin", str(cfg["pgdf"].get("competition_margin", 1.0)),
+            ]
+        )
     local_repo = str(cfg["feature"].get("local_repo", ""))
     if local_repo:
         command.extend(["--local-repo", local_repo])
@@ -716,6 +757,7 @@ def print_plan(cfg: dict[str, Any], run_root: Path, args: argparse.Namespace) ->
         f"warmup={protocol['pgdf']['warmup_epochs']}, interval={protocol['pgdf']['update_interval']}, "
         f"geometry={cfg['pgdf']['geometry_mode']}, "
         f"ambiguous_consistency={cfg['pgdf'].get('ambiguous_consistency', False)}, "
+        f"competition_mode={cfg['pgdf'].get('competition_mode', 'none')}, "
         f"consistency_backward_mode={cfg['pgdf'].get('consistency_backward_mode', 'joint')}, "
         f"variant={protocol['variant_id']}",
         flush=True,

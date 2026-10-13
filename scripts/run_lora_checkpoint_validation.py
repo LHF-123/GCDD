@@ -32,7 +32,7 @@ from gcdd.checkpoint_validation import (
 from gcdd.budget_matching import ClassBudgetSchedule, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
-from gcdd.lora_dynamic import CONSISTENCY_BACKWARD_MODES, selection_update_epochs, train_dynamic_loss_lora
+from gcdd.lora_dynamic import COMPETITION_MODES, CONSISTENCY_BACKWARD_MODES, selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
@@ -169,6 +169,21 @@ def parse_args() -> argparse.Namespace:
         help="GPU micro-batch size only for --consistency-backward-mode microbatch (YAML/default: 20).",
     )
     parser.add_argument(
+        "--competition-mode",
+        choices=COMPETITION_MODES,
+        help="Reliable-only competition loss: none (default), geometry, or logit_snapshot.",
+    )
+    parser.add_argument(
+        "--competition-weight",
+        type=float,
+        help="Competition auxiliary-loss weight lambda_comp (YAML/default: 0.2).",
+    )
+    parser.add_argument(
+        "--competition-margin",
+        type=float,
+        help="Softplus pairwise logit margin delta (YAML/default: 1.0).",
+    )
+    parser.add_argument(
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
@@ -251,11 +266,20 @@ def main() -> None:
     geometry_mode, neighbor_margin_use_fallback, neighbor_margin_positive_only = resolve_pgdf_geometry_config(cfg)
     ambiguous_consistency, consistency_weight = resolve_ambiguous_consistency_config(cfg)
     consistency_backward_mode, ambiguous_micro_batch_size = resolve_consistency_execution_config(cfg)
+    competition_mode, competition_weight, competition_margin = resolve_competition_config(cfg)
     validate_ambiguous_consistency_request(
         methods,
         ambiguous_consistency,
         geometry_mode,
         neighbor_margin_positive_only,
+    )
+    validate_competition_request(
+        methods,
+        competition_mode,
+        ambiguous_consistency,
+        geometry_mode,
+        neighbor_margin_positive_only,
+        neighbor_margin_use_fallback,
     )
     jal_params = resolve_jal_params(cfg, args)
     noise_metadata = load_noise_metadata(noise_index)
@@ -272,6 +296,9 @@ def main() -> None:
         "consistency_weight": consistency_weight,
         "consistency_backward_mode": consistency_backward_mode,
         "ambiguous_micro_batch_size": ambiguous_micro_batch_size,
+        "competition_mode": competition_mode,
+        "competition_weight": competition_weight,
+        "competition_margin": competition_margin,
         "warmup_epochs": int(args.warmup_epochs),
         "update_interval": int(args.update_interval),
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
@@ -422,6 +449,9 @@ def main() -> None:
                 dynamic_consistency_weight = 0.5
                 dynamic_consistency_backward_mode = "joint"
                 dynamic_ambiguous_micro_batch_size = 20
+                dynamic_competition_mode = "none"
+                dynamic_competition_weight = 0.2
+                dynamic_competition_margin = 1.0
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -503,6 +533,9 @@ def main() -> None:
                     dynamic_consistency_weight = consistency_weight
                     dynamic_consistency_backward_mode = consistency_backward_mode
                     dynamic_ambiguous_micro_batch_size = ambiguous_micro_batch_size
+                    dynamic_competition_mode = competition_mode
+                    dynamic_competition_weight = competition_weight
+                    dynamic_competition_margin = competition_margin
                     method_name = (
                         f"DINOv2 LoRA PGDF-DynamicProto r={args.dynamic_ratio:g} p={args.fixed_p:g} "
                         f"geometry={dynamic_geometry_mode}"
@@ -522,6 +555,9 @@ def main() -> None:
                         if dynamic_ambiguous_consistency:
                             method_name += " + Ambiguous Consistency"
                             selection_mode += "_ambiguous_consistency"
+                        if dynamic_competition_mode != "none":
+                            method_name += f" + Competition-{dynamic_competition_mode}"
+                            selection_mode += f"_competition_{dynamic_competition_mode}"
                     else:
                         selection_mode = "pgdf_dynamic_lora_prototype_training_pool_dynamic_loss_and_prototype"
                 elif canonical_key == "fixed_proto_warmup_matched":
@@ -595,6 +631,9 @@ def main() -> None:
                     consistency_weight=dynamic_consistency_weight,
                     consistency_backward_mode=dynamic_consistency_backward_mode,
                     ambiguous_micro_batch_size=dynamic_ambiguous_micro_batch_size,
+                    competition_mode=dynamic_competition_mode,
+                    competition_weight=dynamic_competition_weight,
+                    competition_margin=dynamic_competition_margin,
                 )
                 # The clean/noisy mask is intentionally attached only after
                 # all model fitting and selection are complete.  It is never
@@ -610,6 +649,8 @@ def main() -> None:
                 write_csv(run_dir / "selection_rows.csv", result.selection_rows, selection_fields())
                 write_csv(run_dir / "selection_updates.csv", result.update_rows, update_fields())
                 write_csv(run_dir / "selection_per_class.csv", result.per_class_rows, per_class_fields())
+                if result.competition_rows:
+                    write_csv(run_dir / "competition_snapshot.csv", result.competition_rows, competition_snapshot_fields())
                 selection_record = str(run_dir / "selection_rows.csv")
                 result_row = finalize_result_row(
                     method_key,
@@ -1191,6 +1232,9 @@ def apply_lora_defaults(cfg: dict[str, Any]) -> None:
     cfg["pgdf"].setdefault("consistency_weight", 0.5)
     cfg["pgdf"].setdefault("consistency_backward_mode", "joint")
     cfg["pgdf"].setdefault("ambiguous_micro_batch_size", 20)
+    cfg["pgdf"].setdefault("competition_mode", "none")
+    cfg["pgdf"].setdefault("competition_weight", 0.2)
+    cfg["pgdf"].setdefault("competition_margin", 1.0)
 
 
 def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1231,6 +1275,12 @@ def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> None:
         cfg["pgdf"]["consistency_backward_mode"] = str(args.consistency_backward_mode)
     if args.ambiguous_micro_batch_size is not None:
         cfg["pgdf"]["ambiguous_micro_batch_size"] = int(args.ambiguous_micro_batch_size)
+    if args.competition_mode is not None:
+        cfg["pgdf"]["competition_mode"] = str(args.competition_mode)
+    if args.competition_weight is not None:
+        cfg["pgdf"]["competition_weight"] = float(args.competition_weight)
+    if args.competition_margin is not None:
+        cfg["pgdf"]["competition_margin"] = float(args.competition_margin)
 
 
 def resolve_pgdf_geometry_config(cfg: dict[str, Any]) -> tuple[str, bool, bool]:
@@ -1277,6 +1327,21 @@ def resolve_consistency_execution_config(cfg: dict[str, Any]) -> tuple[str, int]
     return mode, micro_batch_size
 
 
+def resolve_competition_config(cfg: dict[str, Any]) -> tuple[str, float, float]:
+    """Resolve the optional fixed-snapshot competition objective."""
+    pgdf_cfg = cfg.get("pgdf", {})
+    mode = str(pgdf_cfg.get("competition_mode", "none"))
+    if mode not in COMPETITION_MODES:
+        raise ValueError(f"pgdf.competition_mode must be one of {', '.join(COMPETITION_MODES)}.")
+    weight = float(pgdf_cfg.get("competition_weight", 0.2))
+    margin = float(pgdf_cfg.get("competition_margin", 1.0))
+    if not np.isfinite(weight) or weight < 0.0:
+        raise ValueError("pgdf.competition_weight must be finite and non-negative.")
+    if not np.isfinite(margin):
+        raise ValueError("pgdf.competition_margin must be finite.")
+    return mode, weight, margin
+
+
 def validate_ambiguous_consistency_request(
     methods: list[str],
     enabled: bool,
@@ -1293,6 +1358,29 @@ def validate_ambiguous_consistency_request(
         raise ValueError(
             "--ambiguous-consistency requires Margin-Rank: "
             "--geometry-mode neighbor_margin --no-neighbor-margin-positive-only."
+        )
+
+
+def validate_competition_request(
+    methods: list[str],
+    competition_mode: str,
+    ambiguous_consistency: bool,
+    geometry_mode: str,
+    neighbor_margin_positive_only: bool,
+    neighbor_margin_use_fallback: bool,
+) -> None:
+    """Fail closed: competition is defined only for Margin-Rank Reliable samples."""
+    if competition_mode == "none":
+        return
+    if ambiguous_consistency:
+        raise ValueError("--competition-mode cannot be combined with --ambiguous-consistency.")
+    canonical_methods = [canonical_method_key(method) for method in methods]
+    if canonical_methods != ["pgdf_dynamic_proto"]:
+        raise ValueError("--competition-mode requires --methods pgdf_dynamic_proto only.")
+    if not (geometry_mode == "neighbor_margin" and not neighbor_margin_positive_only and neighbor_margin_use_fallback):
+        raise ValueError(
+            "--competition-mode requires Margin-Rank: --geometry-mode neighbor_margin "
+            "--no-neighbor-margin-positive-only --neighbor-margin-use-fallback."
         )
 
 
@@ -1481,6 +1569,7 @@ def train_log_fields() -> list[str]:
         "supervised_ce_loss", "consistency_loss", "total_loss", "ambiguous_consistency_enabled", "consistency_computed", "consistency_reason", "consistency_weight",
         "consistency_backward_mode", "ambiguous_micro_batch_size", "optimizer_steps", "scheduler_steps", "ambiguous_batch_count", "consistency_micro_batch_count", "ambiguous_sample_exposures",
         "weak_prediction_max_probability_mean", "weak_prediction_entropy_mean", "weak_strong_prediction_agreement",
+        "competition_mode", "competition_weight", "competition_margin", "competition_loss", "weighted_competition_loss", "competition_computed", "competition_reason", "competition_batch_count", "competition_sample_exposures", "competition_snapshot_epoch",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
     ]
@@ -1497,6 +1586,7 @@ def result_fields() -> list[str]:
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
         "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
         "geometry_mode", "neighbor_margin_use_fallback", "neighbor_margin_positive_only", "ambiguous_consistency", "consistency_weight", "consistency_backward_mode", "ambiguous_micro_batch_size",
+        "competition_mode", "competition_weight", "competition_margin", "competition_snapshot_updates",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1540,6 +1630,7 @@ def update_fields() -> list[str]:
         "margin_mean", "margin_std", "margin_min", "margin_max", "margin_median", "mean_observed_similarity", "mean_competitor_similarity",
         "dual_evidence_reliable_count", "ambiguous_l_count", "ambiguous_g_count", "ambiguous_total_count", "dual_evidence_suspicious_count",
         "actual_active_count", "fallback_sample_count", "ambiguous_excluded_active_count", "ambiguous_for_consistency_count",
+        "competition_mode", "competition_snapshot_epoch", "competition_strict_reliable_count", "competition_geometry_logit_match_count", "competition_geometry_logit_match_ratio", "competition_geometry_complete", "competition_logit_complete",
         "reliable_purity", "reliable_noisy_retention", "suspicious_noise_ratio", "ambiguous_clean_ratio", "ambiguous_noisy_ratio",
         "prototype_candidate_purity", "neighbor_margin_candidate_purity",
     ]
@@ -1551,6 +1642,13 @@ def per_class_fields() -> list[str]:
         "proto_pass_count", "selected_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected",
         "neighbor_margin_candidate_count", "reliable_count", "ambiguous_count", "suspicious_count", "reliable_zero", "mean_neighbor_margin", "mean_observed_similarity", "mean_competitor_similarity",
+    ]
+
+
+def competition_snapshot_fields() -> list[str]:
+    return [
+        "method", "dataset", "seed", "selection_epoch", "index", "observed_label", "is_strict_reliable",
+        "geometry_competitor", "logit_competitor", "geometry_margin", "logit_margin", "competitors_match", "competition_mode",
     ]
 
 
