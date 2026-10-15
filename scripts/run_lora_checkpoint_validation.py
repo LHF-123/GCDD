@@ -36,6 +36,16 @@ from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.progress import log_stage
+from revision_experiments._paths import protect_output_root
+from revision_experiments.profiling import ProfilingMode, RunProfiler
+from revision_experiments.selection_logging import SelectionLogger
+from revision_experiments.training_integration import (
+    SelectionRunMetadata,
+    build_experiment_id,
+    build_code_provenance,
+    protect_monitored_training_output_dir,
+    write_instrumentation_outputs,
+)
 
 
 METHODS = (
@@ -60,6 +70,14 @@ ABLATION_METHODS = (
     "dynamic_proto_only",
     "pgdf_dynamic_proto",
     "fixed_proto_warmup_matched",
+    "pgdf_fusion_weighted",
+    "pgdf_fusion_union",
+    "pgdf_fusion_soft",
+)
+FUSION_ABLATION_METHODS = (
+    "pgdf_fusion_weighted",
+    "pgdf_fusion_union",
+    "pgdf_fusion_soft",
 )
 STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
 DYNAMIC_METHODS = (
@@ -73,6 +91,7 @@ DYNAMIC_METHODS = (
     "dynamic_proto_only",
     "pgdf_dynamic_proto",
     "fixed_proto_warmup_matched",
+    *FUSION_ABLATION_METHODS,
 )
 LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
@@ -90,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help=(
             "Use 'all' for the 13 primary methods, or an explicit subset. "
-            "proto_only, dynamic_budget_matched, dynamic_proto_only, and pgdf_dynamic_proto are explicit ablations; "
+            "proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, and pgdf_fusion_* are explicit ablations; "
             "dynamic aliases dynamic_r08."
         ),
     )
@@ -103,7 +122,7 @@ def parse_args() -> argparse.Namespace:
         "--pgdf-budget-root",
         help=(
             "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
-            "Required only by dynamic_budget_matched."
+            "Required by dynamic_budget_matched and pgdf_fusion_*; fusion methods read counts only, never PGDF sample identities."
         ),
     )
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Dynamic/PGDF full-pool warm-up epochs.")
@@ -123,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Evaluate official test only once on best_val.pt for single-branch methods. "
-            "Required for proto_only, dynamic_budget_matched, dynamic_proto_only, and pgdf_dynamic_proto."
+            "Required for proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, and pgdf_fusion_* methods."
         ),
     )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
@@ -149,6 +168,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dual-batch-size", type=int, default=16, help="Per-device batch size for two-branch Co-teaching/JoCoR runs.")
     parser.add_argument("--dual-grad-accum-steps", type=int, default=2, help="Gradient accumulation steps for two-branch runs.")
     parser.add_argument("--jocor-lambda", type=float, default=0.1, help="JoCoR symmetric-KL weight.")
+    parser.add_argument(
+        "--revision-profiling-mode",
+        choices=[mode.value for mode in ProfilingMode],
+        default=ProfilingMode.OFF.value,
+        help="Opt-in D1 monitoring for dynamic PGDF-family runs; default preserves historical behavior.",
+    )
+    parser.add_argument(
+        "--revision-selection-logging",
+        action="store_true",
+        help="Opt-in D2 selection facts for dynamic PGDF-family runs; never records oracle labels.",
+    )
+    parser.add_argument(
+        "--revision-output-root",
+        help="Required when either D1/D2 option is enabled; must be outside protected historical outputs/.",
+    )
     return parser.parse_args()
 
 
@@ -158,7 +192,19 @@ def main() -> None:
     noise_index = Path(args.noise_index)
     if not noise_index.exists():
         raise FileNotFoundError(f"Noise index does not exist: {noise_index}")
+    instrumentation_requested = (
+        args.revision_profiling_mode != ProfilingMode.OFF.value or bool(args.revision_selection_logging)
+    )
+    if instrumentation_requested and not args.revision_output_root:
+        raise ValueError("--revision-output-root is required when revision profiling or selection logging is enabled")
+    revision_output_root = (
+        protect_output_root(Path(args.revision_output_root)) if instrumentation_requested else None
+    )
     output_dir = Path(args.output_dir) if args.output_dir else input_dir / f"checkpoint_validation_all_methods_s{args.validation_seed}"
+    output_dir = protect_monitored_training_output_dir(
+        output_dir,
+        instrumentation_requested=instrumentation_requested,
+    )
     legacy_output_dir = input_dir / f"checkpoint_validation_s{args.validation_seed}"
     if output_dir.resolve() == legacy_output_dir.resolve() and output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(
@@ -191,6 +237,19 @@ def main() -> None:
         "posthoc_oracle_test": bool(args.posthoc_oracle_test),
         "official_test_selected_only": bool(args.official_test_selected_only),
         "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
+        "fusion_ablation": {
+            "prototype_source": "existing frozen PGDF prototype similarity",
+            "loss_source": "current-model full-training-pool CE loss",
+            "ranking_percentile": "within observed-label class; deterministic original-index tie-break",
+            "weighted_ranking": {"loss_weight": 0.5, "prototype_weight": 0.5},
+            "union_relaxed": {"candidate_set": "loss_union_prototype", "ranking": "max_signal_reliability"},
+            "soft_weighting": {
+                "loss_weight": 0.5,
+                "prototype_weight": 0.5,
+                "positive_weight_floor": 1.0e-6,
+                "class_normalization": "sum_to_reference_pgdf_budget",
+            },
+        },
         "noise_realization": noise_metadata,
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
         "two_branch": {
@@ -231,7 +290,8 @@ def main() -> None:
     # cache or graph reference; their geometry is rebuilt inside the LoRA
     # training loop from the current model state.
     graph_methods_requested = any(
-        method in STATIC_METHODS or method in {"pgdf_auto", "pgdf_fixed", "fixed_proto_warmup_matched"}
+        method in STATIC_METHODS
+        or method in {"pgdf_auto", "pgdf_fixed", "fixed_proto_warmup_matched", *FUSION_ABLATION_METHODS}
         for method in canonical_methods
     )
     if graph_methods_requested:
@@ -328,6 +388,7 @@ def main() -> None:
                 scheduler_retention_ratio: float | None = None
                 selection_strategy = "loss_only"
                 prototype_mode = "fixed"
+                fusion_mode: str | None = None
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -386,6 +447,46 @@ def main() -> None:
                         budget_schedule,
                         source_method="pgdf_dynamic_proto" if canonical_key == "dynamic_budget_matched_dynamic_proto" else "pgdf_fixed",
                     )
+                elif canonical_key in FUSION_ABLATION_METHODS:
+                    if pgdf_budget_root is None or pgdf_reference is None:
+                        raise RuntimeError("Fusion ablations require validated pgdf_fixed budgets and frozen prototype scores.")
+                    budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
+                    expected_updates = selection_update_epochs(
+                        int(run_cfg["lora_train"]["epochs"]),
+                        int(args.warmup_epochs),
+                        int(args.update_interval),
+                    )
+                    budget_schedule = load_pgdf_class_budget_schedule(
+                        budget_path,
+                        expected_seed=seed,
+                        expected_update_epochs=expected_updates,
+                        labels=data["train_labels"],
+                        candidate_mask=split.train_mask,
+                    )
+                    validate_budget_source_hyperparameters(
+                        budget_schedule,
+                        dynamic_ratio=float(args.dynamic_ratio),
+                        fixed_p=float(args.fixed_p),
+                    )
+                    fusion_specification = {
+                        "pgdf_fusion_weighted": ("fusion_weighted", "weighted_ranking", "equal-weight percentile ranking"),
+                        "pgdf_fusion_union": ("fusion_union", "union_relaxed", "union gate with best-rank ordering"),
+                        "pgdf_fusion_soft": ("fusion_soft", "soft_weighting", "continuous equal-weight reliability"),
+                    }
+                    selection_strategy, fusion_mode, fusion_description = fusion_specification[canonical_key]
+                    retention_ratio = float(budget_schedule.source_retention_ratio)
+                    proto_keep_ratio = float(budget_schedule.source_proto_keep_ratio)
+                    scheduler_retention_ratio = min(retention_ratio, proto_keep_ratio)
+                    method_name = (
+                        f"DINOv2 LoRA PGDF fusion ablation ({fusion_description}) "
+                        f"matched to frozen PGDF class budgets r={retention_ratio:g} p={proto_keep_ratio:g}"
+                    )
+                    proto_scores = pgdf_reference["proto_scores"]
+                    centroid_mask = None
+                    auto_proto_keep = None
+                    prototype_mode = "fixed"
+                    selection_mode = f"pgdf_fixed_budget_matched_{fusion_mode}"
+                    write_budget_source(run_dir, budget_schedule, source_method="pgdf_fixed")
                 elif canonical_key == "dynamic_proto_only":
                     # This is deliberately not the legacy static proto_only
                     # baseline.  It follows the requested full-pool warm-up
@@ -447,6 +548,32 @@ def main() -> None:
                     auto_proto_keep = None
                     selection_strategy = "loss_and_proto"
                     selection_mode = "pgdf_fixed_training_pool_dynamic_loss_and_prototype"
+                profiler: RunProfiler | None = None
+                selection_logger: SelectionLogger | None = None
+                selection_log_metadata: SelectionRunMetadata | None = None
+                if instrumentation_requested:
+                    instrumentation_experiment_id = build_experiment_id(
+                        dataset=str(run_cfg.get("dataset", {}).get("name", "")),
+                        noise_protocol=str(noise_metadata["noise_strategy"]),
+                        noise_seed=int(noise_metadata["noise_seed"]),
+                        method=canonical_key,
+                        training_seed=int(seed),
+                    )
+                    if args.revision_profiling_mode != ProfilingMode.OFF.value:
+                        profiler = RunProfiler(
+                            instrumentation_experiment_id,
+                            ProfilingMode(args.revision_profiling_mode),
+                            # The training function updates this after resolve_device("auto").
+                            device_type="cpu",
+                        )
+                    if args.revision_selection_logging:
+                        selection_logger = SelectionLogger(instrumentation_experiment_id)
+                        selection_log_metadata = SelectionRunMetadata(
+                            dataset=str(run_cfg.get("dataset", {}).get("name", "")),
+                            noise_protocol=str(noise_metadata["noise_strategy"]),
+                            noise_seed=int(noise_metadata["noise_seed"]),
+                            training_seed=int(seed),
+                        )
                 result = train_dynamic_loss_lora(
                     data["train_paths"],
                     data["train_labels"],
@@ -476,13 +603,54 @@ def main() -> None:
                     official_test_selected_only=bool(args.official_test_selected_only),
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
+                    fusion_mode=fusion_mode,
+                    profiler=profiler,
+                    selection_logger=selection_logger,
+                    selection_log_metadata=selection_log_metadata,
                 )
+                if revision_output_root is not None:
+                    code_provenance = build_code_provenance(ROOT)
+                    write_instrumentation_outputs(
+                        output_root=revision_output_root,
+                        profiler=profiler,
+                        selection_logger=selection_logger,
+                        run_metadata={
+                            "schema_version": "revision_training_integration_v1",
+                            "dataset": str(run_cfg.get("dataset", {}).get("name", "")),
+                            "noise_protocol": str(noise_metadata["noise_strategy"]),
+                            "noise_seed": int(noise_metadata["noise_seed"]),
+                            "training_seed": int(seed),
+                            "method": canonical_key,
+                            "profiling_mode": args.revision_profiling_mode,
+                            "selection_logging_enabled": bool(args.revision_selection_logging),
+                            "selection_strategy": selection_strategy,
+                            "prototype_mode": prototype_mode,
+                            "fusion_mode": fusion_mode or "",
+                            "retention_ratio": float(retention_ratio),
+                            "proto_keep_ratio": proto_keep_ratio,
+                            "warmup_epochs": int(args.warmup_epochs),
+                            "update_interval": int(args.update_interval),
+                            "code_commit": code_provenance["git_head"],
+                            "code_provenance": code_provenance,
+                        },
+                    )
                 if budget_schedule is not None:
-                    verify_observed_budget_match(result.per_class_rows, budget_schedule)
+                    if fusion_mode == "soft_weighting":
+                        verify_soft_weight_budget_match(result.fusion_per_class_rows, budget_schedule)
+                    else:
+                        verify_observed_budget_match(result.per_class_rows, budget_schedule)
                 all_updates.extend(result.update_rows)
                 write_csv(run_dir / "selection_rows.csv", result.selection_rows, selection_fields())
                 write_csv(run_dir / "selection_updates.csv", result.update_rows, update_fields())
                 write_csv(run_dir / "selection_per_class.csv", result.per_class_rows, per_class_fields())
+                if result.fusion_update_rows:
+                    write_csv(run_dir / "fusion_selection_updates.csv", result.fusion_update_rows, fusion_update_fields())
+                    write_csv(run_dir / "fusion_selection_rows.csv", result.fusion_sample_rows, fusion_sample_fields())
+                    write_csv(
+                        run_dir / "fusion_selection_per_class.csv",
+                        result.fusion_per_class_rows,
+                        fusion_per_class_fields(),
+                    )
                 selection_record = str(run_dir / "selection_rows.csv")
                 result_row = finalize_result_row(
                     method_key,
@@ -498,7 +666,13 @@ def main() -> None:
                             "budget_source_sha256": budget_schedule.source_sha256,
                             "budget_source_retention_ratio": budget_schedule.source_retention_ratio,
                             "budget_source_proto_keep_ratio": budget_schedule.source_proto_keep_ratio,
-                            "budget_match_verified": "yes",
+                            "budget_match_verified": (
+                                "effective_weight_sum_matches_reference_budget"
+                                if fusion_mode == "soft_weighting"
+                                else "selected_count_matches_reference_budget"
+                                if fusion_mode is not None
+                                else "yes"
+                            ),
                         }
                     )
             elif canonical_key in {"coteaching", "jocor"}:
@@ -757,12 +931,14 @@ def validate_budget_method_request(
     pgdf_budget_root: Path | None,
     seeds: list[int],
 ) -> None:
-    requested = bool(
-        {"dynamic_budget_matched", "dynamic_budget_matched_dynamic_proto"}
-        & {canonical_method_key(method) for method in methods}
-    )
+    budget_matched_methods = {
+        "dynamic_budget_matched",
+        "dynamic_budget_matched_dynamic_proto",
+        *FUSION_ABLATION_METHODS,
+    }
+    requested = bool(budget_matched_methods & {canonical_method_key(method) for method in methods})
     if requested and pgdf_budget_root is None:
-        raise ValueError("dynamic_budget_matched requires --pgdf-budget-root.")
+        raise ValueError("Budget-matched dynamic/fusion methods require --pgdf-budget-root.")
     if not requested:
         return
     if not pgdf_budget_root.is_dir():
@@ -872,6 +1048,41 @@ def verify_observed_budget_match(
             "Observed Dynamic selections do not exactly match the PGDF class budgets: "
             f"missing={missing[:5]}, extra={extra[:5]}, wrong_counts={wrong[:5]}."
         )
+
+
+def verify_soft_weight_budget_match(
+    fusion_per_class_rows: list[dict[str, Any]],
+    schedule: ClassBudgetSchedule,
+) -> None:
+    """Require soft class weights, rather than sample identities, to match PGDF budgets."""
+    observed: dict[tuple[int, str], tuple[int, float, int]] = {}
+    for row in fusion_per_class_rows:
+        key = (int(row["epoch"]), str(row["web_label"]))
+        if key in observed:
+            raise RuntimeError(f"Duplicate soft-weight fusion class record: {key}.")
+        normalized_sum = row.get("normalized_weight_sum", "")
+        nonzero_count = row.get("nonzero_weight_count", "")
+        if normalized_sum == "" or nonzero_count == "":
+            raise RuntimeError(f"Soft-weight fusion row is missing weight statistics: {key}.")
+        observed[key] = (int(row["reference_budget"]), float(normalized_sum), int(nonzero_count))
+    expected = {
+        (epoch, noisy_label): int(selected_count)
+        for epoch, class_counts in schedule.budgets.items()
+        for noisy_label, selected_count in class_counts.items()
+    }
+    if set(observed) != set(expected):
+        missing = sorted(set(expected) - set(observed))
+        extra = sorted(set(observed) - set(expected))
+        raise RuntimeError(f"Soft-weight fusion budget rows differ from PGDF schedule: missing={missing[:5]}, extra={extra[:5]}.")
+    for key, expected_budget in expected.items():
+        reference_budget, normalized_sum, nonzero_count = observed[key]
+        if reference_budget != expected_budget or not np.isclose(normalized_sum, expected_budget, rtol=0.0, atol=1.0e-8):
+            raise RuntimeError(
+                f"Soft-weight effective budget mismatch for {key}: "
+                f"reference={reference_budget}, normalized_sum={normalized_sum}, expected={expected_budget}."
+            )
+        if nonzero_count <= 0:
+            raise RuntimeError(f"Soft-weight fusion has no positive-weight samples for {key}.")
 
 
 def require_fresh_run_dir(run_dir: Path) -> None:
@@ -1033,6 +1244,7 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
         "dynamic_proto_only",
         "pgdf_dynamic_proto",
         "fixed_proto_warmup_matched",
+        *FUSION_ABLATION_METHODS,
     }
     selected_only_supported = (set(METHODS) | set(ABLATION_METHODS)) - {"coteaching", "jocor"}
     requested_strict = sorted(strict_methods & set(canonical))
@@ -1056,7 +1268,7 @@ def resolve_retention_ratio(method_key: str, pgdf_dynamic_ratio: float) -> float
         return 0.8
     if canonical == "dynamic_r09":
         return 0.9
-    if canonical in {"pgdf_auto", "pgdf_fixed", "pgdf_dynamic_proto"}:
+    if canonical in {"pgdf_auto", "pgdf_fixed", "pgdf_dynamic_proto", *FUSION_ABLATION_METHODS}:
         return float(pgdf_dynamic_ratio)
     raise ValueError(f"Method {method_key} has no dynamic retention ratio.")
 
@@ -1153,7 +1365,7 @@ def result_fields() -> list[str]:
         "last5_test_mean", "last5_test_std", "last5_test_top5_mean", "last5_test_top5_std", "oracle_best_test_epoch",
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
-        "selection_updates", "selection_strategy", "prototype_mode", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
+        "selection_updates", "selection_strategy", "prototype_mode", "fusion_mode", "optimizer_steps_attempted", "optimizer_steps_actual", "scheduler_steps_actual", "soft_weighting_effective_budget", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1199,6 +1411,33 @@ def per_class_fields() -> list[str]:
         "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "selection_strategy", "prototype_mode", "epoch", "web_label", "total_count", "loss_selected_count",
         "proto_pass_count", "selected_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected",
+    ]
+
+
+def fusion_update_fields() -> list[str]:
+    return [
+        "method", "dataset", "seed", "epoch", "fusion_mode", "reference_budget_total", "final_selected_total",
+        "strict_intersection_total", "union_candidate_total", "budget_fill_total", "final_strict_intersection_total",
+        "final_strict_union_total", "effective_weight_budget", "nonzero_weight_total",
+        "optimizer_steps_attempted_since_previous_update", "optimizer_steps_actual_since_previous_update",
+        "scheduler_steps_since_previous_update",
+    ]
+
+
+def fusion_per_class_fields() -> list[str]:
+    return [
+        "method", "dataset", "seed", "epoch", "fusion_mode", "web_label", "total_count", "loss_candidate_count",
+        "prototype_candidate_count", "strict_intersection_count", "union_candidate_count", "reference_budget",
+        "final_selected_count", "budget_fill_count", "final_strict_intersection_count", "final_strict_union_count",
+        "final_strict_jaccard", "raw_weight_sum", "normalized_weight_sum", "nonzero_weight_count",
+    ]
+
+
+def fusion_sample_fields() -> list[str]:
+    return [
+        "method", "dataset", "seed", "epoch", "fusion_mode", "index", "web_label", "loss_reliability",
+        "prototype_reliability", "equal_weight_reliability", "union_reliability", "loss_candidate",
+        "prototype_candidate", "strict_intersection_candidate", "union_candidate", "final_selected", "sample_weight",
     ]
 
 

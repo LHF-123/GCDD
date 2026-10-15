@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from .fusion_ablation import FUSION_MODES, FusionSelection, select_budget_matched_fusion, soft_weighted_mean
 from .features import resolve_device
 from .lora_training import (
     DINOv2LoRAClassifier,
@@ -28,6 +29,16 @@ from .lora_training import (
     trainable_state_dict,
 )
 from .progress import log_stage, progress_iter
+from revision_experiments.profiling import RunProfiler
+from revision_experiments.selection_logging import SelectionLogger
+from revision_experiments.training_integration import (
+    SelectionRunMetadata,
+    profiling_enabled,
+    profiling_memory_phase,
+    profiling_stage,
+    record_optimizer_and_scheduler_step,
+    record_selection_update,
+)
 
 
 @dataclass
@@ -40,6 +51,9 @@ class DynamicLossRunResult:
     selection_rows: list[dict[str, Any]]
     update_rows: list[dict[str, Any]]
     per_class_rows: list[dict[str, Any]]
+    fusion_update_rows: list[dict[str, Any]] = field(default_factory=list)
+    fusion_sample_rows: list[dict[str, Any]] = field(default_factory=list)
+    fusion_per_class_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -91,6 +105,10 @@ def train_dynamic_loss_lora(
     official_test_selected_only: bool = False,
     selection_strategy: str = "auto",
     prototype_mode: str = "fixed",
+    fusion_mode: str | None = None,
+    profiler: RunProfiler | None = None,
+    selection_logger: SelectionLogger | None = None,
+    selection_log_metadata: SelectionRunMetadata | None = None,
 ) -> DynamicLossRunResult:
     """Train DINOv2-LoRA with periodically updated class-wise small-loss selection.
 
@@ -101,6 +119,12 @@ def train_dynamic_loss_lora(
     from torch.utils.data import DataLoader
     from torchvision import transforms
 
+    if selection_logger is not None:
+        if selection_log_metadata is None:
+            raise ValueError("selection_log_metadata is required when selection_logger is enabled")
+        if selection_log_metadata.training_seed != int(seed):
+            raise ValueError("selection_log_metadata.training_seed must equal the training seed")
+
     # Preserve the original public call pattern: callers that supplied static
     # prototype scores previously received PGDF intersection selection without
     # an extra strategy argument.
@@ -110,6 +134,23 @@ def train_dynamic_loss_lora(
             if proto_scores is not None or auto_proto_keep is not None or prototype_mode == "dynamic_lora"
             else "loss_only"
         )
+    fusion_strategy_modes = {
+        "fusion_weighted": "weighted_ranking",
+        "fusion_union": "union_relaxed",
+        "fusion_soft": "soft_weighting",
+    }
+    if selection_strategy in fusion_strategy_modes:
+        expected_fusion_mode = fusion_strategy_modes[selection_strategy]
+        if fusion_mode != expected_fusion_mode:
+            raise ValueError(
+                f"{selection_strategy} requires fusion_mode={expected_fusion_mode!r}, got {fusion_mode!r}."
+            )
+    elif fusion_mode is not None:
+        raise ValueError("fusion_mode is only valid for an explicit fusion selection strategy.")
+    if fusion_mode is not None and fusion_mode not in FUSION_MODES:
+        raise ValueError(f"Unsupported fusion_mode={fusion_mode!r}.")
+    is_fusion_strategy = selection_strategy in fusion_strategy_modes
+
     validate_dynamic_args(
         retention_ratio,
         warmup_epochs,
@@ -141,10 +182,16 @@ def train_dynamic_loss_lora(
             raise ValueError("proto_scores contains NaN values for candidate samples.")
     if auto_proto_keep is not None and centroid_mask is None:
         raise ValueError("auto_proto_keep requires centroid_mask to compute dynamic/prototype overlap.")
-    if class_budget_schedule is not None and any(
-        value is not None for value in (centroid_mask, proto_scores, proto_keep_ratio, auto_proto_keep)
-    ):
-        raise ValueError("class_budget_schedule cannot be combined with prototype, centroid, or graph selection inputs.")
+    if class_budget_schedule is not None:
+        if selection_strategy in fusion_strategy_modes:
+            if centroid_mask is not None or auto_proto_keep is not None or proto_scores is None:
+                raise ValueError(
+                    "Budget-matched fusion requires fixed prototype scores and forbids centroid/auto-prototype routing."
+                )
+        elif any(value is not None for value in (centroid_mask, proto_scores, proto_keep_ratio, auto_proto_keep)):
+            raise ValueError("class_budget_schedule cannot be combined with prototype, centroid, or graph selection inputs.")
+    elif is_fusion_strategy:
+        raise ValueError("Budget-matched fusion requires a validated pgdf_fixed class_budget_schedule.")
     if selection_strategy == "proto_only" and class_budget_schedule is not None:
         raise ValueError("proto_only selection cannot use a dynamic small-loss class budget.")
     if prototype_mode == "dynamic_lora":
@@ -154,7 +201,11 @@ def train_dynamic_loss_lora(
             raise ValueError("dynamic_lora prototypes require a pre-declared fixed proto_keep_ratio.")
         if proto_keep_ratio is None:
             raise ValueError("dynamic_lora prototypes require proto_keep_ratio.")
-    elif prototype_mode == "fixed" and selection_strategy in {"proto_only", "loss_and_proto"} and proto_scores is None:
+    elif prototype_mode == "fixed" and selection_strategy in {
+        "proto_only",
+        "loss_and_proto",
+        *fusion_strategy_modes,
+    } and proto_scores is None:
         raise ValueError("fixed prototype selection requires proto_scores.")
 
     lora_cfg = cfg["lora"]
@@ -162,6 +213,15 @@ def train_dynamic_loss_lora(
     feature_cfg = cfg["feature"]
     dataset_name = str(cfg.get("dataset", {}).get("name", ""))
     device = resolve_device(torch, feature_cfg.get("device", "auto"))
+    if profiling_enabled(profiler):
+        # The runner may receive device="auto"; record the actual resolved
+        # device without changing the training choice or CUDA state.
+        profiler.device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    total_training_token = (
+        profiler.start_stage("total_training", phase="train_dynamic_loss_lora")
+        if profiling_enabled(profiler)
+        else None
+    )
     set_torch_seed(torch, seed)
 
     classes = sorted(set(train_labels.tolist()))
@@ -267,19 +327,30 @@ def train_dynamic_loss_lora(
     warmup_steps = int(total_steps * float(train_cfg.get("warmup_ratio", 0.1)))
     scheduler = build_scheduler(torch, optimizer, total_steps, warmup_steps, str(train_cfg.get("scheduler", "cosine")))
     scaler = torch.cuda.amp.GradScaler(enabled=bool(train_cfg.get("amp", True)) and device.startswith("cuda"))
-    criterion = torch.nn.CrossEntropyLoss()
+    use_soft_weighting = fusion_mode == "soft_weighting"
+    criterion = torch.nn.CrossEntropyLoss(reduction="none" if use_soft_weighting else "mean")
     logs: list[dict[str, Any]] = []
     selection_rows: list[dict[str, Any]] = []
     update_rows: list[dict[str, Any]] = []
     per_class_rows: list[dict[str, Any]] = []
+    fusion_update_rows: list[dict[str, Any]] = []
+    fusion_sample_rows: list[dict[str, Any]] = []
+    fusion_per_class_rows: list[dict[str, Any]] = []
     best_row: dict[str, Any] | None = None
     best_state: dict[str, Any] | None = None
     last5_states: list[tuple[int, dict[str, Any]]] = []
     oracle_states: list[tuple[int, dict[str, Any]]] = []
     selected_proto_keep_ratio = proto_keep_ratio
     auto_proto_jaccard: float | None = None
+    optimizer_steps_since_selection = 0
+    optimizer_steps_attempted_since_selection = 0
+    optimizer_steps_attempted_total = 0
+    optimizer_steps_actual_total = 0
+    scheduler_steps_actual_total = 0
 
     selected_mask = candidate_mask.copy()
+    soft_sample_weights = np.zeros(len(train_labels), dtype=np.float64)
+    soft_sample_weights[candidate_mask] = 1.0
     trainable_params = count_trainable_params(model)
     total_params = count_total_params(model)
     initial_trainable_checksum = trainable_model_checksum(model)
@@ -289,11 +360,17 @@ def train_dynamic_loss_lora(
         f"{selection_split_name}_images={len(eval_idx)}, retention_ratio="
         f"{'not_used' if selection_strategy == 'proto_only' else f'{retention_ratio:.3f}'}, "
         f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
-        f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, "
+        f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, fusion_mode={fusion_mode or 'none'}, "
         f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
     )
 
+    fit_time_token = (
+        profiler.start_stage("fit_time", phase="epoch_loop") if profiling_enabled(profiler) else None
+    )
     for epoch in range(1, epochs + 1):
+        epoch_token = (
+            profiler.start_stage("epoch", phase=f"epoch_{epoch}") if profiling_enabled(profiler) else None
+        )
         epoch_train_idx = np.where(selected_mask)[0]
         train_dataset = ImageSplitDataset(train_paths, train_labels, epoch_train_idx, label_to_id, train_transform, path_maps)
         train_loader = DataLoader(
@@ -305,26 +382,70 @@ def train_dynamic_loss_lora(
             drop_last=False,
         )
 
-        model.train()
         loss_sum = 0.0
-        seen = 0
-        progress = progress_iter(train_loader, total=len(train_loader), desc=f"Dynamic LoRA {method} seed={seed} epoch {epoch}/{epochs}")
-        for images, labels, _ in progress:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                logits = model(images)
-                loss = criterion(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            current_batch = int(images.shape[0])
-            loss_sum += float(loss.detach().cpu()) * current_batch
-            seen += current_batch
+        seen = 0.0
+        with profiling_memory_phase(profiler, "training"):
+            with profiling_stage(
+                profiler,
+                "optimizer_training",
+                phase=f"epoch_{epoch}",
+                data_loading_included=True,
+            ):
+                model.train()
+                progress = progress_iter(train_loader, total=len(train_loader), desc=f"Dynamic LoRA {method} seed={seed} epoch {epoch}/{epochs}")
+                for images, labels, sample_indices in progress:
+                    if profiling_enabled(profiler):
+                        profiler.record_training_batch()
+                    images = images.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    batch_weights = None
+                    if use_soft_weighting:
+                        batch_weight_values = soft_sample_weights[sample_indices.detach().cpu().numpy()]
+                        batch_weights = torch.as_tensor(batch_weight_values, device=device, dtype=torch.float32)
+                    with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                        logits = model(images)
+                        per_sample_loss = criterion(logits, labels)
+                        loss = (
+                            soft_weighted_mean(per_sample_loss, batch_weights.to(dtype=per_sample_loss.dtype))
+                            if batch_weights is not None
+                            else per_sample_loss
+                        )
+                    scaler.scale(loss).backward()
+                    track_step_counts = selection_strategy in fusion_strategy_modes or profiling_enabled(profiler)
+                    scale_before = (
+                        float(scaler.get_scale())
+                        if track_step_counts and scaler.is_enabled()
+                        else None
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    if track_step_counts:
+                        scale_after = float(scaler.get_scale()) if scaler.is_enabled() else None
+                        actual_update = record_optimizer_and_scheduler_step(
+                            profiler,
+                            epoch=epoch,
+                            amp_enabled=bool(scaler.is_enabled()),
+                            scale_before=scale_before,
+                            scale_after=scale_after,
+                        )
+                        optimizer_steps_attempted_total += 1
+                        optimizer_steps_actual_total += int(actual_update)
+                        scheduler_steps_actual_total += 1
+                        optimizer_steps_attempted_since_selection += 1
+                        optimizer_steps_since_selection += int(actual_update)
+                    current_batch = int(images.shape[0])
+                    if batch_weights is None:
+                        loss_sum += float(loss.detach().cpu()) * current_batch
+                        seen += current_batch
+                    else:
+                        batch_weight_sum = float(batch_weights.detach().sum().cpu())
+                        loss_sum += float(loss.detach().cpu()) * batch_weight_sum
+                        seen += batch_weight_sum
 
-        top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
+        with profiling_stage(profiler, "validation", phase=f"epoch_{epoch}", data_loading_included=True):
+            top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
         row = {
             "method": method,
             "seed": int(seed),
@@ -357,6 +478,11 @@ def train_dynamic_loss_lora(
         )
 
         if epoch < epochs and should_update_selection(epoch, warmup_epochs, update_interval):
+            selection_update_token = (
+                profiler.start_stage("selection_update_total", phase=f"epoch_{epoch}")
+                if profiling_enabled(profiler)
+                else None
+            )
             previous_mask = selected_mask.copy()
             selection_model_checksum = trainable_model_checksum(model)
             losses: np.ndarray | None = None
@@ -366,98 +492,195 @@ def train_dynamic_loss_lora(
             current_proto_scores: np.ndarray | None = proto_scores
             prototype_snapshot: DynamicPrototypeSnapshot | None = None
             fallback_count = 0
+            fusion_selection: FusionSelection | None = None
 
             # Dynamic Prototype Gate Only intentionally never runs this block:
             # no CE ranking is computed or used for its selection decision.
-            if selection_strategy in {"loss_only", "loss_and_proto"}:
-                losses, confidence = compute_train_losses(
-                    torch,
-                    model,
-                    loss_loader,
-                    device,
-                    len(train_labels),
-                    bool(train_cfg.get("amp", True)),
-                )
+            if selection_strategy in {"loss_only", "loss_and_proto", *fusion_strategy_modes}:
+                with profiling_memory_phase(profiler, "selection"):
+                    with profiling_stage(
+                        profiler,
+                        "selection_loss_forward",
+                        phase=f"epoch_{epoch}",
+                        data_loading_included=True,
+                    ):
+                        losses, confidence = compute_train_losses(
+                            torch,
+                            model,
+                            loss_loader,
+                            device,
+                            len(train_labels),
+                            bool(train_cfg.get("amp", True)),
+                        )
                 if trainable_model_checksum(model) != selection_model_checksum:
                     raise RuntimeError("Model parameters changed during deterministic small-loss evaluation.")
-                if class_budget_schedule is not None:
-                    loss_selected_mask = select_small_loss_classwise_by_budget(
-                        losses,
-                        train_labels,
-                        candidate_mask,
-                        class_budget_schedule[epoch],
-                    )
-                else:
-                    loss_selected_mask = select_small_loss_classwise(
-                        losses, train_labels, candidate_mask, retention_ratio
-                    )
+                with profiling_memory_phase(profiler, "selection"):
+                    with profiling_stage(profiler, "fusion_selection", phase=f"epoch_{epoch}"):
+                        if class_budget_schedule is not None and not is_fusion_strategy:
+                            loss_selected_mask = select_small_loss_classwise_by_budget(
+                                losses,
+                                train_labels,
+                                candidate_mask,
+                                class_budget_schedule[epoch],
+                            )
+                        else:
+                            loss_selected_mask = select_small_loss_classwise(
+                                losses, train_labels, candidate_mask, retention_ratio
+                            )
 
-            if selection_strategy in {"proto_only", "loss_and_proto"}:
+            if selection_strategy in {"proto_only", "loss_and_proto", *fusion_strategy_modes}:
                 if prototype_mode == "dynamic_lora":
-                    dynamic_features = extract_current_lora_cls_features(
-                        torch,
-                        model,
-                        loss_loader,
-                        device,
-                        len(train_labels),
-                        bool(train_cfg.get("amp", True)),
-                    )
+                    with profiling_memory_phase(profiler, "selection"):
+                        with profiling_stage(
+                            profiler,
+                            "selection_cls_forward",
+                            phase=f"epoch_{epoch}",
+                            data_loading_included=True,
+                        ):
+                            dynamic_features = extract_current_lora_cls_features(
+                                torch,
+                                model,
+                                loss_loader,
+                                device,
+                                len(train_labels),
+                                bool(train_cfg.get("amp", True)),
+                            )
                     if trainable_model_checksum(model) != selection_model_checksum:
                         raise RuntimeError("Model parameters changed during dynamic prototype feature extraction.")
-                    prototype_snapshot = build_dynamic_prototype_snapshot(
-                        dynamic_features,
-                        train_labels,
-                        candidate_mask,
-                        float(selected_proto_keep_ratio),
-                        selection_model_checksum,
-                    )
+                    with profiling_memory_phase(profiler, "selection"):
+                        with profiling_stage(profiler, "prototype_construction", phase=f"epoch_{epoch}"):
+                            prototype_snapshot = build_dynamic_prototype_snapshot(
+                                dynamic_features,
+                                train_labels,
+                                candidate_mask,
+                                float(selected_proto_keep_ratio),
+                                selection_model_checksum,
+                            )
                     current_proto_scores = prototype_snapshot.scores
                     proto_pass_mask = prototype_snapshot.gate_mask
                 else:
-                    if auto_proto_keep is not None and selected_proto_keep_ratio is None:
-                        if loss_selected_mask is None:
-                            raise RuntimeError("Auto prototype routing requires dynamic small-loss selection.")
-                        auto_proto_jaccard = mask_jaccard(loss_selected_mask, centroid_mask)
-                        selected_proto_keep_ratio = choose_auto_proto_keep_ratio(auto_proto_jaccard, auto_proto_keep)
-                        log_stage(
-                            f"[dynamic-loss] auto proto_keep_ratio selected: jaccard={auto_proto_jaccard:.4f}, "
-                            f"p={selected_proto_keep_ratio:.3f}"
-                        )
-                    if current_proto_scores is None or selected_proto_keep_ratio is None:
-                        raise RuntimeError("Prototype selection was requested without scores and a keep ratio.")
-                    proto_pass_mask = select_top_proto_classwise(
-                        current_proto_scores,
-                        train_labels,
-                        candidate_mask,
-                        selected_proto_keep_ratio,
-                    )
+                    with profiling_memory_phase(profiler, "selection"):
+                        with profiling_stage(profiler, "fusion_selection", phase=f"epoch_{epoch}"):
+                            if auto_proto_keep is not None and selected_proto_keep_ratio is None:
+                                if loss_selected_mask is None:
+                                    raise RuntimeError("Auto prototype routing requires dynamic small-loss selection.")
+                                auto_proto_jaccard = mask_jaccard(loss_selected_mask, centroid_mask)
+                                selected_proto_keep_ratio = choose_auto_proto_keep_ratio(auto_proto_jaccard, auto_proto_keep)
+                                log_stage(
+                                    f"[dynamic-loss] auto proto_keep_ratio selected: jaccard={auto_proto_jaccard:.4f}, "
+                                    f"p={selected_proto_keep_ratio:.3f}"
+                                )
+                            if current_proto_scores is None or selected_proto_keep_ratio is None:
+                                raise RuntimeError("Prototype selection was requested without scores and a keep ratio.")
+                            proto_pass_mask = select_top_proto_classwise(
+                                current_proto_scores,
+                                train_labels,
+                                candidate_mask,
+                                selected_proto_keep_ratio,
+                            )
 
-            if selection_strategy == "loss_only":
-                if loss_selected_mask is None:
-                    raise RuntimeError("loss_only selection did not produce a small-loss mask.")
-                selected_mask = loss_selected_mask
-            elif selection_strategy == "proto_only":
-                if proto_pass_mask is None:
-                    raise RuntimeError("proto_only selection did not produce a prototype gate.")
-                selected_mask = proto_pass_mask
-            elif selection_strategy == "loss_and_proto":
-                if loss_selected_mask is None or proto_pass_mask is None or losses is None:
-                    raise RuntimeError("loss_and_proto selection requires loss and prototype masks.")
-                fallback_count = count_classwise_intersection_fallbacks(
-                    loss_selected_mask,
-                    proto_pass_mask,
-                    train_labels,
-                    candidate_mask,
+            with profiling_memory_phase(profiler, "selection"):
+                with profiling_stage(profiler, "fusion_selection", phase=f"epoch_{epoch}"):
+                    if selection_strategy == "loss_only":
+                        if loss_selected_mask is None:
+                            raise RuntimeError("loss_only selection did not produce a small-loss mask.")
+                        selected_mask = loss_selected_mask
+                    elif selection_strategy == "proto_only":
+                        if proto_pass_mask is None:
+                            raise RuntimeError("proto_only selection did not produce a prototype gate.")
+                        selected_mask = proto_pass_mask
+                    elif selection_strategy == "loss_and_proto":
+                        if loss_selected_mask is None or proto_pass_mask is None or losses is None:
+                            raise RuntimeError("loss_and_proto selection requires loss and prototype masks.")
+                        fallback_count = count_classwise_intersection_fallbacks(
+                            loss_selected_mask,
+                            proto_pass_mask,
+                            train_labels,
+                            candidate_mask,
+                        )
+                        selected_mask = combine_loss_and_proto_classwise(
+                            loss_selected_mask,
+                            proto_pass_mask,
+                            losses,
+                            train_labels,
+                            candidate_mask,
+                        )
+                    elif is_fusion_strategy:
+                        if (
+                            fusion_mode is None
+                            or class_budget_schedule is None
+                            or losses is None
+                            or current_proto_scores is None
+                            or loss_selected_mask is None
+                            or proto_pass_mask is None
+                        ):
+                            raise RuntimeError("Budget-matched fusion requires loss/prototype scores, gates, and reference budgets.")
+                        fusion_selection = select_budget_matched_fusion(
+                            mode=fusion_mode,
+                            losses=losses,
+                            prototype_scores=current_proto_scores,
+                            labels=train_labels,
+                            candidate_mask=candidate_mask,
+                            loss_candidate_mask=loss_selected_mask,
+                            prototype_candidate_mask=proto_pass_mask,
+                            reference_budgets=class_budget_schedule[epoch],
+                            epoch=epoch,
+                        )
+                        selected_mask = fusion_selection.final_selected_mask
+                        if fusion_selection.sample_weights is not None:
+                            soft_sample_weights = fusion_selection.sample_weights
+                    else:
+                        raise RuntimeError(f"Unsupported selection_strategy: {selection_strategy}")
+            if selection_logger is not None:
+                assert selection_log_metadata is not None
+                record_selection_update(
+                    selection_logger,
+                    train_paths=train_paths,
+                    observed_labels=train_labels,
+                    candidate_mask=candidate_mask,
+                    losses=losses,
+                    prototype_scores=current_proto_scores,
+                    loss_candidate_mask=loss_selected_mask,
+                    prototype_candidate_mask=proto_pass_mask,
+                    final_selected_mask=selected_mask,
+                    epoch=epoch,
+                    selection_strategy=selection_strategy,
+                    model_state_identifier=selection_model_checksum,
+                    metadata=selection_log_metadata,
                 )
-                selected_mask = combine_loss_and_proto_classwise(
-                    loss_selected_mask,
-                    proto_pass_mask,
-                    losses,
-                    train_labels,
-                    candidate_mask,
+            if profiling_enabled(profiler):
+                profiler.record_selection_interval_steps(epoch, optimizer_steps_since_selection)
+            if fusion_selection is not None:
+                fusion_update = {
+                    "method": method,
+                    "dataset": dataset_name,
+                    "seed": int(seed),
+                    **fusion_selection.update_row,
+                    "optimizer_steps_attempted_since_previous_update": int(optimizer_steps_attempted_since_selection),
+                    "optimizer_steps_actual_since_previous_update": int(optimizer_steps_since_selection),
+                    "scheduler_steps_since_previous_update": int(optimizer_steps_attempted_since_selection),
+                }
+                fusion_update_rows.append(fusion_update)
+                fusion_sample_rows.extend(
+                    {
+                        "method": method,
+                        "dataset": dataset_name,
+                        "seed": int(seed),
+                        **sample_row,
+                    }
+                    for sample_row in fusion_selection.sample_rows
                 )
-            else:
-                raise RuntimeError(f"Unsupported selection_strategy: {selection_strategy}")
+                fusion_per_class_rows.extend(
+                    {
+                        "method": method,
+                        "dataset": dataset_name,
+                        "seed": int(seed),
+                        **class_row,
+                    }
+                    for class_row in fusion_selection.per_class_rows
+                )
+            optimizer_steps_since_selection = 0
+            optimizer_steps_attempted_since_selection = 0
             update_rows.append(
                 build_update_row(
                     method,
@@ -528,7 +751,14 @@ def train_dynamic_loss_lora(
                 f"selected={int(selected_mask.sum())}, proto_mode={prototype_mode}, "
                 f"prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}"
             )
+            if selection_update_token is not None:
+                profiler.stop_stage(selection_update_token)
 
+        if epoch_token is not None:
+            profiler.stop_stage(epoch_token)
+
+    if fit_time_token is not None:
+        profiler.stop_stage(fit_time_token)
     final_state = trainable_state_dict(model)
     protocol_metrics: dict[str, Any] = {}
     if test_loader is not None and best_state is not None and best_row is not None:
@@ -599,6 +829,12 @@ def train_dynamic_loss_lora(
                     "oracle_best_to_final_drop": float(oracle_top1 - final_test_top1),
                 }
             )
+    checkpoint_save_token = (
+        profiler.start_stage("checkpoint_save", phase="training_checkpoints")
+        if profiling_enabled(profiler)
+        and (checkpoint_path is not None or final_checkpoint_path is not None or last5_checkpoint_dir is not None)
+        else None
+    )
     if checkpoint_path is not None and best_state is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -655,6 +891,8 @@ def train_dynamic_loss_lora(
                 {"method": method, "seed": int(seed), "classes": classes, "state_dict": state, "epoch": int(epoch), "checkpoint_protocol": checkpoint_protocol},
                 last5_checkpoint_dir / f"epoch_{epoch:03d}.pt",
             )
+    if checkpoint_save_token is not None:
+        profiler.stop_stage(checkpoint_save_token)
 
     summary = summarize_lora_logs(method, seed, logs)
     summary.update(protocol_metrics)
@@ -673,13 +911,22 @@ def train_dynamic_loss_lora(
             "selection_updates": len(update_rows),
             "selection_strategy": selection_strategy,
             "prototype_mode": prototype_mode,
+            "fusion_mode": fusion_mode or "",
+            "optimizer_steps_attempted": optimizer_steps_attempted_total if is_fusion_strategy else "",
+            "optimizer_steps_actual": optimizer_steps_actual_total if is_fusion_strategy else "",
+            "scheduler_steps_actual": scheduler_steps_actual_total if is_fusion_strategy else "",
+            "soft_weighting_effective_budget": (
+                fusion_update_rows[-1].get("effective_weight_budget", "")
+                if fusion_mode == "soft_weighting" and fusion_update_rows
+                else ""
+            ),
             "backbone_frozen": "yes",
             "lora_updated_before_selection": (
                 "yes" if any(row.get("lora_updated_since_initial") == "yes" for row in update_rows) else "no"
             ),
         }
     )
-    return DynamicLossRunResult(
+    result = DynamicLossRunResult(
         logs=logs,
         summary=summary,
         trainable_modules=trainable_modules,
@@ -688,7 +935,13 @@ def train_dynamic_loss_lora(
         selection_rows=selection_rows,
         update_rows=update_rows,
         per_class_rows=per_class_rows,
+        fusion_update_rows=fusion_update_rows,
+        fusion_sample_rows=fusion_sample_rows,
+        fusion_per_class_rows=fusion_per_class_rows,
     )
+    if total_training_token is not None:
+        profiler.stop_stage(total_training_token)
+    return result
 
 
 def validate_dynamic_args(
@@ -709,11 +962,19 @@ def validate_dynamic_args(
         raise ValueError("Use either proto_keep_ratio or auto_proto_keep, not both.")
     if auto_proto_keep is not None:
         validate_auto_proto_keep(auto_proto_keep)
-    if selection_strategy not in {"loss_only", "proto_only", "loss_and_proto"}:
-        raise ValueError("selection_strategy must be loss_only, proto_only, or loss_and_proto.")
+    allowed_strategies = {
+        "loss_only",
+        "proto_only",
+        "loss_and_proto",
+        "fusion_weighted",
+        "fusion_union",
+        "fusion_soft",
+    }
+    if selection_strategy not in allowed_strategies:
+        raise ValueError(f"selection_strategy must be one of {sorted(allowed_strategies)}.")
     if prototype_mode not in {"fixed", "dynamic_lora"}:
         raise ValueError("prototype_mode must be fixed or dynamic_lora.")
-    if selection_strategy in {"proto_only", "loss_and_proto"} and proto_keep_ratio is None:
+    if selection_strategy in {"proto_only", "loss_and_proto", "fusion_weighted", "fusion_union", "fusion_soft"} and proto_keep_ratio is None:
         raise ValueError("Prototype selection requires proto_keep_ratio.")
     if selection_strategy == "proto_only" and auto_proto_keep is not None:
         raise ValueError("proto_only selection cannot use auto_proto_keep.")
