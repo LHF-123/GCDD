@@ -35,6 +35,11 @@ from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yam
 from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
+from gcdd.noise_generalization import (
+    GCCN_STRATEGY,
+    IDN_STRATEGY,
+    validate_noise_generalization_training_input,
+)
 from gcdd.progress import log_stage
 from revision_experiments._paths import protect_output_root
 from revision_experiments.profiling import ProfilingMode, RunProfiler
@@ -295,10 +300,18 @@ def main() -> None:
             "selection_metric": "arithmetic mean of branch A/B validation Top-1; not ensemble prediction",
         },
     }
-    write_yaml(output_dir / "resolved_config.yaml", cfg)
-
     log_stage("[1/5] Loading V1 train/test arrays and creating the shared clean validation manifest.")
     data = load_data(input_dir)
+    if noise_metadata["noise_strategy"] in {IDN_STRATEGY, GCCN_STRATEGY}:
+        cfg["checkpoint_validation"]["noise_generalization_input_validation"] = (
+            validate_noise_generalization_training_input(
+                manifest_path=noise_index,
+                train_paths=data["train_paths"],
+                train_labels=data["train_labels"],
+                labels_path=input_dir / "labels.npy",
+            )
+        )
+    write_yaml(output_dir / "resolved_config.yaml", cfg)
     clean_labels = load_clean_labels_from_noise_index(noise_index, data["train_paths"])
     split = build_or_load_fixed_validation_split(
         output_dir,

@@ -19,6 +19,7 @@ from gcdd.lora_dynamic import select_top_proto_classwise
 from gcdd.lora_training import summarize_lora_logs
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.lora_dynamic import train_dynamic_loss_lora
+from gcdd.noise_generalization import IDN_STRATEGY, validate_noise_generalization_training_input
 from scripts.run_lora_checkpoint_validation import (
     ABLATION_METHODS,
     METHODS,
@@ -56,8 +57,62 @@ class CheckpointValidationTests(unittest.TestCase):
         validate_official_test_request(["proto_only"], True)
         with self.assertRaisesRegex(ValueError, "requires --official-test-selected-only"):
             validate_official_test_request(["proto_only"], False)
-        with self.assertRaisesRegex(ValueError, "restricted"):
-            validate_official_test_request(["dynamic_r08"], True)
+        validate_official_test_request(["dynamic_r08"], True)
+
+    def test_dynamic_pgdf_is_explicit_dynamic_prototype_ablation(self) -> None:
+        self.assertIn("pgdf_dynamic_proto", ABLATION_METHODS)
+        self.assertNotIn("pgdf_dynamic_proto", METHODS)
+        validate_official_test_request(["pgdf_dynamic_proto"], True)
+
+    def test_noise_generalization_input_guard_rejects_mixed_observed_labels(self) -> None:
+        paths = ["train/a/0.jpg", "train/b/1.jpg"]
+        manifest_rows = [
+            {
+                "path": paths[0],
+                "split": "train",
+                "source_train_index": "0",
+                "web_label": "b",
+                "noisy_label": "b",
+                "noise_strategy": IDN_STRATEGY,
+            },
+            {
+                "path": paths[1],
+                "split": "train",
+                "source_train_index": "1",
+                "web_label": "a",
+                "noisy_label": "a",
+                "noise_strategy": IDN_STRATEGY,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = root / "noise_manifest.csv"
+            labels_path = root / "labels.npy"
+            import csv
+
+            with manifest_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(manifest_rows[0]))
+                writer.writeheader()
+                writer.writerows(manifest_rows)
+            labels = np.asarray(["b", "a"], dtype=str)
+            np.save(labels_path, labels)
+            metadata = validate_noise_generalization_training_input(
+                manifest_path=manifest_path,
+                train_paths=paths,
+                train_labels=labels,
+                labels_path=labels_path,
+            )
+            self.assertEqual("verified_path_and_source_index_aligned_observed_labels", metadata["status"])
+            self.assertEqual(IDN_STRATEGY, metadata["noise_strategy"])
+
+            np.save(labels_path, np.asarray(["a", "b"], dtype=str))
+            with self.assertRaisesRegex(ValueError, "labels.npy disagrees"):
+                validate_noise_generalization_training_input(
+                    manifest_path=manifest_path,
+                    train_paths=paths,
+                    train_labels=np.asarray(["a", "b"], dtype=str),
+                    labels_path=labels_path,
+                )
 
     def test_unified_result_schema_contains_required_fields(self) -> None:
         required = {
