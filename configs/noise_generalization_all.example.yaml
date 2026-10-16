@@ -1,0 +1,57 @@
+# Copy this file to a server-private path and replace every <...> placeholder.
+# Do not put real server paths or credentials into this tracked template.
+schema_version: 1
+
+runtime:
+  python_executable: "<SERVER_PYTHON_EXECUTABLE>"
+
+output:
+  noise_assets_root: "<SERVER_OUTPUT_ROOT>/outputs_major_revision/noise_generalization/assets"
+  training_outputs_root: "<SERVER_OUTPUT_ROOT>/outputs_major_revision/noise_generalization/training"
+
+instrumentation:
+  # Existing runner values: off, basic, detailed. D1/D2 need a separate output root.
+  profiling_mode: detailed
+  selection_logging: true
+  output_root: "<SERVER_OUTPUT_ROOT>/outputs_major_revision/noise_generalization/instrumentation"
+
+# These values are intentionally fixed by the formal protocol and are validated
+# by the launcher rather than used as free hyperparameter controls.
+formal:
+  protocols: [idn, gccn]
+  noise_rate: 0.4
+  noise_seed: 42
+  validation_seed: 20250726
+  training_seeds: [1, 42, 88]
+  epochs: 30
+  warmup_epochs: 5
+  update_interval: 5
+  dynamic_ratio: 0.8
+  fixed_p: 0.4
+
+# base_input_dir/resolved_config.yaml is the authoritative location for the
+# existing DINOv2 local_repo, LoRA, optimizer, batch-size, and scheduler settings.
+# training_config is optional and maps directly to the existing trainer --config;
+# leave it null unless an already-approved server override YAML is required.
+datasets:
+  cub:
+    display_name: "CUB-200-2011"
+    base_input_dir: "<CUB_BASE_V1_INPUT_DIR>"
+    source_noise_index: "<CUB_SOURCE_NOISE_INDEX_CSV>"
+    validation_dir: "<CUB_FIXED_VALIDATION_MANIFEST_DIR>"
+    path_maps: []
+    training_config: null
+  cars:
+    display_name: "Stanford Cars"
+    base_input_dir: "<CARS_BASE_V1_INPUT_DIR>"
+    source_noise_index: "<CARS_SOURCE_NOISE_INDEX_CSV>"
+    validation_dir: "<CARS_FIXED_VALIDATION_MANIFEST_DIR>"
+    path_maps: []
+    training_config: null
+  aircraft:
+    display_name: "FGVC-Aircraft"
+    base_input_dir: "<AIRCRAFT_BASE_V1_INPUT_DIR>"
+    source_noise_index: "<AIRCRAFT_SOURCE_NOISE_INDEX_CSV>"
+    validation_dir: "<AIRCRAFT_FIXED_VALIDATION_MANIFEST_DIR>"
+    path_maps: []
+    training_config: null
