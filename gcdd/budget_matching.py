@@ -29,6 +29,8 @@ def load_pgdf_class_budget_schedule(
     expected_update_epochs: Iterable[int],
     labels: np.ndarray,
     candidate_mask: np.ndarray,
+    expected_selection_strategy: str | None = None,
+    expected_prototype_mode: str | None = None,
 ) -> ClassBudgetSchedule:
     """Load only the actual PGDF class counts needed by budget matching.
 
@@ -50,6 +52,10 @@ def load_pgdf_class_budget_schedule(
         for label in expected_classes
     }
     required = {"seed", "epoch", "web_label", "total_count", "selected_count"}
+    if expected_selection_strategy is not None:
+        required.add("selection_strategy")
+    if expected_prototype_mode is not None:
+        required.add("prototype_mode")
     parsed: dict[tuple[int, str], dict[str, Any]] = {}
     retention_ratios: set[float] = set()
     proto_keep_ratios: set[float] = set()
@@ -88,6 +94,19 @@ def load_pgdf_class_budget_schedule(
                 raise ValueError(
                     f"Invalid PGDF selected_count={selected_count} for class "
                     f"{noisy_label!r} with total_count={total_count}."
+                )
+            if (
+                expected_selection_strategy is not None
+                and row.get("selection_strategy") != expected_selection_strategy
+            ):
+                raise ValueError(
+                    f"PGDF selection_strategy mismatch at {path}:{line_number}: "
+                    f"found {row.get('selection_strategy')!r}, expected {expected_selection_strategy!r}."
+                )
+            if expected_prototype_mode is not None and row.get("prototype_mode") != expected_prototype_mode:
+                raise ValueError(
+                    f"PGDF prototype_mode mismatch at {path}:{line_number}: "
+                    f"found {row.get('prototype_mode')!r}, expected {expected_prototype_mode!r}."
                 )
             key = (epoch, noisy_label)
             if key in parsed:

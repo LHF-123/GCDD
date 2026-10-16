@@ -29,7 +29,7 @@ from gcdd.checkpoint_validation import (
     build_validation_safe_static_selections,
     load_clean_labels_from_noise_index,
 )
-from gcdd.budget_matching import ClassBudgetSchedule, load_pgdf_class_budget_schedule
+from gcdd.budget_matching import ClassBudgetSchedule, file_sha256, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
 from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
@@ -73,12 +73,34 @@ ABLATION_METHODS = (
     "pgdf_fusion_weighted",
     "pgdf_fusion_union",
     "pgdf_fusion_soft",
+    "pgdf_dynamic_fusion_weighted",
+    "pgdf_dynamic_fusion_union",
+    "pgdf_dynamic_fusion_soft",
 )
-FUSION_ABLATION_METHODS = (
+FIXED_FUSION_ABLATION_METHODS = (
     "pgdf_fusion_weighted",
     "pgdf_fusion_union",
     "pgdf_fusion_soft",
 )
+DYNAMIC_FUSION_ABLATION_METHODS = (
+    "pgdf_dynamic_fusion_weighted",
+    "pgdf_dynamic_fusion_union",
+    "pgdf_dynamic_fusion_soft",
+)
+FUSION_ABLATION_METHODS = (
+    *FIXED_FUSION_ABLATION_METHODS,
+    *DYNAMIC_FUSION_ABLATION_METHODS,
+)
+FIXED_FUSION_SPECIFICATION = {
+    "pgdf_fusion_weighted": ("fusion_weighted", "weighted_ranking", "equal-weight percentile ranking"),
+    "pgdf_fusion_union": ("fusion_union", "union_relaxed", "union gate with best-rank ordering"),
+    "pgdf_fusion_soft": ("fusion_soft", "soft_weighting", "continuous equal-weight reliability"),
+}
+DYNAMIC_FUSION_SPECIFICATION = {
+    "pgdf_dynamic_fusion_weighted": ("fusion_weighted", "weighted_ranking", "equal-weight percentile ranking"),
+    "pgdf_dynamic_fusion_union": ("fusion_union", "union_relaxed", "union gate with best-rank ordering"),
+    "pgdf_dynamic_fusion_soft": ("fusion_soft", "soft_weighting", "continuous equal-weight reliability"),
+}
 STATIC_METHODS = ("full_gcdd", "centroid", "proto_only", "both_only", "gcdd_proto", "fine")
 DYNAMIC_METHODS = (
     "dynamic",
@@ -121,8 +143,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pgdf-budget-root",
         help=(
-            "Reference directory containing seed*/selection_per_class.csv from PGDF fixed-p. "
-            "Required by dynamic_budget_matched and pgdf_fusion_*; fusion methods read counts only, never PGDF sample identities."
+            "Reference directory containing seed*/selection_per_class.csv from the declared PGDF source. "
+            "Required by budget-matched methods and pgdf_fusion_*; fixed fusion requires pgdf_fixed and "
+            "pgdf_dynamic_fusion_* requires pgdf_dynamic_proto. Fusion methods read counts only, never PGDF sample identities."
         ),
     )
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Dynamic/PGDF full-pool warm-up epochs.")
@@ -215,6 +238,10 @@ def main() -> None:
 
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
+    canonical_methods = [canonical_method_key(method) for method in methods]
+    dynamic_fusion_requested = bool(set(canonical_methods) & set(DYNAMIC_FUSION_ABLATION_METHODS))
+    fixed_fusion_requested = bool(set(canonical_methods) & set(FIXED_FUSION_ABLATION_METHODS))
+    dynamic_budget_source_provenance = ""
     validate_official_test_request(methods, bool(args.official_test_selected_only))
     pgdf_budget_root = Path(args.pgdf_budget_root) if args.pgdf_budget_root else None
     validate_budget_method_request(methods, pgdf_budget_root, seeds)
@@ -238,7 +265,13 @@ def main() -> None:
         "official_test_selected_only": bool(args.official_test_selected_only),
         "pgdf_budget_root": str(pgdf_budget_root) if pgdf_budget_root is not None else "",
         "fusion_ablation": {
-            "prototype_source": "existing frozen PGDF prototype similarity",
+            "prototype_source": (
+                "method-specific mixed frozen and current-LoRA prototype similarity"
+                if dynamic_fusion_requested and fixed_fusion_requested
+                else "current LoRA-adapted CLS rebuilt at every selection update"
+                if dynamic_fusion_requested
+                else "existing frozen PGDF prototype similarity"
+            ),
             "loss_source": "current-model full-training-pool CE loss",
             "ranking_percentile": "within observed-label class; deterministic original-index tie-break",
             "weighted_ranking": {"loss_weight": 0.5, "prototype_weight": 0.5},
@@ -251,6 +284,7 @@ def main() -> None:
             },
         },
         "noise_realization": noise_metadata,
+        "noise_index_sha256": file_sha256(noise_index),
         "jal": {"alpha": jal_params["jal_alpha"], "beta": jal_params["jal_beta"], "a": jal_params["jal_a"], "eps": jal_params["jal_eps"]},
         "two_branch": {
             "remember_mode": "fixed",
@@ -275,6 +309,14 @@ def main() -> None:
     )
     if pgdf_budget_root is not None:
         validate_budget_source_manifest(pgdf_budget_root, split.metadata)
+        if dynamic_fusion_requested:
+            dynamic_budget_source_provenance = validate_dynamic_pgdf_budget_source_provenance(
+                pgdf_budget_root,
+                dataset_name=str(cfg.get("dataset", {}).get("name", "")),
+                noise_metadata=noise_metadata,
+                noise_index_sha256=file_sha256(noise_index),
+                noise_index_name=noise_index.name,
+            )
     validation_idx = np.where(split.validation_mask)[0]
     validation_paths = [data["train_paths"][int(index)] for index in validation_idx]
     validation_labels = clean_labels[validation_idx]
@@ -283,7 +325,6 @@ def main() -> None:
         f"official_test={len(data['test_paths'])}; test is not evaluated during fitting."
     )
 
-    canonical_methods = [canonical_method_key(method) for method in methods]
     pgdf_reference: dict[str, Any] | None = None
     static_selections: dict[str, dict[str, Any]] = {}
     # Dynamic-prototype ablations intentionally do not touch the frozen CLS
@@ -291,7 +332,12 @@ def main() -> None:
     # training loop from the current model state.
     graph_methods_requested = any(
         method in STATIC_METHODS
-        or method in {"pgdf_auto", "pgdf_fixed", "fixed_proto_warmup_matched", *FUSION_ABLATION_METHODS}
+        or method in {
+            "pgdf_auto",
+            "pgdf_fixed",
+            "fixed_proto_warmup_matched",
+            *FIXED_FUSION_ABLATION_METHODS,
+        }
         for method in canonical_methods
     )
     if graph_methods_requested:
@@ -447,7 +493,7 @@ def main() -> None:
                         budget_schedule,
                         source_method="pgdf_dynamic_proto" if canonical_key == "dynamic_budget_matched_dynamic_proto" else "pgdf_fixed",
                     )
-                elif canonical_key in FUSION_ABLATION_METHODS:
+                elif canonical_key in FIXED_FUSION_ABLATION_METHODS:
                     if pgdf_budget_root is None or pgdf_reference is None:
                         raise RuntimeError("Fusion ablations require validated pgdf_fixed budgets and frozen prototype scores.")
                     budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
@@ -468,12 +514,7 @@ def main() -> None:
                         dynamic_ratio=float(args.dynamic_ratio),
                         fixed_p=float(args.fixed_p),
                     )
-                    fusion_specification = {
-                        "pgdf_fusion_weighted": ("fusion_weighted", "weighted_ranking", "equal-weight percentile ranking"),
-                        "pgdf_fusion_union": ("fusion_union", "union_relaxed", "union gate with best-rank ordering"),
-                        "pgdf_fusion_soft": ("fusion_soft", "soft_weighting", "continuous equal-weight reliability"),
-                    }
-                    selection_strategy, fusion_mode, fusion_description = fusion_specification[canonical_key]
+                    selection_strategy, fusion_mode, fusion_description = FIXED_FUSION_SPECIFICATION[canonical_key]
                     retention_ratio = float(budget_schedule.source_retention_ratio)
                     proto_keep_ratio = float(budget_schedule.source_proto_keep_ratio)
                     scheduler_retention_ratio = min(retention_ratio, proto_keep_ratio)
@@ -487,6 +528,48 @@ def main() -> None:
                     prototype_mode = "fixed"
                     selection_mode = f"pgdf_fixed_budget_matched_{fusion_mode}"
                     write_budget_source(run_dir, budget_schedule, source_method="pgdf_fixed")
+                elif canonical_key in DYNAMIC_FUSION_ABLATION_METHODS:
+                    if pgdf_budget_root is None:
+                        raise RuntimeError("Dynamic-prototype fusion ablations require validated pgdf_dynamic_proto budgets.")
+                    budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
+                    expected_updates = selection_update_epochs(
+                        int(run_cfg["lora_train"]["epochs"]),
+                        int(args.warmup_epochs),
+                        int(args.update_interval),
+                    )
+                    budget_schedule = load_pgdf_class_budget_schedule(
+                        budget_path,
+                        expected_seed=seed,
+                        expected_update_epochs=expected_updates,
+                        labels=data["train_labels"],
+                        candidate_mask=split.train_mask,
+                        expected_selection_strategy="loss_and_proto",
+                        expected_prototype_mode="dynamic_lora",
+                    )
+                    validate_budget_source_hyperparameters(
+                        budget_schedule,
+                        dynamic_ratio=float(args.dynamic_ratio),
+                        fixed_p=float(args.fixed_p),
+                    )
+                    selection_strategy, fusion_mode, fusion_description = DYNAMIC_FUSION_SPECIFICATION[canonical_key]
+                    retention_ratio = float(budget_schedule.source_retention_ratio)
+                    proto_keep_ratio = float(budget_schedule.source_proto_keep_ratio)
+                    scheduler_retention_ratio = min(retention_ratio, proto_keep_ratio)
+                    method_name = (
+                        f"DINOv2 LoRA PGDF-DynamicProto fusion ablation ({fusion_description}) "
+                        f"matched to dynamic-prototype PGDF class budgets r={retention_ratio:g} p={proto_keep_ratio:g}"
+                    )
+                    proto_scores = None
+                    centroid_mask = None
+                    auto_proto_keep = None
+                    prototype_mode = "dynamic_lora"
+                    selection_mode = f"pgdf_dynamic_proto_budget_matched_{fusion_mode}"
+                    write_budget_source(
+                        run_dir,
+                        budget_schedule,
+                        source_method="pgdf_dynamic_proto",
+                        source_provenance_status=dynamic_budget_source_provenance,
+                    )
                 elif canonical_key == "dynamic_proto_only":
                     # This is deliberately not the legacy static proto_only
                     # baseline.  It follows the requested full-pool warm-up
@@ -984,6 +1067,57 @@ def validate_budget_source_manifest(pgdf_budget_root: Path, current_manifest: di
         )
 
 
+def validate_dynamic_pgdf_budget_source_provenance(
+    pgdf_budget_root: Path,
+    *,
+    dataset_name: str,
+    noise_metadata: dict[str, Any],
+    noise_index_sha256: str,
+    noise_index_name: str,
+) -> str:
+    """Require dynamic-fusion budgets to originate from the exact dynamic PGDF setup.
+
+    The manifest comparison above already proves the validation split and train
+    path pool. New reference runs additionally pin dataset and noise-index
+    content by SHA256; legacy submission-era sources receive an explicitly
+    downgraded filename-plus-manifest provenance status instead.
+    """
+    source_path = pgdf_budget_root.parent / "resolved_config.yaml"
+    if not source_path.exists():
+        raise FileNotFoundError(f"Dynamic PGDF budget source config is missing: {source_path}")
+    with source_path.open("r", encoding="utf-8") as handle:
+        source_cfg = yaml.safe_load(handle) or {}
+    source_checkpoint_cfg = source_cfg.get("checkpoint_validation", {})
+    source_noise = source_checkpoint_cfg.get("noise_realization")
+    source_hash = source_checkpoint_cfg.get("noise_index_sha256")
+    if str(source_cfg.get("dataset", {}).get("name", "")) != dataset_name:
+        raise ValueError("Dynamic PGDF budget source dataset does not match the current dataset.")
+    if not isinstance(source_noise, dict) or not isinstance(source_hash, str) or not source_hash:
+        # Submission-era runs predate content-hash logging.  They remain
+        # reusable only when their source V1 noise-index filename agrees with
+        # the requested one and the exact validation manifest has already
+        # matched above.  The downgraded evidence status is written into every
+        # new fusion run's budget_source.json rather than represented as an
+        # exact content-hash verification.
+        source_index_name = Path(str(source_cfg.get("dataset", {}).get("index_file", ""))).name
+        if not source_index_name or source_index_name != noise_index_name:
+            raise ValueError(
+                "Legacy dynamic PGDF budget source lacks content-hash provenance and its noise-index filename "
+                "does not match the current request. Run pgdf_dynamic_proto with the current revision entry point."
+            )
+        return "legacy_manifest_and_noise_index_filename"
+    fields = ("noise_strategy", "noise_ratio", "noise_seed", "mapping_type", "mapping_seed")
+    mismatches = [field for field in fields if source_noise.get(field) != noise_metadata.get(field)]
+    if source_hash != noise_index_sha256:
+        mismatches.append("noise_index_sha256")
+    if mismatches:
+        raise ValueError(
+            "Dynamic PGDF budget source does not match the current noise realization; "
+            f"mismatched fields: {sorted(mismatches)}."
+        )
+    return "exact_noise_index_sha256"
+
+
 def validate_budget_source_hyperparameters(
     schedule: ClassBudgetSchedule,
     *,
@@ -1001,7 +1135,13 @@ def validate_budget_source_hyperparameters(
         )
 
 
-def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule, *, source_method: str) -> None:
+def write_budget_source(
+    run_dir: Path,
+    schedule: ClassBudgetSchedule,
+    *,
+    source_method: str,
+    source_provenance_status: str = "",
+) -> None:
     """Freeze only PGDF class counts, never its selected sample identities or scores."""
     write_csv(
         run_dir / "budget_source.csv",
@@ -1014,6 +1154,7 @@ def write_budget_source(run_dir: Path, schedule: ClassBudgetSchedule, *, source_
             "source_path": schedule.source_path,
             "source_sha256": schedule.source_sha256,
             "source_method": source_method,
+            "source_provenance_status": source_provenance_status,
             "source_retention_ratio": schedule.source_retention_ratio,
             "source_proto_keep_ratio": schedule.source_proto_keep_ratio,
             "seed": schedule.seed,

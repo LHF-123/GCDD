@@ -120,11 +120,11 @@ def select_budget_matched_fusion(
     ``weighted_ranking`` ranks all class members by the equal-weight mean of
     loss and prototype percentile reliabilities.  ``union_relaxed`` first
     restricts to the union of the two original candidate sets and ranks by the
-    better of the two reliabilities; if that union is smaller than the frozen
+    better of the two reliabilities; if that union is smaller than the reference
     PGDF budget, the same rule fills from the remaining class members.  The
     ``soft_weighting`` branch retains all candidates and normalizes positive
     continuous equal-weight reliability scores so every class sums to the
-    frozen PGDF budget.
+    PGDF budget.
     """
     losses, proto, labels, candidate, loss_candidate, proto_candidate = _validate_inputs(
         mode,

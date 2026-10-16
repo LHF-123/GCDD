@@ -184,14 +184,14 @@ def train_dynamic_loss_lora(
         raise ValueError("auto_proto_keep requires centroid_mask to compute dynamic/prototype overlap.")
     if class_budget_schedule is not None:
         if selection_strategy in fusion_strategy_modes:
-            if centroid_mask is not None or auto_proto_keep is not None or proto_scores is None:
+            if centroid_mask is not None or auto_proto_keep is not None:
                 raise ValueError(
-                    "Budget-matched fusion requires fixed prototype scores and forbids centroid/auto-prototype routing."
+                    "Budget-matched fusion forbids centroid/auto-prototype routing."
                 )
         elif any(value is not None for value in (centroid_mask, proto_scores, proto_keep_ratio, auto_proto_keep)):
             raise ValueError("class_budget_schedule cannot be combined with prototype, centroid, or graph selection inputs.")
     elif is_fusion_strategy:
-        raise ValueError("Budget-matched fusion requires a validated pgdf_fixed class_budget_schedule.")
+        raise ValueError("Budget-matched fusion requires a validated PGDF class_budget_schedule.")
     if selection_strategy == "proto_only" and class_budget_schedule is not None:
         raise ValueError("proto_only selection cannot use a dynamic small-loss class budget.")
     if prototype_mode == "dynamic_lora":
