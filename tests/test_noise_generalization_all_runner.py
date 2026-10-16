@@ -25,8 +25,10 @@ from tools.run_noise_generalization_all import (
     WARMUP_EPOCHS,
     build_plan,
     build_training_command,
+    ensure_fixed_validation_manifest,
     is_task_complete,
     load_config,
+    materialize_training_validation_manifest,
     run_orchestration,
     validate_all_dataset_inputs,
 )
@@ -56,6 +58,8 @@ class NoiseGeneralizationAllRunnerTests(unittest.TestCase):
 
             self.assertTrue((config.training_outputs_root / "orchestration" / "run_plan.csv").is_file())
             self.assertFalse(any(config.noise_assets_root.rglob("noise_manifest.csv")) if config.noise_assets_root.exists() else False)
+            for dataset in config.datasets:
+                self.assertFalse((dataset.validation_dir / "validation_manifest.csv").exists())
 
     def test_missing_base_input_fails_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -71,6 +75,8 @@ class NoiseGeneralizationAllRunnerTests(unittest.TestCase):
             root = Path(tmp)
             config = load_config(_write_config(root))
             task = build_plan(config)[0]
+            ensure_fixed_validation_manifest(task.dataset, dry_run=False)
+            materialize_training_validation_manifest(task)
             task.run_dir.mkdir(parents=True)
             _write_complete_task(task)
             complete, _, _ = is_task_complete(task)
@@ -84,6 +90,27 @@ class NoiseGeneralizationAllRunnerTests(unittest.TestCase):
             self.assertFalse(complete)
             self.assertIn("noise_seed", detail)
 
+    def test_independent_validation_manifest_is_created_and_copied_to_training_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = load_config(_write_config(root))
+            dataset = config.datasets[0]
+            self.assertEqual("CREATED", ensure_fixed_validation_manifest(dataset, dry_run=False))
+            task = build_plan(config)[0]
+            materialize_training_validation_manifest(task)
+            for name in ("validation_manifest.csv", "validation_manifest.json"):
+                self.assertEqual(
+                    (dataset.validation_dir / name).read_bytes(),
+                    (task.run_root / name).read_bytes(),
+                )
+
+    def test_repository_config_does_not_depend_on_dynamic_fusion_outputs(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "configs" / "noise_generalization_all.yaml"
+        config = load_config(config_path)
+        for dataset in config.datasets:
+            self.assertIn("noise_generalization/fixed_validation", dataset.validation_dir.as_posix())
+            self.assertNotIn("pgdf_dynamic_ref", dataset.validation_dir.as_posix())
+
 
 def _write_config(root: Path) -> Path:
     datasets: dict[str, dict[str, object]] = {}
@@ -91,12 +118,13 @@ def _write_config(root: Path) -> Path:
         base = root / key / "base"
         validation = root / key / "validation"
         base.mkdir(parents=True)
-        validation.mkdir(parents=True)
-        for name in ("paths.txt", "eval_paths.txt", "eval_labels.npy", "features_cls.npy", "features_gap.npy", "features_top.npy", "resolved_config.yaml"):
+        paths = [f"/images/{label}/{index}.jpg" for label in ("A", "B") for index in range(2)]
+        labels = ["A", "A", "B", "B"]
+        (base / "paths.txt").write_text("\n".join(paths) + "\n", encoding="utf-8")
+        for name in ("eval_paths.txt", "eval_labels.npy", "features_cls.npy", "features_gap.npy", "features_top.npy", "resolved_config.yaml"):
             (base / name).write_bytes(b"test")
-        (root / key / "source.csv").write_text("path,split,clean_label\n", encoding="utf-8")
-        (validation / "validation_manifest.csv").write_text("index,path,clean_label,partition\n", encoding="utf-8")
-        (validation / "validation_manifest.json").write_text("{}\n", encoding="utf-8")
+        source_rows = ["path,split,clean_label", *[f"{path},train,{label}" for path, label in zip(paths, labels, strict=True)]]
+        (root / key / "source.csv").write_text("\n".join(source_rows) + "\n", encoding="utf-8")
         datasets[key] = {
             "display_name": display_name,
             "base_input_dir": str(base),

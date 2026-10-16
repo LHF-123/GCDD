@@ -27,8 +27,8 @@ REF=outputs_major_revision/pgdf_dynamic_ref_aircraft40;FUS=outputs_major_revisio
 ### 前置条件
 
 - 当前分支包含 `cbbd2c6` 及前序 IDN/GCCN 核心提交 `4492a9d`。
-- `configs/noise_generalization_all.yaml` 已按本文件上方动态融合命令的既有相对路径填写。其固定 validation manifest 指向 `outputs_major_revision/pgdf_dynamic_ref_{cub40,cars40,aircraft40}`，因此三个 dynamic PGDF reference 输出必须完整存在。
-- 三个数据集均已有完整 V1 输入、对齐的 source noise-index CSV、固定干净 validation manifest，以及服务器可访问的图像路径；若服务器图像根不同，才修改该 YAML 的 `path_maps`。
+- `configs/noise_generalization_all.yaml` 复用上方命令中的 V1 输入与 source noise-index，但不依赖动态融合或任何历史训练输出。调度器会在 `outputs_major_revision/noise_generalization/fixed_validation/<dataset>/` 独立创建或校验固定 clean validation manifest，并将同一份 manifest 写入 IDN/GCCN 的训练根目录。
+- 三个数据集均已有完整 V1 输入、对齐的 source noise-index CSV，以及服务器可访问的图像路径；若服务器图像根不同，才修改该 YAML 的 `path_maps`。
 - Python 环境具备 CUDA PyTorch、仓库 `requirements.txt` 依赖、可解析的本地 DINOv2 仓库/缓存与权重。
 - 三个新的输出根目录（noise assets、training、instrumentation）可写且互不重叠。
 

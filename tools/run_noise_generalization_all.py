@@ -32,7 +32,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from gcdd.checkpoint_validation import PROTOCOL_NAME
+from gcdd.checkpoint_validation import (
+    PROTOCOL_NAME,
+    build_or_load_fixed_validation_split,
+    load_clean_labels_from_noise_index,
+)
 from gcdd.noise_generalization import (
     GCCN_STRATEGY,
     IDN_STRATEGY,
@@ -222,6 +226,8 @@ def run_orchestration(config: ExperimentConfig, *, dry_run: bool, summarize_only
 
     validate_runtime(config)
     validate_all_dataset_inputs(config.datasets)
+    for dataset in config.datasets:
+        ensure_fixed_validation_manifest(dataset, dry_run=dry_run)
     write_global_metadata(config, plan)
     write_status_and_summary(config, plan)
     print_plan(config, plan, dry_run=dry_run)
@@ -301,12 +307,65 @@ def validate_all_dataset_inputs(datasets: Iterable[DatasetSpec]) -> None:
             raise FileNotFoundError(f"{dataset.key}: base V1 input is incomplete: {missing}")
         if not dataset.source_noise_index.is_file():
             raise FileNotFoundError(f"{dataset.key}: source_noise_index is missing: {dataset.source_noise_index}")
-        for name in ("validation_manifest.csv", "validation_manifest.json"):
-            path = dataset.validation_dir / name
-            if not path.is_file():
-                raise FileNotFoundError(f"{dataset.key}: fixed validation manifest is missing: {path}")
         if dataset.training_config is not None and not dataset.training_config.is_file():
             raise FileNotFoundError(f"{dataset.key}: training_config is missing: {dataset.training_config}")
+
+
+def ensure_fixed_validation_manifest(dataset: DatasetSpec, *, dry_run: bool) -> str:
+    """Create or validate the protocol-owned fixed clean validation split.
+
+    This is deliberately independent of every training result, including the
+    dynamic-prototype fusion references.  It uses only source-train paths and
+    clean labels from the source noise index, which is the established
+    ``fixed_clean_validation_v1`` construction rule.
+    """
+
+    train_paths = (dataset.base_input_dir / "paths.txt").read_text(encoding="utf-8").splitlines()
+    clean_labels = load_clean_labels_from_noise_index(dataset.source_noise_index, train_paths)
+    validation_csv, validation_json = validation_manifest_paths(dataset.validation_dir)
+    if validation_csv.is_file() != validation_json.is_file():
+        raise FileNotFoundError(
+            f"{dataset.key}: fixed validation manifest is only partially present under {dataset.validation_dir}."
+        )
+    if validation_csv.is_file():
+        build_or_load_fixed_validation_split(
+            dataset.validation_dir,
+            train_paths,
+            clean_labels,
+            validation_ratio=0.10,
+            validation_seed=VALIDATION_SEED,
+        )
+        print(f"REUSE VALIDATED FIXED VALIDATION dataset={dataset.key} path={dataset.validation_dir}", flush=True)
+        return "REUSED_VALIDATED"
+
+    for label in sorted(set(clean_labels.tolist())):
+        if int(np.sum(clean_labels == label)) < 2:
+            raise ValueError(
+                f"{dataset.key}: cannot construct fixed validation split; clean class {label!r} has fewer than two samples."
+            )
+    if dataset.validation_dir.exists() and any(dataset.validation_dir.iterdir()):
+        raise FileExistsError(
+            f"{dataset.key}: independent fixed validation directory is non-empty but has no manifest: "
+            f"{dataset.validation_dir}"
+        )
+    if dry_run:
+        print(f"PLAN CREATE FIXED VALIDATION dataset={dataset.key} path={dataset.validation_dir}", flush=True)
+        return "WILL_CREATE"
+
+    dataset.validation_dir.mkdir(parents=True, exist_ok=True)
+    build_or_load_fixed_validation_split(
+        dataset.validation_dir,
+        train_paths,
+        clean_labels,
+        validation_ratio=0.10,
+        validation_seed=VALIDATION_SEED,
+    )
+    print(f"CREATED FIXED VALIDATION dataset={dataset.key} path={dataset.validation_dir}", flush=True)
+    return "CREATED"
+
+
+def validation_manifest_paths(root: Path) -> tuple[Path, Path]:
+    return root / "validation_manifest.csv", root / "validation_manifest.json"
 
 
 def prepare_or_validate_artifact(config: ExperimentConfig, dataset: DatasetSpec, protocol: str, artifact_dir: Path) -> None:
@@ -421,6 +480,7 @@ def validate_noise_artifact(dataset: DatasetSpec, protocol: str, artifact_dir: P
 
 
 def run_or_skip_task(config: ExperimentConfig, task: Task, *, resume: bool) -> None:
+    materialize_training_validation_manifest(task)
     complete, reason, _ = is_task_complete(task)
     if complete:
         if not resume:
@@ -483,7 +543,43 @@ def build_training_command(config: ExperimentConfig, task: Task) -> list[str]:
     return command
 
 
+def materialize_training_validation_manifest(task: Task) -> None:
+    """Make each protocol training root use the canonical independent split."""
+
+    source_csv, source_json = validation_manifest_paths(task.dataset.validation_dir)
+    target_csv, target_json = validation_manifest_paths(task.run_root)
+    if not source_csv.is_file() or not source_json.is_file():
+        raise FileNotFoundError(
+            f"Canonical fixed validation manifest is unavailable for {task.dataset.key}: {task.dataset.validation_dir}"
+        )
+    if target_csv.is_file() != target_json.is_file():
+        raise FileNotFoundError(f"Training root has only one validation manifest file: {task.run_root}")
+    if target_csv.is_file():
+        for source, target in ((source_csv, target_csv), (source_json, target_json)):
+            if source.read_bytes() != target.read_bytes():
+                raise ValueError(
+                    f"Training root validation manifest differs from the canonical independent split: {target}"
+                )
+        return
+    if task.run_root.exists() and any(task.run_root.iterdir()):
+        raise FileExistsError(
+            f"Training root is non-empty but lacks the canonical fixed validation manifest: {task.run_root}"
+        )
+    task.run_root.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_csv, target_csv)
+    shutil.copy2(source_json, target_json)
+
+
 def is_task_complete(task: Task) -> tuple[bool, str, dict[str, Any] | None]:
+    source_csv, source_json = validation_manifest_paths(task.dataset.validation_dir)
+    target_csv, target_json = validation_manifest_paths(task.run_root)
+    if not source_csv.is_file() or not source_json.is_file():
+        return False, f"canonical fixed validation manifest is missing: {task.dataset.validation_dir}", None
+    if not target_csv.is_file() or not target_json.is_file():
+        return False, f"training root validation manifest is missing: {task.run_root}", None
+    for source, target in ((source_csv, target_csv), (source_json, target_json)):
+        if source.read_bytes() != target.read_bytes():
+            return False, f"training root validation manifest differs from canonical split: {target}", None
     required = [
         task.run_dir / "result.json",
         task.run_dir / "train_log.csv",

@@ -31,6 +31,9 @@ formal:
 
 # base_input_dir/resolved_config.yaml is the authoritative location for the
 # existing DINOv2 local_repo, LoRA, optimizer, batch-size, and scheduler settings.
+# validation_dir is a new protocol-owned output location. The launcher creates
+# or validates the fixed clean manifest there from paths.txt and source clean labels;
+# it must not point to a fusion or other historical training-result directory.
 # training_config is optional and maps directly to the existing trainer --config;
 # leave it null unless an already-approved server override YAML is required.
 datasets:
