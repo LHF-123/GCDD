@@ -1,0 +1,51 @@
+# Formal IDN/GCCN matrix under the repository layout used by the existing
+# dynamic-prototype fusion commands in train.md. Paths are resolved relative
+# to this configs/ directory, not to the caller's current working directory.
+schema_version: 1
+
+runtime:
+  python_executable: python
+
+output:
+  noise_assets_root: ../outputs_major_revision/noise_generalization/assets
+  training_outputs_root: ../outputs_major_revision/noise_generalization/training
+
+instrumentation:
+  profiling_mode: basic
+  selection_logging: true
+  output_root: ../outputs_major_revision/noise_generalization/instrumentation
+
+formal:
+  protocols: [idn, gccn]
+  noise_rate: 0.4
+  noise_seed: 42
+  validation_seed: 20250726
+  training_seeds: [1, 42, 88]
+  epochs: 30
+  warmup_epochs: 5
+  update_interval: 5
+  dynamic_ratio: 0.8
+  fixed_p: 0.4
+
+datasets:
+  cub:
+    display_name: CUB-200-2011
+    base_input_dir: ../outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42
+    source_noise_index: ../outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv
+    validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_cub40
+    path_maps: []
+    training_config: null
+  cars:
+    display_name: Stanford Cars
+    base_input_dir: ../outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42
+    source_noise_index: ../outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv
+    validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_cars40
+    path_maps: []
+    training_config: null
+  aircraft:
+    display_name: FGVC-Aircraft
+    base_input_dir: ../outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42
+    source_noise_index: ../outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv
+    validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_aircraft40
+    path_maps: []
+    training_config: null
