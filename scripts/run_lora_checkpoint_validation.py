@@ -237,6 +237,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--initialize-output-contract-only",
+        action="store_true",
+        help=(
+            "Write the resolved configuration and fixed validation manifest, then exit before graph construction, "
+            "model creation, or training. Intended only to initialize a future training root's immutable input contract."
+        ),
+    )
+    parser.add_argument(
         "--revision-profiling-mode",
         choices=[mode.value for mode in ProfilingMode],
         default=ProfilingMode.OFF.value,
@@ -400,6 +408,13 @@ def main() -> None:
         validation_ratio=float(args.validation_ratio),
         validation_seed=int(args.validation_seed),
     )
+    if args.initialize_output_contract_only:
+        print(
+            "OUTPUT CONTRACT INITIALIZED: resolved configuration and fixed validation manifest were written; "
+            "no graph, model, GPU, or training process was started.",
+            flush=True,
+        )
+        return
     if pgdf_budget_root is not None:
         validate_budget_source_manifest(pgdf_budget_root, split.metadata)
         if dynamic_fusion_requested:

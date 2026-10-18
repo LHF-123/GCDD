@@ -1,4 +1,4 @@
-"""Prepare or sequentially run the formal IDN/GCCN generalization matrix.
+"""Prepare, initialize, or sequentially run the formal IDN/GCCN generalization matrix.
 
 The launcher owns orchestration only.  Noise construction and model training
 remain in ``tools/prepare_noise_generalization.py`` and
@@ -140,6 +140,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Create or strictly validate the 6 IDN/GCCN noise assets, then stop before any training subprocess.",
     )
+    parser.add_argument(
+        "--initialize-reference-contracts-only",
+        action="store_true",
+        help=(
+            "Write and validate the six future 126-run input contracts, then stop before model construction or training. "
+            "Requires prepared IDN/GCCN assets."
+        ),
+    )
     parser.add_argument("--summarize-only", action="store_true", help="Read strictly complete runs only and refresh status/summary files without generating data or training.")
     parser.add_argument("--resume", dest="resume", action="store_true", default=True, help="Default: skip only strictly verified completed tasks.")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Fail if any task is already complete instead of skipping it.")
@@ -148,14 +156,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    selected_modes = sum(bool(value) for value in (args.dry_run, args.prepare_only, args.summarize_only))
+    selected_modes = sum(
+        bool(value)
+        for value in (
+            args.dry_run,
+            args.prepare_only,
+            args.initialize_reference_contracts_only,
+            args.summarize_only,
+        )
+    )
     if selected_modes > 1:
-        raise ValueError("Use at most one of --dry-run, --prepare-only, and --summarize-only.")
+        raise ValueError(
+            "Use at most one of --dry-run, --prepare-only, --initialize-reference-contracts-only, and --summarize-only."
+        )
     config = load_config(args.config)
     run_orchestration(
         config,
         dry_run=bool(args.dry_run),
         prepare_only=bool(args.prepare_only),
+        initialize_reference_contracts_only=bool(args.initialize_reference_contracts_only),
         summarize_only=bool(args.summarize_only),
         resume=bool(args.resume),
     )
@@ -231,6 +250,7 @@ def run_orchestration(
     *,
     dry_run: bool,
     prepare_only: bool,
+    initialize_reference_contracts_only: bool,
     summarize_only: bool,
     resume: bool,
 ) -> None:
@@ -252,6 +272,18 @@ def run_orchestration(
             for protocol in PROTOCOLS:
                 prepare_or_validate_artifact(config, dataset, protocol, artifact_directory(config, dataset, protocol))
         print("PREPARATION COMPLETE: 6 IDN/GCCN assets are ready; no training subprocess was started.", flush=True)
+        return
+    if initialize_reference_contracts_only:
+        for dataset in config.datasets:
+            for protocol in PROTOCOLS:
+                artifact_dir = artifact_directory(config, dataset, protocol)
+                prepare_or_validate_artifact(config, dataset, protocol, artifact_dir)
+                initialize_or_validate_reference_contract(config, dataset, protocol, artifact_dir)
+        print(
+            "REFERENCE CONTRACT INITIALIZATION COMPLETE: 6 future 126-run roots are input-validated; "
+            "no model or training subprocess was started.",
+            flush=True,
+        )
         return
 
     write_global_metadata(config, plan)
@@ -443,6 +475,87 @@ def build_prepare_command(config: ExperimentConfig, dataset: DatasetSpec, protoc
     if protocol == "idn":
         command.extend(["--idn-probability-modulation", str(IDN_PROBABILITY_MODULATION)])
     return command
+
+
+def initialize_or_validate_reference_contract(
+    config: ExperimentConfig,
+    dataset: DatasetSpec,
+    protocol: str,
+    artifact_dir: Path,
+) -> None:
+    """Materialize only the immutable input contract for a future 126-run root."""
+
+    reference_root = training_directory(config, dataset, protocol)
+    if reference_root.exists() and any(reference_root.iterdir()):
+        validate_reference_input_contract(reference_root, artifact_dir)
+        print(
+            f"REUSE VALIDATED REFERENCE CONTRACT dataset={dataset.key} protocol={protocol} path={reference_root}",
+            flush=True,
+        )
+        return
+
+    command = [
+        config.python_executable,
+        str(ROOT / "scripts" / "run_lora_checkpoint_validation.py"),
+        "--input-dir", str(artifact_dir / "prepared_input"),
+        "--noise-index", str(artifact_dir / "noise_manifest.csv"),
+        "--output-dir", str(reference_root),
+        "--methods", "all_noisy",
+        "--seeds", "1",
+        "--validation-ratio", "0.10",
+        "--validation-seed", str(VALIDATION_SEED),
+        "--epochs", str(EPOCHS),
+        "--warmup-epochs", str(WARMUP_EPOCHS),
+        "--update-interval", str(UPDATE_INTERVAL),
+        "--dynamic-ratio", str(DYNAMIC_RATIO),
+        "--fixed-p", str(FIXED_P),
+        "--no-posthoc-oracle-test",
+        "--initialize-output-contract-only",
+    ]
+    for path_map in dataset.path_maps:
+        command.extend(["--path-map", path_map])
+    log_path = config.noise_assets_root / "logs" / f"initialize_reference__{dataset.key}__{protocol}.log"
+    print(f"INITIALIZE REFERENCE CONTRACT dataset={dataset.key} protocol={protocol}", flush=True)
+    return_code = run_logged_command(command, log_path)
+    if return_code != 0:
+        raise RuntimeError(
+            f"Reference-contract initialization failed for {dataset.key}/{protocol} with exit code {return_code}. "
+            f"See {log_path}"
+        )
+    validate_reference_input_contract(reference_root, artifact_dir)
+    write_json(
+        reference_root / "reference_input_contract.json",
+        {
+            "status": "INITIALIZED_WITHOUT_MODEL_TRAINING",
+            "dataset": dataset.display_name,
+            "noise_protocol": protocol,
+            "noise_manifest_sha256": sha256_file(artifact_dir / "noise_manifest.csv"),
+            "validation_manifest_sha256": sha256_file(reference_root / "validation_manifest.csv"),
+            "validation_manifest_json_sha256": sha256_file(reference_root / "validation_manifest.json"),
+            "timestamp_utc": utc_now(),
+        },
+    )
+
+
+def validate_reference_input_contract(reference_root: Path, artifact_dir: Path) -> None:
+    """Fail closed unless a root proves the prepared realization and fixed split."""
+
+    required = (
+        reference_root / "resolved_config.yaml",
+        reference_root / "validation_manifest.csv",
+        reference_root / "validation_manifest.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Reference input contract is incomplete: {missing}")
+    payload = yaml.safe_load((reference_root / "resolved_config.yaml").read_text(encoding="utf-8")) or {}
+    configured_hash = str(payload.get("checkpoint_validation", {}).get("noise_index_sha256", ""))
+    realized_hash = sha256_file(artifact_dir / "noise_manifest.csv")
+    if configured_hash != realized_hash:
+        raise ValueError("Reference input contract noise-index SHA256 differs from the prepared realization")
+    for name in ("validation_manifest.csv", "validation_manifest.json"):
+        if sha256_file(reference_root / name) != sha256_file(artifact_dir / "protocol" / name):
+            raise ValueError(f"Reference input contract {name} differs from the prepared fixed validation split")
 
 
 def validate_noise_artifact(dataset: DatasetSpec, protocol: str, artifact_dir: Path) -> dict[str, Any]:

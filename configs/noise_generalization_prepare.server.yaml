@@ -7,12 +7,12 @@ runtime:
 
 output:
   noise_assets_root: /root/GCDD/outputs_major_revision/noise_generalization/assets
-  training_outputs_root: /root/GCDD-ido/outputs_major_revision/noise_generalization/training_unused_prepare_only
+  training_outputs_root: /root/GCDD/outputs_major_revision/noise_generalization/training
 
 instrumentation:
   profiling_mode: basic
   selection_logging: true
-  output_root: /root/GCDD-ido/outputs_major_revision/noise_generalization/instrumentation_unused_prepare_only
+  output_root: /root/GCDD-ido/outputs_major_revision/noise_generalization/instrumentation
 
 formal:
   protocols: [idn, gccn]
