@@ -1,0 +1,83 @@
+# IDO controlled-adaptation 9+18 matrix.  Paths are relative to this file, so
+# the same YAML layout works on Windows and Linux after a server-specific copy
+# replaces only root/path-map values.  It is intentionally not execution-ready
+# until an authorized maintainer sets protocol.protocol_frozen: true.
+schema_version: 1
+
+runtime:
+  python_executable: python
+
+output:
+  root: /root/GCDD-ido/outputs_major_revision/ido_controlled_batch
+  instrumentation_root: /root/GCDD-ido/outputs_major_revision/ido_controlled_batch_instrumentation
+
+protocol:
+  protocol_frozen: false
+  approval_note: "10+20 candidate only; WELoss broadcast correction and BMM fail-closed policy require external review."
+
+formal:
+  epochs: 30
+  stage1_epochs: 10
+  validation_seed: 20250726
+
+datasets:
+  cub:
+    display_name: CUB-200-2011
+    expected_classes: 200
+    path_maps: []
+    protocols:
+      cyclic:
+        input_dir: /root/GCDD/outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42
+        noise_index: /root/GCDD/outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv
+        validation_dir: /root/GCDD/outputs_major_revision/pgdf_ref_cub40
+        reference_126_training_root: null
+      idn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/cub/idn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/cub/idn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cub
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/cub/idn_r0p4_s42
+      gccn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/cub/gccn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/cub/gccn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cub
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/cub/gccn_r0p4_s42
+  cars:
+    display_name: Stanford Cars
+    expected_classes: 196
+    path_maps: []
+    protocols:
+      cyclic:
+        input_dir: /root/GCDD/outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42
+        noise_index: /root/GCDD/outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv
+        validation_dir: /root/GCDD/outputs_major_revision/pgdf_ref_cars40
+        reference_126_training_root: null
+      idn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/cars/idn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/cars/idn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cars
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/cars/idn_r0p4_s42
+      gccn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/cars/gccn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/cars/gccn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cars
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/cars/gccn_r0p4_s42
+  aircraft:
+    display_name: FGVC-Aircraft
+    expected_classes: 100
+    path_maps: []
+    protocols:
+      cyclic:
+        input_dir: /root/GCDD/outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42
+        noise_index: /root/GCDD/outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv
+        validation_dir: /root/GCDD/outputs_major_revision/pgdf_ref_aircraft40
+        reference_126_training_root: null
+      idn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/aircraft/idn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/aircraft/idn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/aircraft
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/aircraft/idn_r0p4_s42
+      gccn:
+        input_dir: /root/GCDD/outputs_major_revision/noise_generalization/assets/aircraft/gccn_r0p4_s42/prepared_input
+        noise_index: /root/GCDD/outputs_major_revision/noise_generalization/assets/aircraft/gccn_r0p4_s42/noise_manifest.csv
+        validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/aircraft
+        reference_126_training_root: /root/GCDD/outputs_major_revision/noise_generalization/training/aircraft/gccn_r0p4_s42
