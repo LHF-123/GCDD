@@ -53,3 +53,46 @@ python tools/run_noise_generalization_all.py --config configs/noise_generalizati
 ```bash
 python tools/run_noise_generalization_all.py --config configs/noise_generalization_all.yaml --summarize-only
 ```
+
+## IDO-style DINOv2-LoRA controlled adaptation（待独立预检，未启动训练）
+
+该实现接入固定 clean-validation 协议，但必须表述为
+`IDO-style DINOv2-B/14+LoRA controlled adaptation`，不是 IDO 官方
+ViT-B/16、ResNet 或 ConvNeXt 的原版等价复现。
+
+- BMM：按 observed-label class 拟合，与论文主方法和官方 `stage_2_class.py` 一致；不使用官方启动脚本实际调用的全局 BMM 路径。
+- BMM 退化：类别 wrong-event 全相同、非有限、component collapse、参数边界，或 EM 的两个分量发生严格均值反转时，记录类别、阶段、原因、统计量和可用的最后 BMM 参数，然后 **fail-closed 中止该 run**；不静默重排分量、改用全局 BMM，也不把 observed label 当作 clean-safe 回退。任何替代退化策略均须另行人工批准。
+- Label-wave：Stage 1 候选 checkpoint 均为 LoRA/head 张量的 deep clone，避免历史快照与后续优化共享存储。
+- 损失：保留官方 `utils/lnl_methods.py::WELoss` 的双视图 CE、logit MSE 与 confidence-weighted entropy。官方源码将 `confidence.unsqueeze(1)` 与 `[B]` entropy 相乘，导致跨样本 `[B,B]` 广播；本适配改为逐样本 `[B]`，因此准确名称是 `official-source WELoss adaptation with per-sample entropy broadcast fix`，不可称未修改 official reproduction，也不可替换为 BMM-weighted CE。
+- 预算：30 epoch 时按官方 Stage 1:Stage 2 = 5:10 固定比例缩放的候选为 10+20；这仍是 **PROTOCOL APPROVAL REQUIRED**，不是已冻结正式协议。总 epoch 不是 3 的倍数时，必须显式以 `--ido-stage1-epochs` 预注册 Stage 1 预算。
+
+单数据集、单 seed 的预检/正式入口（按实际数据集替换路径；不与正在执行的 IDN/GCCN 调度器共享输出目录）：
+
+```bash
+python scripts/run_lora_checkpoint_validation.py --input-dir <v1_input_dir> --noise-index <synthetic_noise_index.csv> --output-dir outputs_major_revision/ido_controlled_<dataset> --methods ido --seeds 1 --epochs 30 --validation-ratio 0.10 --validation-seed 20250726 --official-test-selected-only --no-posthoc-oracle-test --device cuda
+```
+
+每个 `seed*/` 会额外落盘 `stage1_wrong_event.csv`（不含 clean-label oracle）和
+`bmm_class_fits.csv`（每个 observed class、每轮 BMM 的状态及 fail-closed 原因）。解析后的
+`result.json` 还区分完整 Stage 1/2 成本、optimizer-loop、BMM、validation、official-test、checkpoint
+及 end-to-end D1 时间；其中 `d1_total_wall_seconds` 仅为 end-to-end 兼容别名，不能当作纯优化时间。
+
+在不访问 official test 的单 seed GPU pilot 中，必须显式使用下列 IDO 专用安全门；该输出不能作为
+正式批量完成结果或纳入三 seed 汇总：
+
+```bash
+python scripts/run_lora_checkpoint_validation.py --input-dir <v1_input_dir> --noise-index <synthetic_noise_index.csv> --output-dir <isolated_pilot_output> --methods ido --seeds 1 --epochs 30 --validation-ratio 0.10 --validation-seed 20250726 --no-posthoc-oracle-test --ido-pilot-no-official-test --device cuda --revision-profiling-mode basic --revision-output-root <isolated_pilot_d1_output>
+```
+
+正式批量任务为每一个 `ido/seedN` 写入不可变 `ido_task_contract.json`；完成判定会校验该契约、输入/验证划分/源码 SHA256、结果 schema、official-test 模式，以及三个可读取且 metadata 一致的 checkpoint。CPU 层还要求 checkpoint 仅含 DINOv2 `backbone.*.lora_*` 与 `head.*` 的有限 tensor、三份 key/shape layout 一致、分类 head 输出维度与 V1 observed-label 类别数一致；这不是实际 DINOv2 `load_state_dict` 的替代，后者仍由 GPU pilot 验收。
+`resolved_config.yaml` 固化架构差异、两阶段预算、BMM 退化策略和 WELoss 来源。
+
+完整矩阵只可通过显式执行授权启动；默认是不会启动训练的 dry-run：
+
+```bash
+python tools/run_ido_cyclic_all.py --config configs/ido_batch_all.yaml --dry-run
+python tools/run_ido_noise_generalization_all.py --config configs/ido_batch_all.yaml --dry-run
+python tools/run_ido_all.py --config configs/ido_batch_all.yaml --dry-run
+```
+
+`configs/ido_batch_all.yaml` 默认 `protocol.protocol_frozen: false`。只有人工冻结协议、在目标服务器通过 preflight 后，才可使用 `--execute`。预检会逐样本核对 V1 `paths.txt`/`labels.npy` 与 noise index 的 path/observed label；IDN/GCCN 还核对 `source_train_index`。中断任务不会覆盖或伪恢复，必须以 `--new-attempt --execute` 创建隔离 attempt；新 attempt 只会复用同一冻结 experiment signature 下唯一已完整验收的 seed，重跑未完成 seed。若发现多个已完成重复 seed，调度器会 fail-closed，而不会按成绩或目录顺序选择。

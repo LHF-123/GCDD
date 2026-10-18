@@ -1,15 +1,142 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from PIL import Image
 
 from .features import load_dinov2_model, resolve_device
 from .progress import log_stage, progress_iter
+
+
+# This catalog mirrors the linear modules exposed by the controlled
+# ``dinov2_vitb14`` backbone used in :func:`DINOv2LoRAClassifier.make`.  It is
+# deliberately separate from a checkpoint's own keys: batch completion audits
+# must compare a saved state against a frozen model-structure contract rather
+# than infer a supposedly valid architecture from the state being audited.
+DINO_VITB14_ARCHITECTURE = "dinov2_vitb14"
+DINO_VITB14_BLOCK_COUNT = 12
+DINO_VITB14_EMBED_DIM = 768
+DINO_VITB14_LINEAR_MODULES: tuple[tuple[str, str, int, int], ...] = (
+    ("attn.qkv", "qkv", DINO_VITB14_EMBED_DIM, 3 * DINO_VITB14_EMBED_DIM),
+    ("attn.proj", "proj", DINO_VITB14_EMBED_DIM, DINO_VITB14_EMBED_DIM),
+    ("mlp.fc1", "fc1", DINO_VITB14_EMBED_DIM, 4 * DINO_VITB14_EMBED_DIM),
+    ("mlp.fc2", "fc2", 4 * DINO_VITB14_EMBED_DIM, DINO_VITB14_EMBED_DIM),
+)
+
+
+def lora_module_matches_target(qualified_module_name: str, target_modules: Sequence[str]) -> bool:
+    """Use the exact target-pattern semantics shared by injection and audit."""
+    return any(target in qualified_module_name for target in target_modules)
+
+
+def build_dinov2_vitb14_lora_structure_contract(
+    *,
+    target_modules: Sequence[str],
+    rank: int,
+    num_classes: int,
+) -> dict[str, Any]:
+    """Return the immutable trainable-key contract for controlled DINOv2-B/14.
+
+    The qualified module catalog is tied to the current DINOv2-B/14 model
+    builder, while target matching calls the same helper used by
+    :func:`inject_lora`.  It therefore rejects fabricated block paths (for
+    example ``blocks.999``) instead of accepting any key with a plausible
+    suffix and matrix shape.
+    """
+    normalized_targets = tuple(str(item).strip() for item in target_modules if str(item).strip())
+    if not normalized_targets:
+        raise ValueError("At least one LoRA target module pattern is required.")
+    if rank <= 0:
+        raise ValueError("LoRA rank must be positive.")
+    if num_classes <= 1:
+        raise ValueError("Classifier must have at least two classes.")
+
+    lora_modules: list[dict[str, Any]] = []
+    for block_index in range(DINO_VITB14_BLOCK_COUNT):
+        for suffix, target_name, in_features, out_features in DINO_VITB14_LINEAR_MODULES:
+            backbone_module = f"blocks.{block_index}.{suffix}"
+            if not lora_module_matches_target(backbone_module, normalized_targets):
+                continue
+            state_prefix = f"backbone.{backbone_module}"
+            lora_modules.append(
+                {
+                    "backbone_module": backbone_module,
+                    "target_name": target_name,
+                    "lora_a_key": f"{state_prefix}.lora_a.weight",
+                    "lora_b_key": f"{state_prefix}.lora_b.weight",
+                    "lora_a_shape": [int(rank), int(in_features)],
+                    "lora_b_shape": [int(out_features), int(rank)],
+                }
+            )
+    if not lora_modules:
+        raise ValueError(
+            "No controlled DINOv2-B/14 Linear module matches "
+            f"target_modules={normalized_targets!r}."
+        )
+    return {
+        "schema_version": 1,
+        "contract_source": "frozen_dinov2_vitb14_catalog_shared_injection_matcher_v1",
+        "architecture": DINO_VITB14_ARCHITECTURE,
+        "block_count": DINO_VITB14_BLOCK_COUNT,
+        "embed_dim": DINO_VITB14_EMBED_DIM,
+        "target_modules": list(normalized_targets),
+        "rank": int(rank),
+        "head": {
+            "weight_key": "head.weight",
+            "bias_key": "head.bias",
+            "weight_shape": [int(num_classes), DINO_VITB14_EMBED_DIM],
+            "bias_shape": [int(num_classes)],
+        },
+        "lora_modules": lora_modules,
+    }
+
+
+def canonical_structure_sha256(contract: dict[str, Any]) -> str:
+    """Hash a JSON-safe model-structure record deterministically."""
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def capture_lora_runtime_structure(
+    model: Any,
+    *,
+    injected_modules: Sequence[str],
+    target_modules: Sequence[str],
+    rank: int,
+) -> dict[str, Any]:
+    """Capture actual post-injection trainable parameters for GPU-pilot audit.
+
+    Unlike the frozen contract above, this record is obtained from the live
+    model after :func:`inject_lora`; it is stored as diagnostic evidence and
+    must not be used to derive what a completed checkpoint is allowed to
+    contain.
+    """
+    trainable = [
+        {
+            "key": name,
+            "shape": [int(size) for size in parameter.shape],
+            "dtype": str(parameter.dtype),
+        }
+        for name, parameter in model.named_parameters()
+        if bool(parameter.requires_grad)
+    ]
+    return {
+        "schema_version": 1,
+        "record_source": "live_model_after_inject_lora",
+        # ``inject_lora`` returns ``named_modules`` traversal order.  Preserve
+        # it so the record can be compared to the canonical block order rather
+        # than losing that structural evidence through lexicographic sorting.
+        "injected_backbone_modules": [str(name) for name in injected_modules],
+        "target_modules": [str(item) for item in target_modules],
+        "rank": int(rank),
+        "trainable_parameters": sorted(trainable, key=lambda item: str(item["key"])),
+    }
 
 
 @dataclass
@@ -445,7 +572,7 @@ def inject_lora(torch: Any, module: Any, target_modules: list[str], rank: int, a
     for name, child in list(module.named_modules()):
         if not isinstance(child, torch.nn.Linear):
             continue
-        if not any(target in name for target in target_modules):
+        if not lora_module_matches_target(name, target_modules):
             continue
         parent, child_name = get_parent_module(module, name)
         setattr(parent, child_name, LoRALinear.make(torch, child, rank=rank, alpha=alpha, dropout=dropout))

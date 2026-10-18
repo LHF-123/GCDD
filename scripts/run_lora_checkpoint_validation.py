@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -32,6 +33,16 @@ from gcdd.checkpoint_validation import (
 from gcdd.budget_matching import ClassBudgetSchedule, file_sha256, load_pgdf_class_budget_schedule
 from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
+from gcdd.ido import (
+    BMMDegenerateError,
+    IDO_ADAPTATION_NAME,
+    IDO_BMM_SCOPE,
+    IDO_DEGENERATE_POLICY,
+    IDO_WAVE_SNAPSHOT_POLICY,
+    IDO_WELoss_SOURCE,
+    resolve_stage_budget,
+    train_ido_lora,
+)
 from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
@@ -68,6 +79,10 @@ METHODS = (
     "pgdf_auto",
     "pgdf_fixed",
 )
+# IDO is intentionally opt-in rather than part of ``all``.  It is a controlled
+# DINOv2-LoRA adaptation of an external method, not one of the frozen original
+# 13-method comparison runs or a PGDF ablation.
+CONTROLLED_ADAPTATION_METHODS = ("ido",)
 ABLATION_METHODS = (
     "proto_only",
     "dynamic_budget_matched",
@@ -125,7 +140,7 @@ LEGACY_METHOD_ALIASES = {"dynamic": "dynamic_r08"}
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run all 13 comparison methods with fixed clean validation checkpoint selection."
+        description="Run fixed-validation noisy-label baselines and explicit controlled adaptations."
     )
     parser.add_argument("--input-dir", required=True, help="V1 directory containing paths.txt, labels.npy, features_*.npy, and official test files.")
     parser.add_argument("--noise-index", required=True, help="Synthetic-noise index CSV containing clean_label for the original train split.")
@@ -137,7 +152,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use 'all' for the 13 primary methods, or an explicit subset. "
             "proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, and pgdf_fusion_* are explicit ablations; "
-            "dynamic aliases dynamic_r08."
+            "ido is an opt-in controlled adaptation; dynamic aliases dynamic_r08."
         ),
     )
     parser.add_argument("--seeds", default="1,42,88", help="Comma-separated model/dataloader seeds.")
@@ -197,10 +212,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dual-grad-accum-steps", type=int, default=2, help="Gradient accumulation steps for two-branch runs.")
     parser.add_argument("--jocor-lambda", type=float, default=0.1, help="JoCoR symmetric-KL weight.")
     parser.add_argument(
+        "--ido-stage1-epochs",
+        type=int,
+        help=(
+            "Optional explicitly pre-registered Stage-1 budget for IDO. By default, the total epoch budget must be "
+            "divisible by 3 and the official 5:10 ratio is scaled exactly (30 -> 10+20)."
+        ),
+    )
+    parser.add_argument(
+        "--ido-task-contract",
+        type=Path,
+        help=(
+            "Optional immutable JSON contract written by gcdd.ido_batch. It is accepted only for one IDO seed and "
+            "must be stored in the resulting ido/seed<N> directory; it is echoed into result/checkpoint metadata "
+            "for strict batch completion auditing."
+        ),
+    )
+    parser.add_argument(
+        "--ido-pilot-no-official-test",
+        action="store_true",
+        help=(
+            "IDO-only GPU-pilot safeguard: do not pass official-test data into the IDO trainer. "
+            "It cannot be combined with a batch task contract or validation-selected test evaluation."
+        ),
+    )
+    parser.add_argument(
         "--revision-profiling-mode",
         choices=[mode.value for mode in ProfilingMode],
         default=ProfilingMode.OFF.value,
-        help="Opt-in D1 monitoring for dynamic PGDF-family runs; default preserves historical behavior.",
+        help="Opt-in D1 monitoring for dynamic PGDF-family runs and explicit IDO controlled adaptation; default preserves historical behavior.",
     )
     parser.add_argument(
         "--revision-selection-logging",
@@ -244,6 +284,7 @@ def main() -> None:
     methods = parse_methods(args.methods)
     seeds = parse_seeds(args.seeds)
     canonical_methods = [canonical_method_key(method) for method in methods]
+    validate_ido_pilot_no_official_test_request(args, canonical_methods, seeds)
     dynamic_fusion_requested = bool(set(canonical_methods) & set(DYNAMIC_FUSION_ABLATION_METHODS))
     fixed_fusion_requested = bool(set(canonical_methods) & set(FIXED_FUSION_ABLATION_METHODS))
     dynamic_budget_source_provenance = ""
@@ -256,6 +297,45 @@ def main() -> None:
     apply_lora_defaults(cfg)
     apply_overrides(cfg, args)
     validate_args(args)
+    ido_stage_budget: tuple[int, int] | None = None
+    if "ido" in canonical_methods:
+        ido_stage_budget = resolve_stage_budget(int(cfg["lora_train"]["epochs"]), args.ido_stage1_epochs)
+        cfg["ido_controlled_adaptation"] = {
+            "identity": IDO_ADAPTATION_NAME,
+            "official_reference": "https://github.com/iTheresaApocalypse/IDO",
+            "scope": "DINOv2-B/14+LoRA controlled adaptation; not an original-architecture-equivalent reproduction",
+            "stage_budget_rule": "scale official Stage-1:Stage-2 5:10 ratio to the total controlled epoch budget",
+            "stage_budget_source": "explicit_cli_pre_registered" if args.ido_stage1_epochs is not None else "default_official_ratio_scaling",
+            "stage1_epochs": int(ido_stage_budget[0]),
+            "stage2_epochs": int(ido_stage_budget[1]),
+            "bmm_scope": IDO_BMM_SCOPE,
+            "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
+            "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
+            "weloss_source": IDO_WELoss_SOURCE,
+            "bmm_initial_fit_iterations": 20,
+            "bmm_epoch_update_iterations": 2,
+            "stage2_augmentation": "weak RandomResizedCrop+Flip; strong RandomResizedCrop+Flip+RandAugment(2,10)",
+        }
+    ido_task_contract = load_ido_task_contract(
+        args.ido_task_contract,
+        input_dir=input_dir,
+        noise_index=noise_index,
+        output_dir=output_dir,
+        methods=canonical_methods,
+        seeds=seeds,
+        validation_seed=int(args.validation_seed),
+        stage_budget=ido_stage_budget,
+        path_maps=path_maps,
+        official_test_selected_only=bool(args.official_test_selected_only),
+        posthoc_oracle_test=bool(args.posthoc_oracle_test),
+    )
+    if ido_task_contract is not None:
+        cfg["ido_batch_task_contract"] = {
+            "task_id": ido_task_contract["task"]["task_id"],
+            "attempt_id": ido_task_contract["task"]["attempt_id"],
+            "task_contract_sha256": canonical_json_sha256(ido_task_contract),
+            "experiment_signature": ido_task_contract["experiment_signature"],
+        }
     jal_params = resolve_jal_params(cfg, args)
     noise_metadata = load_noise_metadata(noise_index)
     cfg["checkpoint_validation"] = {
@@ -335,7 +415,8 @@ def main() -> None:
     validation_labels = clean_labels[validation_idx]
     log_stage(
         f"[checkpoint-validation] training_pool={int(split.train_mask.sum())}, validation={len(validation_idx)}, "
-        f"official_test={len(data['test_paths'])}; test is not evaluated during fitting."
+        f"official_test={'not passed to IDO pilot' if args.ido_pilot_no_official_test else len(data['test_paths'])}; "
+        "test is not evaluated during fitting."
     )
 
     pgdf_reference: dict[str, Any] | None = None
@@ -441,6 +522,112 @@ def main() -> None:
                 )
                 if canonical_key == "proto_only":
                     result_row["proto_keep_ratio"] = float(args.fixed_p)
+            elif canonical_key == "ido":
+                if ido_stage_budget is None:
+                    raise RuntimeError("IDO stage budget was not resolved.")
+                run_cfg["loss_type"] = "ido_official_weloss"
+                run_cfg["ido_controlled_adaptation"] = copy.deepcopy(cfg["ido_controlled_adaptation"])
+                method_name = IDO_ADAPTATION_NAME
+                profiler: RunProfiler | None = None
+                if args.revision_profiling_mode != ProfilingMode.OFF.value:
+                    profiler = RunProfiler(
+                        build_experiment_id(
+                            dataset=str(run_cfg.get("dataset", {}).get("name", "")),
+                            noise_protocol=str(noise_metadata["noise_strategy"]),
+                            noise_seed=int(noise_metadata["noise_seed"]),
+                            method=canonical_key,
+                            training_seed=int(seed),
+                        ),
+                        ProfilingMode(args.revision_profiling_mode),
+                        device_type="cpu",
+                    )
+                try:
+                    result = train_ido_lora(
+                        data["train_paths"],
+                        data["train_labels"],
+                        validation_paths,
+                        validation_labels,
+                        split.train_mask,
+                        run_cfg,
+                        method=method_name,
+                        seed=seed,
+                        stage1_epochs=int(ido_stage_budget[0]),
+                        path_maps=path_maps,
+                        checkpoint_path=checkpoints / "best_val.pt",
+                        test_paths=None if args.ido_pilot_no_official_test else data["test_paths"],
+                        test_labels=None if args.ido_pilot_no_official_test else data["test_labels"],
+                        final_checkpoint_path=checkpoints / "last.pt",
+                        last5_checkpoint_dir=checkpoints / "last5",
+                        checkpoint_protocol=PROTOCOL_NAME,
+                        posthoc_oracle_test=bool(args.posthoc_oracle_test),
+                        official_test_selected_only=bool(args.official_test_selected_only),
+                        profiler=profiler,
+                        task_contract_sha256="" if ido_task_contract is None else canonical_json_sha256(ido_task_contract),
+                        task_id="" if ido_task_contract is None else str(ido_task_contract["task"]["task_id"]),
+                        experiment_signature="" if ido_task_contract is None else str(ido_task_contract["experiment_signature"]),
+                    )
+                except BMMDegenerateError as exc:
+                    write_csv(run_dir / "bmm_class_fits.csv", [exc.record], ido_bmm_fit_fields())
+                    write_json(
+                        run_dir / "bmm_degeneracy.json",
+                        {
+                            "status": "ABORTED_FAIL_CLOSED",
+                            "policy": IDO_DEGENERATE_POLICY,
+                            "record": exc.record,
+                            "message": str(exc),
+                        },
+                    )
+                    raise
+                write_csv(run_dir / "bmm_class_fits.csv", result.bmm_fit_rows, ido_bmm_fit_fields())
+                write_ido_wrong_event(
+                    run_dir / "stage1_wrong_event.csv",
+                    data,
+                    split.train_mask,
+                    result.stage1_wrong_event,
+                )
+                selection_record = str(run_dir / "bmm_class_fits.csv")
+                if profiler is not None:
+                    assert revision_output_root is not None
+                    code_provenance = build_code_provenance(ROOT)
+                    write_instrumentation_outputs(
+                        output_root=revision_output_root,
+                        profiler=profiler,
+                        selection_logger=None,
+                        run_metadata={
+                            "schema_version": "ido_d1_training_integration_v1",
+                            "dataset": str(run_cfg.get("dataset", {}).get("name", "")),
+                            "noise_protocol": str(noise_metadata["noise_strategy"]),
+                            "noise_seed": int(noise_metadata["noise_seed"]),
+                            "training_seed": int(seed),
+                            "method": canonical_key,
+                            "profiling_mode": args.revision_profiling_mode,
+                            "ido_stage1_epochs": int(ido_stage_budget[0]),
+                            "ido_stage2_epochs": int(ido_stage_budget[1]),
+                            "weloss_source": IDO_WELoss_SOURCE,
+                            "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
+                            "code_commit": code_provenance["git_head"],
+                            "code_provenance": code_provenance,
+                        },
+                    )
+                result_row = finalize_result_row(
+                    method_key,
+                    result.summary,
+                    "ido_classwise_bmm_all_training_pool",
+                    selected_count=int(split.train_mask.sum()),
+                    candidate_count=int(split.train_mask.sum()),
+                )
+                if args.ido_pilot_no_official_test:
+                    # Preserve a machine-readable indication that this output
+                    # cannot satisfy the formal batch completion contract.
+                    result_row["official_test_evaluation"] = "not_run_ido_pilot"
+                if ido_task_contract is not None:
+                    result_row.update(
+                        {
+                            "ido_task_id": str(ido_task_contract["task"]["task_id"]),
+                            "ido_task_contract_sha256": canonical_json_sha256(ido_task_contract),
+                            "ido_experiment_signature": str(ido_task_contract["experiment_signature"]),
+                        }
+                    )
             elif canonical_key in DYNAMIC_METHODS:
                 run_cfg["loss_type"] = "ce"
                 budget_schedule: ClassBudgetSchedule | None = None
@@ -849,6 +1036,15 @@ def main() -> None:
                     "budget_match_verified": result_row.get("budget_match_verified", ""),
                     "selection_strategy": result.summary.get("selection_strategy", ""),
                     "prototype_mode": result.summary.get("prototype_mode", ""),
+                    "ido_stage1_epochs": result.summary.get("stage1_epochs", ""),
+                    "ido_stage2_epochs": result.summary.get("stage2_epochs", ""),
+                    "ido_base_stage1_epoch": result.summary.get("base_stage1_epoch", ""),
+                    "ido_bmm_scope": result.summary.get("bmm_scope", ""),
+                    "ido_bmm_degenerate_policy": result.summary.get("bmm_degenerate_policy", ""),
+                    "ido_final_bmm_fallback_classes": result.summary.get("final_bmm_fallback_classes", ""),
+                    "ido_task_id": result_row.get("ido_task_id", ""),
+                    "ido_task_contract_sha256": result_row.get("ido_task_contract_sha256", ""),
+                    "ido_experiment_signature": result_row.get("ido_experiment_signature", ""),
                 },
             )
             all_results.append(result_row)
@@ -971,6 +1167,103 @@ def write_static_selection(
         rows,
         ["index", "path", "noisy_label", "partition", "eligible", "selected", "state", "score", "selection_mode"],
     )
+
+
+def write_ido_wrong_event(
+    path: Path,
+    data: dict[str, Any],
+    training_pool_mask: np.ndarray,
+    wrong_event: np.ndarray,
+) -> None:
+    """Persist non-oracle Stage-1 wrong-event facts aligned to the original pool."""
+    wrong_event = np.asarray(wrong_event, dtype=np.int64)
+    if wrong_event.shape != training_pool_mask.shape:
+        raise ValueError("IDO wrong-event array must align with the training-pool mask.")
+    rows = [
+        {
+            "index": int(index),
+            "path": data["train_paths"][index],
+            "observed_label": str(data["train_labels"][index]),
+            "wrong_event": int(wrong_event[index]),
+        }
+        for index in np.where(training_pool_mask)[0]
+    ]
+    write_csv(path, rows, ["index", "path", "observed_label", "wrong_event"])
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def load_ido_task_contract(
+    path: Path | None,
+    *,
+    input_dir: Path,
+    noise_index: Path,
+    output_dir: Path,
+    methods: list[str],
+    seeds: list[int],
+    validation_seed: int,
+    stage_budget: tuple[int, int] | None,
+    path_maps: list[tuple[str, str]],
+    official_test_selected_only: bool,
+    posthoc_oracle_test: bool,
+) -> dict[str, Any] | None:
+    """Load and verify the batch-owned immutable IDO task contract.
+
+    The contract is optional for manual single-run use.  When supplied, it is a
+    strict guard: a batch subprocess cannot silently run another method, seed,
+    stage budget, validation split, observed-label input, or noise realization.
+    """
+    if path is None:
+        return None
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"--ido-task-contract is not a file: {path}")
+    if methods != ["ido"] or len(seeds) != 1 or stage_budget is None:
+        raise ValueError("--ido-task-contract requires exactly --methods ido and one seed.")
+    expected_run_dir = output_dir.resolve() / "ido" / f"seed{seeds[0]}"
+    if path.parent != expected_run_dir:
+        raise ValueError("--ido-task-contract must be stored under the resulting ido/seed<N> output directory.")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("IDO task contract must be a JSON object.")
+    if payload.get("schema_version") != 1:
+        raise ValueError("Unsupported IDO task-contract schema version.")
+    experiment = payload.get("experiment")
+    task = payload.get("task")
+    if not isinstance(experiment, dict) or not isinstance(task, dict):
+        raise ValueError("IDO task contract needs experiment and task mappings.")
+    if payload.get("experiment_signature") != canonical_json_sha256(experiment):
+        raise ValueError("IDO task contract experiment signature is invalid.")
+    if payload.get("task_signature") != canonical_json_sha256(task):
+        raise ValueError("IDO task contract task signature is invalid.")
+    if experiment.get("method_key") != "ido" or int(task.get("seed", -1)) != seeds[0]:
+        raise ValueError("IDO task contract method or seed differs from CLI.")
+    if int(experiment.get("validation_seed", -1)) != validation_seed:
+        raise ValueError("IDO task contract validation seed differs from CLI.")
+    if (int(experiment.get("stage1_epochs", -1)), int(experiment.get("stage2_epochs", -1))) != stage_budget:
+        raise ValueError("IDO task contract stage budget differs from resolved CLI/config budget.")
+    if experiment.get("official_test_selected_only") is not True or official_test_selected_only is not True or posthoc_oracle_test:
+        raise ValueError("IDO task contract requires validation-selected-only test evaluation with no post-hoc oracle test.")
+    if experiment.get("path_maps") != [f"{old}={new}" for old, new in path_maps]:
+        raise ValueError("IDO task contract path maps differ from CLI.")
+    assets = experiment.get("assets")
+    if not isinstance(assets, dict):
+        raise ValueError("IDO task contract lacks asset hashes.")
+    expected_assets = {
+        "paths_txt_sha256": file_sha256(input_dir / "paths.txt"),
+        "observed_labels_sha256": file_sha256(input_dir / "labels.npy"),
+        "v1_resolved_config_sha256": file_sha256(input_dir / "resolved_config.yaml"),
+        "noise_index_sha256": file_sha256(noise_index),
+        "validation_manifest_csv_sha256": file_sha256(output_dir / "validation_manifest.csv"),
+        "validation_manifest_json_sha256": file_sha256(output_dir / "validation_manifest.json"),
+    }
+    if assets != expected_assets:
+        raise ValueError("IDO task contract asset hashes differ from current V1/noise/validation inputs.")
+    return payload
 
 
 def static_method_name(method_key: str, *, proto_keep_ratio: float = 0.4) -> str:
@@ -1363,6 +1656,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dual-batch-size and --dual-grad-accum-steps must be positive.")
     if args.jocor_lambda < 0.0:
         raise ValueError("--jocor-lambda must be non-negative.")
+    if args.ido_stage1_epochs is not None and args.ido_stage1_epochs <= 0:
+        raise ValueError("--ido-stage1-epochs must be positive when provided.")
     if args.official_test_selected_only and args.posthoc_oracle_test:
         raise ValueError("--official-test-selected-only cannot be combined with --posthoc-oracle-test.")
 
@@ -1375,12 +1670,13 @@ def parse_methods(raw: str) -> list[str]:
         if methods != ["all"]:
             raise ValueError("--methods all cannot be combined with explicit method keys.")
         return list(METHODS)
-    allowed = set(METHODS) | set(ABLATION_METHODS) | set(LEGACY_METHOD_ALIASES)
+    allowed = set(METHODS) | set(ABLATION_METHODS) | set(CONTROLLED_ADAPTATION_METHODS) | set(LEGACY_METHOD_ALIASES)
     unknown = sorted(set(methods) - allowed)
     if unknown:
         raise ValueError(
             f"Unknown methods: {unknown}. Allowed primary methods: {METHODS}; "
-            f"explicit ablations: {ABLATION_METHODS}; legacy alias: dynamic"
+            f"explicit ablations: {ABLATION_METHODS}; controlled adaptations: {CONTROLLED_ADAPTATION_METHODS}; "
+            "legacy alias: dynamic"
         )
     canonical = [canonical_method_key(method) for method in methods]
     if len(set(canonical)) != len(canonical):
@@ -1400,7 +1696,7 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
         "fixed_proto_warmup_matched",
         *FUSION_ABLATION_METHODS,
     }
-    selected_only_supported = (set(METHODS) | set(ABLATION_METHODS)) - {"coteaching", "jocor"}
+    selected_only_supported = (set(METHODS) | set(ABLATION_METHODS) | set(CONTROLLED_ADAPTATION_METHODS)) - {"coteaching", "jocor"}
     requested_strict = sorted(strict_methods & set(canonical))
     if requested_strict and not selected_only:
         raise ValueError(f"{', '.join(requested_strict)} requires --official-test-selected-only.")
@@ -1410,6 +1706,22 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
             "--official-test-selected-only is not implemented for methods that train two branches: "
             f"{unsupported}."
         )
+
+
+def validate_ido_pilot_no_official_test_request(
+    args: argparse.Namespace,
+    canonical_methods: list[str],
+    seeds: list[int],
+) -> None:
+    """Keep the no-test pilot path disjoint from any formal batch result."""
+    if not args.ido_pilot_no_official_test:
+        return
+    if canonical_methods != ["ido"] or len(seeds) != 1:
+        raise ValueError("--ido-pilot-no-official-test requires exactly '--methods ido' and one seed.")
+    if args.official_test_selected_only or args.posthoc_oracle_test:
+        raise ValueError("--ido-pilot-no-official-test cannot request any official-test evaluation.")
+    if args.ido_task_contract is not None:
+        raise ValueError("--ido-pilot-no-official-test cannot be used with a formal IDO batch task contract.")
 
 
 def canonical_method_key(method_key: str) -> str:
@@ -1471,6 +1783,9 @@ def summarize_methods(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def write_run_summary(path: Path, args: argparse.Namespace, manifest: dict[str, Any], summary: list[dict[str, Any]]) -> None:
     official_test_mode = (
+        "not run (IDO pilot safeguard)"
+        if args.ido_pilot_no_official_test
+        else
         "validation-selected checkpoint only"
         if args.official_test_selected_only
         else "validation-selected, final, and last-5 checkpoints"
@@ -1480,7 +1795,7 @@ def write_run_summary(path: Path, args: argparse.Namespace, manifest: dict[str, 
         "",
         f"- Protocol: `{PROTOCOL_NAME}`.",
         f"- Shared fixed clean validation: {manifest['validation_samples']}/{manifest['source_train_samples']} samples, ratio={manifest['validation_ratio']}, seed={manifest['validation_seed']}.",
-        "- During fitting, checkpoint selection uses validation Top-1 only. The official test set is evaluated after fitting.",
+        "- During fitting, checkpoint selection uses validation Top-1 only. The official test set is evaluated after fitting unless this is the explicit no-test IDO pilot.",
         f"- Official test evaluation: {official_test_mode}.",
         f"- Post-hoc oracle test curve: {'enabled (supplementary only)' if args.posthoc_oracle_test else 'disabled'}.",
         f"- Fixed PGDF p: {args.fixed_p}; this is a pre-declared global value, not selected from this run's test results.",
@@ -1507,6 +1822,9 @@ def train_log_fields() -> list[str]:
         "best_top1", "best_epoch", "train_samples", "candidate_samples", "selected_ratio", "eval_samples", "trainable_params", "total_params",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
+        "stage", "stage_epoch", "wrong_event_total", "stage1_prediction_changes", "stage1_base_snapshot_selected",
+        "ce_term", "mse_term", "entropy_term", "bmm_clean_posterior_mean", "bmm_fallback_predictions",
+        "bmm_clipped_predictions", "bmm_fallback_classes",
     ]
 
 
@@ -1523,6 +1841,23 @@ def result_fields() -> list[str]:
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
+        "stage1_epochs", "stage2_epochs", "base_stage1_epoch", "bmm_scope", "bmm_degenerate_policy",
+        "label_wave_snapshot_policy", "weloss_source", "final_bmm_fallback_classes", "stage1_base_checkpoint",
+        "d1_recording_status", "d1_stage1_wall_seconds", "d1_stage2_wall_seconds", "d1_optimizer_loop_wall_seconds",
+        "d1_bmm_fit_seconds", "d1_checkpoint_seconds", "d1_official_test_seconds", "d1_end_to_end_wall_seconds",
+        "d1_total_wall_seconds", "d1_optimizer_steps_attempted", "d1_optimizer_steps_actual",
+        "d1_peak_cuda_allocated_bytes", "d1_peak_cuda_reserved_bytes", "d1_validation_seconds",
+        "d1_stage1_processed_samples", "d1_stage2_processed_samples", "d1_stage2_extra_view_forwards",
+        "ido_task_id", "ido_task_contract_sha256", "ido_experiment_signature",
+    ]
+
+
+def ido_bmm_fit_fields() -> list[str]:
+    return [
+        "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
+        "unique_wrong_event_count", "wrong_event_min", "wrong_event_max", "bmm_status", "bmm_reason",
+        "bmm_fit_iterations", "alpha_1", "beta_1", "weight_1", "alpha_2", "beta_2", "weight_2",
+        "component_1_normalized_mean", "component_2_normalized_mean",
     ]
 
 

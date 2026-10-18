@@ -92,7 +92,15 @@ def build_code_provenance(repository_root: Path) -> dict[str, Any]:
         "revision_experiments/offline_diagnostics.py": root / "revision_experiments" / "offline_diagnostics.py",
         "revision_experiments/training_integration.py": root / "revision_experiments" / "training_integration.py",
     }
-    required = [training_function, training_entry, *d1_d2_modules.values()]
+    ido_modules = {
+        "gcdd/ido.py": root / "gcdd" / "ido.py",
+        "gcdd/ido_batch.py": root / "gcdd" / "ido_batch.py",
+        "gcdd/features.py": root / "gcdd" / "features.py",
+        "gcdd/data.py": root / "gcdd" / "data.py",
+        "gcdd/lora_training.py": root / "gcdd" / "lora_training.py",
+        "gcdd/checkpoint_validation.py": root / "gcdd" / "checkpoint_validation.py",
+    }
+    required = [training_function, training_entry, *d1_d2_modules.values(), *ido_modules.values()]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Cannot build revision provenance; missing source files: {missing}")
@@ -105,6 +113,12 @@ def build_code_provenance(repository_root: Path) -> dict[str, Any]:
         "training_entry_sha256": _sha256_file(training_entry),
         "d1_d2_module_sha256": {
             relative_path: _sha256_file(path) for relative_path, path in d1_d2_modules.items()
+        },
+        # This is intentionally present for every monitored method.  It makes
+        # a dirty-worktree IDO result self-identifying without changing the
+        # training path for the pre-existing methods.
+        "ido_module_sha256": {
+            relative_path: _sha256_file(path) for relative_path, path in ido_modules.items()
         },
     }
 

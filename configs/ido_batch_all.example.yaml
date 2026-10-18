@@ -1,0 +1,42 @@
+# Server-private copy template for configs/ido_batch_all.yaml.
+# Replace roots/path maps, then obtain protocol approval before setting true.
+schema_version: 1
+runtime:
+  python_executable: "<SERVER_PYTHON>"
+output:
+  root: "<SERVER_OUTPUT_ROOT>/ido_controlled_batch"
+  instrumentation_root: "<SERVER_OUTPUT_ROOT>/ido_controlled_batch_instrumentation"
+protocol:
+  protocol_frozen: false
+  approval_note: "Required: externally reviewed 10+20 candidate, per-sample WELoss correction, BMM fail-closed policy."
+formal:
+  epochs: 30
+  stage1_epochs: 10
+  validation_seed: 20250726
+
+# Retain the exact three-dataset structure and replace every <...> path.
+datasets:
+  cub: &cub
+    display_name: CUB-200-2011
+    expected_classes: 200
+    path_maps: ["<STORED_IMAGE_ROOT>=<SERVER_IMAGE_ROOT>"]
+    protocols:
+      cyclic: {input_dir: "<CUB_CYCLIC_V1>", noise_index: "<CUB_CYCLIC_INDEX>", validation_dir: "<CUB_FIXED_VALIDATION>", reference_126_training_root: null}
+      idn: {input_dir: "<CUB_IDN_PREPARED_V1>", noise_index: "<CUB_IDN_MANIFEST>", validation_dir: "<CUB_FIXED_VALIDATION>", reference_126_training_root: "<CUB_IDN_126_ROOT>"}
+      gccn: {input_dir: "<CUB_GCCN_PREPARED_V1>", noise_index: "<CUB_GCCN_MANIFEST>", validation_dir: "<CUB_FIXED_VALIDATION>", reference_126_training_root: "<CUB_GCCN_126_ROOT>"}
+  cars:
+    display_name: Stanford Cars
+    expected_classes: 196
+    path_maps: ["<STORED_IMAGE_ROOT>=<SERVER_IMAGE_ROOT>"]
+    protocols:
+      cyclic: {input_dir: "<CARS_CYCLIC_V1>", noise_index: "<CARS_CYCLIC_INDEX>", validation_dir: "<CARS_FIXED_VALIDATION>", reference_126_training_root: null}
+      idn: {input_dir: "<CARS_IDN_PREPARED_V1>", noise_index: "<CARS_IDN_MANIFEST>", validation_dir: "<CARS_FIXED_VALIDATION>", reference_126_training_root: "<CARS_IDN_126_ROOT>"}
+      gccn: {input_dir: "<CARS_GCCN_PREPARED_V1>", noise_index: "<CARS_GCCN_MANIFEST>", validation_dir: "<CARS_FIXED_VALIDATION>", reference_126_training_root: "<CARS_GCCN_126_ROOT>"}
+  aircraft:
+    display_name: FGVC-Aircraft
+    expected_classes: 100
+    path_maps: ["<STORED_IMAGE_ROOT>=<SERVER_IMAGE_ROOT>"]
+    protocols:
+      cyclic: {input_dir: "<AIRCRAFT_CYCLIC_V1>", noise_index: "<AIRCRAFT_CYCLIC_INDEX>", validation_dir: "<AIRCRAFT_FIXED_VALIDATION>", reference_126_training_root: null}
+      idn: {input_dir: "<AIRCRAFT_IDN_PREPARED_V1>", noise_index: "<AIRCRAFT_IDN_MANIFEST>", validation_dir: "<AIRCRAFT_FIXED_VALIDATION>", reference_126_training_root: "<AIRCRAFT_IDN_126_ROOT>"}
+      gccn: {input_dir: "<AIRCRAFT_GCCN_PREPARED_V1>", noise_index: "<AIRCRAFT_GCCN_MANIFEST>", validation_dir: "<AIRCRAFT_FIXED_VALIDATION>", reference_126_training_root: "<AIRCRAFT_GCCN_126_ROOT>"}
