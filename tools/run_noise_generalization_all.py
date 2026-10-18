@@ -1,4 +1,4 @@
-"""Sequentially run the formal IDN/GCCN generalization matrix.
+"""Prepare or sequentially run the formal IDN/GCCN generalization matrix.
 
 The launcher owns orchestration only.  Noise construction and model training
 remain in ``tools/prepare_noise_generalization.py`` and
@@ -135,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path, help="Server-specific YAML based on configs/noise_generalization_all.example.yaml.")
     parser.add_argument("--dry-run", action="store_true", help="Validate inputs and print all 6 preparation plus 126 training commands without launching subprocesses.")
+    parser.add_argument(
+        "--prepare-only",
+        action="store_true",
+        help="Create or strictly validate the 6 IDN/GCCN noise assets, then stop before any training subprocess.",
+    )
     parser.add_argument("--summarize-only", action="store_true", help="Read strictly complete runs only and refresh status/summary files without generating data or training.")
     parser.add_argument("--resume", dest="resume", action="store_true", default=True, help="Default: skip only strictly verified completed tasks.")
     parser.add_argument("--no-resume", dest="resume", action="store_false", help="Fail if any task is already complete instead of skipping it.")
@@ -143,10 +148,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.dry_run and args.summarize_only:
-        raise ValueError("Use at most one of --dry-run and --summarize-only.")
+    selected_modes = sum(bool(value) for value in (args.dry_run, args.prepare_only, args.summarize_only))
+    if selected_modes > 1:
+        raise ValueError("Use at most one of --dry-run, --prepare-only, and --summarize-only.")
     config = load_config(args.config)
-    run_orchestration(config, dry_run=bool(args.dry_run), summarize_only=bool(args.summarize_only), resume=bool(args.resume))
+    run_orchestration(
+        config,
+        dry_run=bool(args.dry_run),
+        prepare_only=bool(args.prepare_only),
+        summarize_only=bool(args.summarize_only),
+        resume=bool(args.resume),
+    )
 
 
 def load_config(path: Path) -> ExperimentConfig:
@@ -214,7 +226,14 @@ def load_config(path: Path) -> ExperimentConfig:
     )
 
 
-def run_orchestration(config: ExperimentConfig, *, dry_run: bool, summarize_only: bool, resume: bool) -> None:
+def run_orchestration(
+    config: ExperimentConfig,
+    *,
+    dry_run: bool,
+    prepare_only: bool,
+    summarize_only: bool,
+    resume: bool,
+) -> None:
     plan = build_plan(config)
     if len(plan) != 126:
         raise RuntimeError(f"Formal plan must contain exactly 126 tasks, found {len(plan)}.")
@@ -228,6 +247,13 @@ def run_orchestration(config: ExperimentConfig, *, dry_run: bool, summarize_only
     validate_all_dataset_inputs(config.datasets)
     for dataset in config.datasets:
         ensure_fixed_validation_manifest(dataset, dry_run=dry_run)
+    if prepare_only:
+        for dataset in config.datasets:
+            for protocol in PROTOCOLS:
+                prepare_or_validate_artifact(config, dataset, protocol, artifact_directory(config, dataset, protocol))
+        print("PREPARATION COMPLETE: 6 IDN/GCCN assets are ready; no training subprocess was started.", flush=True)
+        return
+
     write_global_metadata(config, plan)
     write_status_and_summary(config, plan)
     print_plan(config, plan, dry_run=dry_run)

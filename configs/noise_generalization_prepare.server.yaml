@@ -1,0 +1,50 @@
+# Server-only path mapping for --prepare-only.  It creates or validates the
+# six immutable IDN/GCCN assets under /root/GCDD and never launches training.
+schema_version: 1
+
+runtime:
+  python_executable: python
+
+output:
+  noise_assets_root: /root/GCDD/outputs_major_revision/noise_generalization/assets
+  training_outputs_root: /root/GCDD-ido/outputs_major_revision/noise_generalization/training_unused_prepare_only
+
+instrumentation:
+  profiling_mode: basic
+  selection_logging: true
+  output_root: /root/GCDD-ido/outputs_major_revision/noise_generalization/instrumentation_unused_prepare_only
+
+formal:
+  protocols: [idn, gccn]
+  noise_rate: 0.4
+  noise_seed: 42
+  validation_seed: 20250726
+  training_seeds: [1, 42, 88]
+  epochs: 30
+  warmup_epochs: 5
+  update_interval: 5
+  dynamic_ratio: 0.8
+  fixed_p: 0.4
+
+datasets:
+  cub:
+    display_name: CUB-200-2011
+    base_input_dir: /root/GCDD/outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42
+    source_noise_index: /root/GCDD/outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv
+    validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cub
+    path_maps: []
+    training_config: null
+  cars:
+    display_name: Stanford Cars
+    base_input_dir: /root/GCDD/outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42
+    source_noise_index: /root/GCDD/outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv
+    validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/cars
+    path_maps: []
+    training_config: null
+  aircraft:
+    display_name: FGVC-Aircraft
+    base_input_dir: /root/GCDD/outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42
+    source_noise_index: /root/GCDD/outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv
+    validation_dir: /root/GCDD/outputs_major_revision/noise_generalization/fixed_validation/aircraft
+    path_maps: []
+    training_config: null
