@@ -1,5 +1,16 @@
 # IDO-style DINOv2-B/14+LoRA 实现独立验收报告
 
+## 2026-10-19 — Global-BMM 受控变体实施状态
+
+- 新增显式 `ido_bmm_mode: classwise|global`；未指定时仍为 `classwise`，不会改变已有实验语义。
+- `global` 仅在 observed training pool 的完整 wrong-event 向量上拟合一个 BMM，并使用共同 min/max 归一化；不读取 clean-label oracle、validation 或 official test。
+- 两种模式具有不同方法名、BMM scope、resolved config、checkpoint/result/selection metadata 与 batch experiment signature；汇总器不会把它们混为同一协议。
+- 保留 class-wise 分支、原有 fail-closed 数值检查、10+20 协议、WELoss 三项、Stage-1 label-wave、Stage-2 动态 wrong-event 与末轮不重拟合规则。
+- 新增每次 BMM 拟合的参数、posterior/CDF 范围、soft assignment、Kish ESS、`density_sum + epsilon` 后验质量差额审计字段。该差额被记录而未归一化；WELoss 继续按既有官方表达式使用 `1-prob1` 和 `1-prob2`，不错误假定第二 posterior 是严格补集。
+- CPU 回归：`test_ido.py` 16 PASS、`test_ido_batch.py` 16 PASS、`test_noise_generalization_all_runner.py` 6 PASS；全仓 CPU 回归为 90 PASS（18.55 s）。本地没有 Linux GPU/服务器访问权限，GPU pilot 尚未执行，状态只能是 `NOT EXECUTED`。
+
+详见新增报告 `audit_reports/IDO_GLOBAL_BMM_GPU_PILOT_REPORT.md`。该实现不等同于论文 class-wise IDO，也不批准正式 27 次训练。
+
 > **修复复验附录（2026-10-17）。** 下文“审查范围、边界与结论”至文末保留的是修复前的独立验收记录，故其中的 `REVISION REQUIRED`、`NOT IMPLEMENTED` 与旧 `clean_safe` 描述是历史发现，不能当作当前实现状态。本附录记录本轮实际修复、重新执行的 CPU 证据和仍然有效的阻塞条件；没有删除或改写原始发现。
 
 ## 修复复验（当前状态）

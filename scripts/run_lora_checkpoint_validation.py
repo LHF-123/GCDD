@@ -35,11 +35,12 @@ from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
 from gcdd.ido import (
     BMMDegenerateError,
-    IDO_ADAPTATION_NAME,
-    IDO_BMM_SCOPE,
     IDO_DEGENERATE_POLICY,
     IDO_WAVE_SNAPSHOT_POLICY,
     IDO_WELoss_SOURCE,
+    ido_adaptation_name,
+    ido_bmm_scope,
+    resolve_ido_bmm_mode,
     resolve_stage_budget,
     train_ido_lora,
 )
@@ -235,6 +236,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ido-bmm-mode",
+        choices=["classwise", "global"],
+        help=(
+            "Explicit IDO BMM fit scope. If omitted, uses config.ido_controlled_adaptation.bmm_mode "
+            "or the backward-compatible classwise default. Global is the separately named whole-training-pool variant."
+        ),
+    )
+    parser.add_argument(
         "--ido-task-contract",
         type=Path,
         help=(
@@ -329,18 +338,35 @@ def main() -> None:
     apply_overrides(cfg, args)
     validate_args(args)
     ido_stage_budget: tuple[int, int] | None = None
+    ido_bmm_mode = "classwise"
     if "ido" in canonical_methods:
         ido_stage_budget = resolve_stage_budget(int(cfg["lora_train"]["epochs"]), args.ido_stage1_epochs)
+        existing_ido = cfg.get("ido_controlled_adaptation", {})
+        if not isinstance(existing_ido, dict):
+            raise ValueError("ido_controlled_adaptation must be a mapping when supplied in config.")
+        configured_mode = existing_ido.get("bmm_mode")
+        ido_bmm_mode = resolve_ido_bmm_mode(args.ido_bmm_mode if args.ido_bmm_mode is not None else configured_mode)
         cfg["ido_controlled_adaptation"] = {
-            "identity": IDO_ADAPTATION_NAME,
+            "identity": ido_adaptation_name(ido_bmm_mode),
             "official_reference": "https://github.com/iTheresaApocalypse/IDO",
-            "scope": "DINOv2-B/14+LoRA controlled adaptation; not an original-architecture-equivalent reproduction",
+            "scope": "DINOv2-B/14+LoRA controlled adaptation; global-BMM is not a class-wise-equivalent or original-architecture-equivalent reproduction",
             "stage_budget_rule": "scale official Stage-1:Stage-2 5:10 ratio to the total controlled epoch budget",
             "stage_budget_source": "explicit_cli_pre_registered" if args.ido_stage1_epochs is not None else "default_official_ratio_scaling",
             "stage1_epochs": int(ido_stage_budget[0]),
             "stage2_epochs": int(ido_stage_budget[1]),
-            "bmm_scope": IDO_BMM_SCOPE,
+            "bmm_mode": ido_bmm_mode,
+            "bmm_scope": ido_bmm_scope(ido_bmm_mode),
+            "bmm_mode_source": "explicit_cli" if args.ido_bmm_mode is not None else ("config" if configured_mode is not None else "backward_compatible_default"),
             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
+            "bmm_initialization": {
+                "alpha": [1.0, 2.0],
+                "beta": [2.0, 1.0],
+                "mixture_weights": [0.5, 0.5],
+            },
+            "bmm_epsilon": 1.0e-6,
+            "bmm_component_boundary": 1.0e-5,
+            "bmm_responsibility_denominator": "component_density_sum_plus_epsilon",
+            "bmm_posterior_complementarity": "not_forced; each posterior uses component_density_sum_plus_epsilon",
             "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
             "weloss_source": IDO_WELoss_SOURCE,
             "bmm_initial_fit_iterations": 20,
@@ -359,6 +385,7 @@ def main() -> None:
         path_maps=path_maps,
         official_test_selected_only=bool(args.official_test_selected_only),
         posthoc_oracle_test=bool(args.posthoc_oracle_test),
+        bmm_mode=ido_bmm_mode,
     )
     if ido_task_contract is not None:
         cfg["ido_batch_task_contract"] = {
@@ -515,6 +542,7 @@ def main() -> None:
             run_cfg = copy.deepcopy(cfg)
             run_cfg["lora_train"]["seed"] = int(seed)
             selection_record = ""
+            source_active_budget_audit: dict[str, Any] | None = None
             if canonical_key in {"all_noisy", "jal_ce", *STATIC_METHODS}:
                 if canonical_key == "jal_ce":
                     configure_jal(run_cfg, args)
@@ -573,7 +601,7 @@ def main() -> None:
                     raise RuntimeError("IDO stage budget was not resolved.")
                 run_cfg["loss_type"] = "ido_official_weloss"
                 run_cfg["ido_controlled_adaptation"] = copy.deepcopy(cfg["ido_controlled_adaptation"])
-                method_name = IDO_ADAPTATION_NAME
+                method_name = ido_adaptation_name(ido_bmm_mode)
                 profiler: RunProfiler | None = None
                 if args.revision_profiling_mode != ProfilingMode.OFF.value:
                     profiler = RunProfiler(
@@ -598,6 +626,7 @@ def main() -> None:
                         method=method_name,
                         seed=seed,
                         stage1_epochs=int(ido_stage_budget[0]),
+                        bmm_mode=ido_bmm_mode,
                         path_maps=path_maps,
                         checkpoint_path=checkpoints / "best_val.pt",
                         test_paths=None if args.ido_pilot_no_official_test else data["test_paths"],
@@ -649,6 +678,8 @@ def main() -> None:
                             "profiling_mode": args.revision_profiling_mode,
                             "ido_stage1_epochs": int(ido_stage_budget[0]),
                             "ido_stage2_epochs": int(ido_stage_budget[1]),
+                            "ido_bmm_mode": ido_bmm_mode,
+                            "ido_bmm_scope": ido_bmm_scope(ido_bmm_mode),
                             "weloss_source": IDO_WELoss_SOURCE,
                             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
                             "code_commit": code_provenance["git_head"],
@@ -658,7 +689,7 @@ def main() -> None:
                 result_row = finalize_result_row(
                     method_key,
                     result.summary,
-                    "ido_classwise_bmm_all_training_pool",
+                    f"ido_{ido_bmm_mode}_bmm_all_training_pool",
                     selected_count=int(split.train_mask.sum()),
                     candidate_count=int(split.train_mask.sum()),
                 )
@@ -681,7 +712,6 @@ def main() -> None:
                 selection_strategy = "loss_only"
                 prototype_mode = "fixed"
                 fusion_mode: str | None = None
-                source_active_budget_audit: dict[str, Any] | None = None
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -1173,7 +1203,11 @@ def main() -> None:
             all_logs.extend(result.logs)
             write_csv(run_dir / "train_log.csv", result.logs, train_log_fields())
             budget_source_path = str(result_row.get("budget_source_path", ""))
-            source_root = Path(budget_source_path).parents[2] if budget_source_path else None
+            source_root = (
+                Path(budget_source_path).parents[2]
+                if budget_source_path
+                else None
+            )
             source_validation_manifest = (
                 source_root / "validation_manifest.json" if source_root is not None else None
             )
@@ -1192,6 +1226,7 @@ def main() -> None:
                     "official_test_used_for_checkpoint_selection": False,
                     "budget_source_path": result_row.get("budget_source_path", ""),
                     "budget_source_sha256": result_row.get("budget_source_sha256", ""),
+                    "budget_match_verified": result_row.get("budget_match_verified", ""),
                     "source_pgdf_method": (
                         "pgdf_dynamic_proto"
                         if canonical_key in {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}
@@ -1211,7 +1246,6 @@ def main() -> None:
                         if canonical_key in {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}
                         else ""
                     ),
-                    "budget_match_verified": result_row.get("budget_match_verified", ""),
                     "selection_strategy": result.summary.get("selection_strategy", ""),
                     "prototype_mode": result.summary.get("prototype_mode", ""),
                     "random_selection_scheme": (
@@ -1223,6 +1257,7 @@ def main() -> None:
                     "ido_stage2_epochs": result.summary.get("stage2_epochs", ""),
                     "ido_base_stage1_epoch": result.summary.get("base_stage1_epoch", ""),
                     "ido_bmm_scope": result.summary.get("bmm_scope", ""),
+                    "ido_bmm_mode": result.summary.get("bmm_mode", ""),
                     "ido_bmm_degenerate_policy": result.summary.get("bmm_degenerate_policy", ""),
                     "ido_final_bmm_fallback_classes": result.summary.get("final_bmm_fallback_classes", ""),
                     "ido_task_id": result_row.get("ido_task_id", ""),
@@ -1393,6 +1428,7 @@ def load_ido_task_contract(
     path_maps: list[tuple[str, str]],
     official_test_selected_only: bool,
     posthoc_oracle_test: bool,
+    bmm_mode: str = "classwise",
 ) -> dict[str, Any] | None:
     """Load and verify the batch-owned immutable IDO task contract.
 
@@ -1429,6 +1465,8 @@ def load_ido_task_contract(
         raise ValueError("IDO task contract validation seed differs from CLI.")
     if (int(experiment.get("stage1_epochs", -1)), int(experiment.get("stage2_epochs", -1))) != stage_budget:
         raise ValueError("IDO task contract stage budget differs from resolved CLI/config budget.")
+    if experiment.get("bmm_mode", "classwise") != resolve_ido_bmm_mode(bmm_mode):
+        raise ValueError("IDO task contract BMM mode differs from the resolved CLI/config mode.")
     if experiment.get("official_test_selected_only") is not True or official_test_selected_only is not True or posthoc_oracle_test:
         raise ValueError("IDO task contract requires validation-selected-only test evaluation with no post-hoc oracle test.")
     if experiment.get("path_maps") != [f"{old}={new}" for old, new in path_maps]:
@@ -1607,6 +1645,7 @@ def validate_dynamic_pgdf_budget_source_provenance(
         )
     return "exact_noise_index_sha256"
 
+
 def inspect_pgdf_active_budget_source(
     pgdf_budget_root: Path,
     schedule: ClassBudgetSchedule,
@@ -1614,8 +1653,11 @@ def inspect_pgdf_active_budget_source(
     """Fail closed unless PGDF's recorded active subset agrees with class budgets.
 
     ``selection_per_class.csv`` supplies only the allowed class-wise count
-    schedule. This companion audit reads source aggregate update counts and
-    fallback counts, never identities, scores, oracle labels, or test metrics.
+    schedule.  This companion audit reads the source run's aggregate update
+    counts and fallback counts, never sample identities, losses, prototype
+    scores, oracle labels, or test metrics.  The PGDF fallback adds exactly
+    one member only to an otherwise empty observed-label strict intersection,
+    so ``active - fallback`` is the source strict-intersection count.
     """
     source_path = pgdf_budget_root / f"seed{schedule.seed}" / "selection_updates.csv"
     if not source_path.is_file():
@@ -1683,7 +1725,6 @@ def inspect_pgdf_active_budget_source(
         "active_selected_count_total": sum(row["active_selected_count"] for row in updates),
         "updates": updates,
     }
-
 
 
 def validate_budget_source_hyperparameters(
@@ -1974,8 +2015,8 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
     strict_methods = {
         "proto_only",
         "dynamic_budget_matched",
-        *EXACT_BUDGET_CONTROL_METHODS,
         "dynamic_budget_matched_dynamic_proto",
+        *EXACT_BUDGET_CONTROL_METHODS,
         "dynamic_proto_only",
         "pgdf_dynamic_proto",
         "fixed_proto_warmup_matched",
@@ -2109,7 +2150,8 @@ def train_log_fields() -> list[str]:
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
         "stage", "stage_epoch", "wrong_event_total", "stage1_prediction_changes", "stage1_base_snapshot_selected",
         "ce_term", "mse_term", "entropy_term", "bmm_clean_posterior_mean", "bmm_fallback_predictions",
-        "bmm_clipped_predictions", "bmm_fallback_classes",
+        "bmm_clipped_predictions", "bmm_fallback_classes", "bmm_mode", "bmm_scope",
+        "bmm_posterior_mass_deficit_sum", "bmm_posterior_mass_deficit_max",
     ]
 
 
@@ -2126,7 +2168,7 @@ def result_fields() -> list[str]:
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
-        "stage1_epochs", "stage2_epochs", "base_stage1_epoch", "bmm_scope", "bmm_degenerate_policy",
+        "stage1_epochs", "stage2_epochs", "base_stage1_epoch", "bmm_mode", "bmm_scope", "bmm_degenerate_policy",
         "label_wave_snapshot_policy", "weloss_source", "final_bmm_fallback_classes", "stage1_base_checkpoint",
         "d1_recording_status", "d1_stage1_wall_seconds", "d1_stage2_wall_seconds", "d1_optimizer_loop_wall_seconds",
         "d1_bmm_fit_seconds", "d1_checkpoint_seconds", "d1_official_test_seconds", "d1_end_to_end_wall_seconds",
@@ -2139,10 +2181,18 @@ def result_fields() -> list[str]:
 
 def ido_bmm_fit_fields() -> list[str]:
     return [
-        "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
+        "bmm_mode", "bmm_scope", "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
         "unique_wrong_event_count", "wrong_event_min", "wrong_event_max", "bmm_status", "bmm_reason",
         "bmm_fit_iterations", "alpha_1", "beta_1", "weight_1", "alpha_2", "beta_2", "weight_2",
         "component_1_normalized_mean", "component_2_normalized_mean",
+        "component_1_soft_assignment", "component_1_kish_ess", "component_1_weight_times_n",
+        "component_1_max_responsibility", "component_1_responsibility_ge_half_count",
+        "component_2_soft_assignment", "component_2_kish_ess", "component_2_weight_times_n",
+        "component_2_max_responsibility", "component_2_responsibility_ge_half_count",
+        "posterior_1_min", "posterior_1_max", "posterior_2_min", "posterior_2_max",
+        "cdf_1_min", "cdf_1_max", "cdf_2_min", "cdf_2_max",
+        "posterior_mass_sum", "posterior_mass_deficit", "posterior_mass_min", "posterior_mass_max",
+        "bmm_prediction_clipped_count",
     ]
 
 

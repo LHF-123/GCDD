@@ -51,10 +51,43 @@ from revision_experiments.training_integration import (
 
 
 IDO_ADAPTATION_NAME = "IDO-style DINOv2-B/14+LoRA controlled adaptation"
+IDO_GLOBAL_BMM_ADAPTATION_NAME = "IDO-style global-BMM DINOv2-B/14+LoRA controlled adaptation"
+IDO_BMM_MODE_CLASSWISE = "classwise"
+IDO_BMM_MODE_GLOBAL = "global"
+IDO_BMM_MODES = (IDO_BMM_MODE_CLASSWISE, IDO_BMM_MODE_GLOBAL)
 IDO_BMM_SCOPE = "observed_label_classwise"
+IDO_GLOBAL_BMM_SCOPE = "all_observed_training_pool"
 IDO_DEGENERATE_POLICY = "fail_closed_record_and_abort"
 IDO_WAVE_SNAPSHOT_POLICY = "deep_clone_trainable_state"
 IDO_WELoss_SOURCE = "official_repository_WELoss_logits_mse_with_per_sample_entropy_broadcast_fix"
+
+
+def resolve_ido_bmm_mode(mode: str | None) -> str:
+    """Return an explicit supported BMM mode without changing the legacy default.
+
+    ``None`` deliberately resolves to ``classwise`` so existing IDO command
+    lines retain their prior, observed-label class-wise semantics.  The global
+    variant is opt-in and carries its own method identity and experiment
+    signature downstream.
+    """
+    resolved = IDO_BMM_MODE_CLASSWISE if mode in (None, "") else str(mode).strip().lower()
+    if resolved not in IDO_BMM_MODES:
+        raise ValueError(f"ido_bmm_mode must be one of {IDO_BMM_MODES}, got {mode!r}.")
+    return resolved
+
+
+def ido_bmm_scope(mode: str | None) -> str:
+    """Return the auditable fit scope for a resolved BMM mode."""
+    return IDO_GLOBAL_BMM_SCOPE if resolve_ido_bmm_mode(mode) == IDO_BMM_MODE_GLOBAL else IDO_BMM_SCOPE
+
+
+def ido_adaptation_name(mode: str | None) -> str:
+    """Return the non-interchangeable controlled-adaptation method identity."""
+    return (
+        IDO_GLOBAL_BMM_ADAPTATION_NAME
+        if resolve_ido_bmm_mode(mode) == IDO_BMM_MODE_GLOBAL
+        else IDO_ADAPTATION_NAME
+    )
 
 
 @dataclass
@@ -357,6 +390,50 @@ class ClassConditionalBetaMixture:
         return likelihood / (likelihood.sum(axis=0, keepdims=True) + self.epsilon)
 
 
+def _prediction_diagnostics(
+    model: ClassConditionalBetaMixture,
+    values: np.ndarray,
+) -> dict[str, Any]:
+    """Describe fitted BMM outputs without changing their training semantics.
+
+    The official BMM divides component densities by ``density_sum + epsilon``.
+    Consequently ``prob1 + prob2`` is not asserted to be exactly one.  The
+    deficit is recorded rather than normalized away because WELoss retains the
+    official ``1 - prob1`` and ``1 - prob2`` expressions.
+    """
+    raw = np.asarray(values, dtype=np.float64).reshape(-1)
+    prob1, prob2, cdf1, cdf2, clipped = model.predict(raw)
+    posterior_mass = prob1 + prob2
+
+    def component_support(responsibility: np.ndarray, component: int) -> dict[str, Any]:
+        soft = float(np.sum(responsibility))
+        squared = float(np.sum(np.square(responsibility)))
+        return {
+            f"component_{component}_soft_assignment": soft,
+            f"component_{component}_kish_ess": float((soft * soft) / squared) if squared > 0.0 else 0.0,
+            f"component_{component}_weight_times_n": float(model.weights[component - 1] * len(raw)),
+            f"component_{component}_max_responsibility": float(np.max(responsibility)),
+            f"component_{component}_responsibility_ge_half_count": int(np.count_nonzero(responsibility >= 0.5)),
+        }
+
+    return {
+        **component_support(prob1, 1),
+        **component_support(prob2, 2),
+        "posterior_1_min": float(np.min(prob1)),
+        "posterior_1_max": float(np.max(prob1)),
+        "posterior_2_min": float(np.min(prob2)),
+        "posterior_2_max": float(np.max(prob2)),
+        "cdf_1_min": float(np.min(cdf1)),
+        "cdf_1_max": float(np.max(cdf1)),
+        "cdf_2_min": float(np.min(cdf2)),
+        "cdf_2_max": float(np.max(cdf2)),
+        "posterior_mass_sum": float(np.sum(posterior_mass)),
+        "posterior_mass_deficit": float(len(raw) - np.sum(posterior_mass)),
+        "posterior_mass_min": float(np.min(posterior_mass)),
+        "posterior_mass_max": float(np.max(posterior_mass)),
+        "bmm_prediction_clipped_count": int(clipped),
+    }
+
 
 class ClasswiseBMM:
     """One BMM per observed-label class, never a hidden global fallback."""
@@ -384,6 +461,7 @@ class ClasswiseBMM:
             try:
                 metadata = self.models[label_id].fit(values, max_iter=max_iter)
             except BMMDegenerateError as exc:
+                exc.record.update({"bmm_mode": IDO_BMM_MODE_CLASSWISE, "bmm_scope": IDO_BMM_SCOPE})
                 raise exc.add_context(
                     observed_label_id=label_id,
                     observed_label=observed_label,
@@ -392,11 +470,14 @@ class ClasswiseBMM:
                 ) from exc
             rows.append(
                 {
+                    "bmm_mode": IDO_BMM_MODE_CLASSWISE,
+                    "bmm_scope": IDO_BMM_SCOPE,
                     "fit_round": fit_round,
                     "stage2_epoch": int(stage2_epoch),
                     "observed_label_id": int(label_id),
                     "observed_label": observed_label,
                     **metadata,
+                    **_prediction_diagnostics(self.models[label_id], values),
                 }
             )
         return rows
@@ -421,6 +502,7 @@ class ClasswiseBMM:
             try:
                 prob1, prob2, cdf1, cdf2, clipped = model.predict(wrong_event[positions])
             except BMMDegenerateError as exc:
+                exc.record.update({"bmm_mode": IDO_BMM_MODE_CLASSWISE, "bmm_scope": IDO_BMM_SCOPE})
                 raise exc.add_context(
                     observed_label_id=label_id,
                     observed_label=self.observed_label_names[label_id],
@@ -432,10 +514,105 @@ class ClasswiseBMM:
             outputs["cdf1"][positions] = cdf1
             outputs["cdf2"][positions] = cdf2
             clipped_predictions += int(clipped)
-        return {**outputs, "fallback_predictions": 0, "clipped_predictions": clipped_predictions}
+        posterior_mass_deficit = 1.0 - (outputs["prob1"] + outputs["prob2"])
+        return {
+            **outputs,
+            "fallback_predictions": 0,
+            "clipped_predictions": clipped_predictions,
+            "posterior_mass_deficit_sum": float(np.sum(posterior_mass_deficit)),
+            "posterior_mass_deficit_max": float(np.max(posterior_mass_deficit)),
+        }
 
     def fallback_class_count(self) -> int:
         """Retained for result-schema compatibility; fail-closed has no fallback."""
+        return 0
+
+
+class GlobalBMM:
+    """One official-style BMM over the full observed training pool.
+
+    This is an opt-in controlled adaptation, never a hidden fallback from the
+    class-wise branch.  ``label_ids`` are accepted only to verify alignment
+    with the training pool; no observed-label partitioning occurs here.
+    """
+
+    def __init__(self, observed_label_names: list[str], *, epsilon: float = 1.0e-6) -> None:
+        self.observed_label_names = list(observed_label_names)
+        self.model = ClassConditionalBetaMixture(epsilon=epsilon)
+
+    def _validate_inputs(self, wrong_event: np.ndarray, label_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        values = np.asarray(wrong_event, dtype=np.float64).reshape(-1)
+        ids = np.asarray(label_ids, dtype=np.int64).reshape(-1)
+        if values.shape != ids.shape:
+            raise ValueError("wrong_event and label_ids must share the same shape.")
+        if np.any(ids < 0) or np.any(ids >= len(self.observed_label_names)):
+            raise ValueError("label_ids contain an observed class outside the configured vocabulary.")
+        return values, ids
+
+    def fit(
+        self,
+        wrong_event: np.ndarray,
+        label_ids: np.ndarray,
+        *,
+        stage2_epoch: int,
+        fit_round: str,
+        max_iter: int,
+    ) -> list[dict[str, Any]]:
+        values, _ = self._validate_inputs(wrong_event, label_ids)
+        try:
+            metadata = self.model.fit(values, max_iter=max_iter)
+        except BMMDegenerateError as exc:
+            exc.record.update({"bmm_mode": IDO_BMM_MODE_GLOBAL, "bmm_scope": IDO_GLOBAL_BMM_SCOPE})
+            raise exc.add_context(
+                observed_label_id=-1,
+                observed_label="__global_observed_training_pool__",
+                stage2_epoch=stage2_epoch,
+                fit_round=fit_round,
+            ) from exc
+        return [
+            {
+                "bmm_mode": IDO_BMM_MODE_GLOBAL,
+                "bmm_scope": IDO_GLOBAL_BMM_SCOPE,
+                "fit_round": fit_round,
+                "stage2_epoch": int(stage2_epoch),
+                "observed_label_id": "",
+                "observed_label": "",
+                **metadata,
+                **_prediction_diagnostics(self.model, values),
+            }
+        ]
+
+    def predict(
+        self,
+        wrong_event: np.ndarray,
+        label_ids: np.ndarray,
+        *,
+        stage2_epoch: int,
+    ) -> dict[str, np.ndarray | int | float]:
+        values, _ = self._validate_inputs(wrong_event, label_ids)
+        try:
+            prob1, prob2, cdf1, cdf2, clipped = self.model.predict(values)
+        except BMMDegenerateError as exc:
+            exc.record.update({"bmm_mode": IDO_BMM_MODE_GLOBAL, "bmm_scope": IDO_GLOBAL_BMM_SCOPE})
+            raise exc.add_context(
+                observed_label_id=-1,
+                observed_label="__global_observed_training_pool__",
+                stage2_epoch=stage2_epoch,
+                fit_round="stage2_prediction",
+            ) from exc
+        posterior_mass_deficit = 1.0 - (prob1 + prob2)
+        return {
+            "prob1": prob1,
+            "prob2": prob2,
+            "cdf1": cdf1,
+            "cdf2": cdf2,
+            "fallback_predictions": 0,
+            "clipped_predictions": int(clipped),
+            "posterior_mass_deficit_sum": float(np.sum(posterior_mass_deficit)),
+            "posterior_mass_deficit_max": float(np.max(posterior_mass_deficit)),
+        }
+
+    def fallback_class_count(self) -> int:
         return 0
 
 
@@ -759,6 +936,7 @@ def train_ido_lora(
     method: str,
     seed: int,
     stage1_epochs: int | None = None,
+    bmm_mode: str | None = None,
     path_maps: list[tuple[str, str]] | None = None,
     checkpoint_path: Path | None = None,
     test_paths: list[str] | None = None,
@@ -778,6 +956,8 @@ def train_ido_lora(
     from torch.utils.data import DataLoader
     from torchvision import transforms
 
+    resolved_bmm_mode = resolve_ido_bmm_mode(bmm_mode)
+    bmm_scope = ido_bmm_scope(resolved_bmm_mode)
     if (test_paths is None) != (test_labels is None):
         raise ValueError("test_paths and test_labels must be provided together.")
     if official_test_selected_only and posthoc_oracle_test:
@@ -857,7 +1037,7 @@ def train_ido_lora(
 
     log_stage(
         f"[ido] seed={seed}: Stage 1={resolved_stage1_epochs}, Stage 2={resolved_stage2_epochs}, "
-        f"BMM={IDO_BMM_SCOPE}, train_images={len(train_idx)}, trainable_params={trainable_params}"
+        f"BMM={bmm_scope}, train_images={len(train_idx)}, trainable_params={trainable_params}"
     )
     base_state, base_stage_epoch = _run_stage1(
         torch=torch,
@@ -903,6 +1083,8 @@ def train_ido_lora(
             task_id=task_id,
             experiment_signature=experiment_signature,
             lora_structure_metadata=lora_structure_metadata,
+            bmm_mode=resolved_bmm_mode,
+            bmm_scope=bmm_scope,
         )
     if stage1_checkpoint_token is not None:
         profiler.stop_stage(stage1_checkpoint_token)
@@ -910,7 +1092,11 @@ def train_ido_lora(
     model.to(device)
 
     pool_label_ids = np.asarray([label_to_id[str(train_labels[index])] for index in train_idx], dtype=np.int64)
-    bmm = ClasswiseBMM(classes)
+    bmm = (
+        GlobalBMM(classes)
+        if resolved_bmm_mode == IDO_BMM_MODE_GLOBAL
+        else ClasswiseBMM(classes)
+    )
     with profiling_stage(profiler, "bmm_fit", phase="stage2_initial"):
         bmm_fit_rows = bmm.fit(
             wrong_event[train_idx], pool_label_ids, stage2_epoch=0, fit_round="stage2_initial", max_iter=20
@@ -946,6 +1132,8 @@ def train_ido_lora(
         mse_sum = 0.0
         entropy_sum = 0.0
         posterior_sum = 0.0
+        posterior_mass_deficit_sum = 0.0
+        posterior_mass_deficit_max = 0.0
         seen = 0
         fallback_predictions = 0
         clipped_predictions = 0
@@ -1002,6 +1190,11 @@ def train_ido_lora(
             mse_sum += parts["mse_term"] * batch_size
             entropy_sum += parts["entropy_term"] * batch_size
             posterior_sum += parts["clean_posterior_mean"] * batch_size
+            posterior_mass_deficit_sum += float(bmm_terms["posterior_mass_deficit_sum"])
+            posterior_mass_deficit_max = max(
+                posterior_mass_deficit_max,
+                float(bmm_terms["posterior_mass_deficit_max"]),
+            )
             seen += batch_size
             fallback_predictions += int(bmm_terms["fallback_predictions"])
             clipped_predictions += int(bmm_terms["clipped_predictions"])
@@ -1036,6 +1229,10 @@ def train_ido_lora(
                 "bmm_fallback_predictions": int(fallback_predictions),
                 "bmm_clipped_predictions": int(clipped_predictions),
                 "bmm_fallback_classes": int(bmm.fallback_class_count()),
+                "bmm_mode": resolved_bmm_mode,
+                "bmm_scope": bmm_scope,
+                "bmm_posterior_mass_deficit_sum": float(posterior_mass_deficit_sum),
+                "bmm_posterior_mass_deficit_max": float(posterior_mass_deficit_max),
             }
         )
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -1130,6 +1327,8 @@ def train_ido_lora(
         task_id=task_id,
         experiment_signature=experiment_signature,
         lora_structure_metadata=lora_structure_metadata,
+        bmm_mode=resolved_bmm_mode,
+        bmm_scope=bmm_scope,
     )
     if checkpoint_save_token is not None:
         profiler.stop_stage(checkpoint_save_token)
@@ -1141,6 +1340,8 @@ def train_ido_lora(
         stage2_epochs=resolved_stage2_epochs,
         base_stage_epoch=base_stage_epoch,
         bmm=bmm,
+        bmm_mode=resolved_bmm_mode,
+        bmm_scope=bmm_scope,
     )
     summary["stage1_base_checkpoint"] = str(stage1_base_checkpoint_path) if stage1_base_checkpoint_path is not None else ""
     summary.update(protocol_metrics)
@@ -1504,6 +1705,8 @@ def _save_stage1_base_checkpoint(
     task_id: str,
     experiment_signature: str,
     lora_structure_metadata: dict[str, Any],
+    bmm_mode: str,
+    bmm_scope: str,
 ) -> None:
     """Persist the selected Stage-1 boundary for audit, not in-place resume.
 
@@ -1516,7 +1719,7 @@ def _save_stage1_base_checkpoint(
     torch.save(
         {
             "method": method,
-            "ido_adaptation": IDO_ADAPTATION_NAME,
+            "ido_adaptation": ido_adaptation_name(bmm_mode),
             "seed": int(seed),
             "classes": classes,
             "state_dict": base_state,
@@ -1528,6 +1731,8 @@ def _save_stage1_base_checkpoint(
             "resume_support": "not_implemented_fail_closed_new_attempt_required",
             "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
+            "bmm_mode": bmm_mode,
+            "bmm_scope": bmm_scope,
             "task_contract_sha256": task_contract_sha256,
             "task_id": task_id,
             "experiment_signature": experiment_signature,
@@ -1560,6 +1765,8 @@ def _save_checkpoints(
     task_id: str,
     experiment_signature: str,
     lora_structure_metadata: dict[str, Any],
+    bmm_mode: str,
+    bmm_scope: str,
 ) -> None:
     del model
     metadata = {
@@ -1567,11 +1774,12 @@ def _save_checkpoints(
         "seed": int(seed),
         "classes": classes,
         "checkpoint_protocol": checkpoint_protocol,
-        "ido_adaptation": IDO_ADAPTATION_NAME,
+        "ido_adaptation": ido_adaptation_name(bmm_mode),
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
         "base_stage1_epoch": int(base_stage_epoch),
-        "bmm_scope": IDO_BMM_SCOPE,
+        "bmm_mode": bmm_mode,
+        "bmm_scope": bmm_scope,
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
         "weloss_source": IDO_WELoss_SOURCE,
@@ -1601,7 +1809,9 @@ def _summarize_ido_logs(
     stage1_epochs: int,
     stage2_epochs: int,
     base_stage_epoch: int,
-    bmm: ClasswiseBMM,
+    bmm: ClasswiseBMM | GlobalBMM,
+    bmm_mode: str,
+    bmm_scope: str,
 ) -> dict[str, Any]:
     stage2_logs = [row for row in logs if row["stage"] == "stage2"]
     if not stage2_logs:
@@ -1623,14 +1833,15 @@ def _summarize_ido_logs(
         "last5_std": float(np.asarray([row["top1"] for row in stage2_logs[-5:]], dtype=np.float32).std()),
         "trainable_params": int(final["trainable_params"]),
         "total_params": int(final["total_params"]),
-        "selection_mode": "ido_classwise_bmm_all_training_pool",
-        "selection_strategy": "classwise_bmm_weighted_loss",
+        "selection_mode": f"ido_{bmm_mode}_bmm_all_training_pool",
+        "selection_strategy": f"{bmm_mode}_bmm_weighted_loss",
         "prototype_mode": "",
         "loss_type": "ido_official_weloss",
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
         "base_stage1_epoch": int(base_stage_epoch),
-        "bmm_scope": IDO_BMM_SCOPE,
+        "bmm_mode": bmm_mode,
+        "bmm_scope": bmm_scope,
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
         "weloss_source": IDO_WELoss_SOURCE,

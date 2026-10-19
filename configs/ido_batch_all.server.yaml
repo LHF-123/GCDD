@@ -19,6 +19,7 @@ formal:
   epochs: 30
   stage1_epochs: 10
   validation_seed: 20250726
+  bmm_mode: classwise
 
 datasets:
   cub:

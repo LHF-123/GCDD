@@ -28,6 +28,7 @@ from .lora_training import (
     build_dinov2_vitb14_lora_structure_contract,
     canonical_structure_sha256,
 )
+from .ido import ido_adaptation_name, ido_bmm_scope, resolve_ido_bmm_mode
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +102,7 @@ class IDOBatchConfig:
     epochs: int
     stage1_epochs: int | None
     validation_seed: int
+    bmm_mode: str
     datasets: tuple[DatasetSpec, ...]
 
 
@@ -233,6 +235,7 @@ def load_config(path: Path) -> IDOBatchConfig:
         raise ValueError("formal.stage1_epochs must lie strictly within total epochs.")
     if stage1_epochs is None and int(formal["epochs"]) % 3:
         raise ValueError("formal.stage1_epochs is required when formal.epochs is not divisible by 3.")
+    bmm_mode = resolve_ido_bmm_mode(formal.get("bmm_mode", "classwise"))
     datasets_data = require_mapping(payload, "datasets")
     if set(datasets_data) != set(DATASET_ORDER):
         raise ValueError(f"datasets must contain exactly {list(DATASET_ORDER)}.")
@@ -276,6 +279,7 @@ def load_config(path: Path) -> IDOBatchConfig:
         epochs=int(formal["epochs"]),
         stage1_epochs=stage1_epochs,
         validation_seed=int(formal["validation_seed"]),
+        bmm_mode=bmm_mode,
         datasets=tuple(datasets),
     )
 
@@ -600,6 +604,7 @@ def build_training_command(config: IDOBatchConfig, task: IDOTask) -> list[str]:
         "--revision-profiling-mode", "basic",
         "--revision-output-root", str(config.instrumentation_root / task.attempt_id),
         "--ido-task-contract", str(task.contract_path),
+        "--ido-bmm-mode", config.bmm_mode,
     ]
     if config.stage1_epochs is not None:
         command.extend(["--ido-stage1-epochs", str(config.stage1_epochs)])
@@ -680,6 +685,8 @@ def build_task_contract(config: IDOBatchConfig, task: IDOTask) -> dict[str, Any]
         "official_test_selected_only": True,
         "posthoc_oracle_test": False,
         "checkpoint_protocol": "fixed_clean_validation_v1",
+        "bmm_mode": config.bmm_mode,
+        "bmm_scope": ido_bmm_scope(config.bmm_mode),
         "batch_config_sha256": sha256_file(config.path),
         "assets": assets,
         "code_sha256": {name: sha256_file(path) for name, path in code_paths.items()},
@@ -734,7 +741,7 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         return False, "task contract does not match the current frozen config/input/code identity"
     if result.get("method_key") != "ido" or int(result.get("seed", -1)) != task.seed:
         return False, "result metadata does not match stable task ID"
-    if result.get("method") != "IDO-style DINOv2-B/14+LoRA controlled adaptation":
+    if result.get("method") != ido_adaptation_name(config.bmm_mode):
         return False, "result method identity is not the controlled IDO adaptation"
     if policy.get("method_key") != "ido":
         return False, "selection policy method identity is not IDO"
@@ -746,6 +753,10 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         return False, "selection policy does not attest to this task contract"
     if result.get("bmm_degenerate_policy") != "fail_closed_record_and_abort":
         return False, "result does not use fail-closed BMM policy"
+    if result.get("bmm_mode") != config.bmm_mode or result.get("bmm_scope") != ido_bmm_scope(config.bmm_mode):
+        return False, "result BMM mode/scope does not match the frozen batch config"
+    if policy.get("ido_bmm_mode") != config.bmm_mode or policy.get("ido_bmm_scope") != ido_bmm_scope(config.bmm_mode):
+        return False, "selection policy BMM mode/scope does not match the frozen batch config"
     if result.get("d1_recording_status") != "complete":
         return False, "IDO D1 output is incomplete"
     expected_stage1 = config.stage1_epochs if config.stage1_epochs is not None else config.epochs // 3
@@ -796,6 +807,7 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         expected_classes=task.dataset.expected_classes,
         expected_stage1_epochs=expected_stage1,
         expected_stage2_epochs=expected_stage2,
+        bmm_mode=config.bmm_mode,
     )
     if bmm_error:
         return False, bmm_error
@@ -897,14 +909,18 @@ def validate_bmm_fit_artifact(
     expected_classes: int,
     expected_stage1_epochs: int,
     expected_stage2_epochs: int,
+    bmm_mode: str = "classwise",
 ) -> str:
-    """Require every class-wise BMM fit actually consumed by Stage 2.
+    """Require every BMM fit actually consumed by Stage 2.
 
-    A successful run has one initial fit at Stage-2 epoch 0, then one fit per
-    observed-label class after each nonterminal Stage-2 epoch.  The terminal
-    refit is intentionally absent because no later optimization step consumes
-    it.  This validates only observed labels and public fit diagnostics.
+    The class-wise variant requires one row per observed class and fit round.
+    The explicit global variant requires exactly one all-training-pool row per
+    fit round; it must never masquerade as 200 independent class fits.  Both
+    paths intentionally omit the terminal refit because no later optimizer
+    step consumes it.
     """
+    bmm_mode = resolve_ido_bmm_mode(bmm_mode)
+    expected_scope = ido_bmm_scope(bmm_mode)
     classes = sorted(set(np.asarray(canonical_labels, dtype=str).tolist()))
     if len(classes) != expected_classes:
         return "BMM audit observed-label vocabulary does not match the configured class count"
@@ -922,14 +938,18 @@ def validate_bmm_fit_artifact(
         except (KeyError, TypeError, ValueError):
             return "BMM audit cannot parse the already-validated Stage-1 wrong-event artifact"
 
-    expected_rows: list[tuple[str, int, int, str]] = []
+    expected_rows: list[tuple[str, int, int | str, str, int]] = []
     for stage2_epoch in range(0, expected_stage2_epochs):
         fit_round = "stage2_initial" if stage2_epoch == 0 else "stage2_epoch_update"
-        for label_id, label in enumerate(classes):
-            expected_rows.append((fit_round, stage2_epoch, label_id, label))
+        if bmm_mode == "global":
+            expected_rows.append((fit_round, stage2_epoch, "", "", len(training_indices)))
+        else:
+            for label_id, label in enumerate(classes):
+                expected_rows.append((fit_round, stage2_epoch, label_id, label, support[label]))
     if len(rows) != len(expected_rows):
+        display_mode = "class-wise" if bmm_mode == "classwise" else "global"
         return (
-            "bmm_class_fits.csv does not contain the required class-wise initial plus nonterminal Stage-2 fits: "
+            f"bmm_class_fits.csv does not contain the required {display_mode} initial plus nonterminal Stage-2 fits: "
             f"{len(rows)} != {len(expected_rows)}"
         )
 
@@ -944,37 +964,66 @@ def validate_bmm_fit_artifact(
         "weight_2",
         "component_1_normalized_mean",
         "component_2_normalized_mean",
+        "component_1_soft_assignment",
+        "component_1_kish_ess",
+        "component_1_weight_times_n",
+        "component_1_max_responsibility",
+        "component_2_soft_assignment",
+        "component_2_kish_ess",
+        "component_2_weight_times_n",
+        "component_2_max_responsibility",
+        "posterior_1_min",
+        "posterior_1_max",
+        "posterior_2_min",
+        "posterior_2_max",
+        "cdf_1_min",
+        "cdf_1_max",
+        "cdf_2_min",
+        "cdf_2_max",
+        "posterior_mass_sum",
+        "posterior_mass_deficit",
+        "posterior_mass_min",
+        "posterior_mass_max",
     )
     for position, (row, expected) in enumerate(zip(rows, expected_rows)):
-        fit_round, stage2_epoch, label_id, label = expected
+        fit_round, stage2_epoch, label_id, label, expected_sample_count = expected
         required = (
-            "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
+            "bmm_mode", "bmm_scope", "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
             "unique_wrong_event_count", "bmm_status", "bmm_reason", "bmm_fit_iterations", *numeric_fields,
+            "component_1_responsibility_ge_half_count", "component_2_responsibility_ge_half_count",
+            "bmm_prediction_clipped_count",
         )
         if "bmm_reason" not in row:
             return f"bmm_class_fits.csv row {position} is missing the bmm_reason schema column"
         # A successful BMM fit has an intentionally empty bmm_reason value,
         # while all other fields must have a parseable value.
-        missing = [key for key in required if key != "bmm_reason" and (key not in row or row[key] == "")]
+        blank_allowed = {"bmm_reason"}
+        if bmm_mode == "global":
+            blank_allowed.update({"observed_label_id", "observed_label"})
+        missing = [key for key in required if key not in blank_allowed and (key not in row or row[key] == "")]
         if missing:
             return f"bmm_class_fits.csv row {position} is missing required fields: {missing}"
         try:
             actual_epoch = int(row["stage2_epoch"])
-            actual_label_id = int(row["observed_label_id"])
+            actual_label_id = row["observed_label_id"] if bmm_mode == "global" else int(row["observed_label_id"])
             sample_count = int(row["sample_count"])
             unique_count = int(row["unique_wrong_event_count"])
             iterations = int(row["bmm_fit_iterations"])
             values = {field: float(row[field]) for field in numeric_fields}
+            ge_half = (int(row["component_1_responsibility_ge_half_count"]), int(row["component_2_responsibility_ge_half_count"]))
+            clipped = int(row["bmm_prediction_clipped_count"])
         except (TypeError, ValueError):
             return f"bmm_class_fits.csv row {position} has a non-numeric required value"
         if row["fit_round"] != fit_round or actual_epoch != stage2_epoch:
             return f"bmm_class_fits.csv row {position} has an unexpected fit round/Stage-2 epoch"
+        if row["bmm_mode"] != bmm_mode or row["bmm_scope"] != expected_scope:
+            return f"bmm_class_fits.csv row {position} BMM mode/scope differs from the frozen protocol"
         if actual_label_id != label_id or row["observed_label"] != label:
             return f"bmm_class_fits.csv row {position} has an unexpected observed-label class identity"
         if row["bmm_status"] != "fitted" or str(row.get("bmm_reason", "")):
             return f"bmm_class_fits.csv row {position} is not a successful, reason-free BMM fit"
-        if sample_count != support[label] or unique_count < 2 or unique_count > sample_count:
-            return f"bmm_class_fits.csv row {position} has invalid observed-class support or diversity metadata"
+        if sample_count != expected_sample_count or unique_count < 2 or unique_count > sample_count:
+            return f"bmm_class_fits.csv row {position} has invalid BMM support or diversity metadata"
         if iterations != (20 if stage2_epoch == 0 else 2):
             return f"bmm_class_fits.csv row {position} has an unexpected BMM iteration budget"
         if not all(math.isfinite(value) for value in values.values()):
@@ -999,8 +1048,23 @@ def validate_bmm_fit_artifact(
             return f"bmm_class_fits.csv row {position} violates ordered component-mean semantics"
         if not all(math.isclose(value, expected, rel_tol=0.0, abs_tol=1.0e-6) for value, expected in zip(means, expected_means)):
             return f"bmm_class_fits.csv row {position} component means do not match its Beta parameters"
+        if any(value < 0.0 or value > sample_count for value in (*ge_half, clipped)):
+            return f"bmm_class_fits.csv row {position} has invalid BMM responsibility/clipping counts"
+        if not (0.0 <= values["posterior_mass_min"] <= values["posterior_mass_max"] <= 1.0):
+            return f"bmm_class_fits.csv row {position} has invalid posterior-mass range"
+        if values["posterior_mass_deficit"] < 0.0 or values["posterior_mass_sum"] > sample_count + 1.0e-6:
+            return f"bmm_class_fits.csv row {position} violates the official epsilon posterior-mass semantics"
+        if any(
+            not (0.0 <= values[field] <= 1.0)
+            for field in ("posterior_1_min", "posterior_1_max", "posterior_2_min", "posterior_2_max", "cdf_1_min", "cdf_1_max", "cdf_2_min", "cdf_2_max")
+        ):
+            return f"bmm_class_fits.csv row {position} has out-of-range posterior/CDF diagnostics"
         if stage2_epoch == 0:
-            initial_values = [stage1_by_index[index] for index in training_indices if str(canonical_labels[index]) == label]
+            initial_values = (
+                [stage1_by_index[index] for index in training_indices]
+                if bmm_mode == "global"
+                else [stage1_by_index[index] for index in training_indices if str(canonical_labels[index]) == label]
+            )
             if (
                 unique_count != len(set(initial_values))
                 or not math.isclose(values["wrong_event_min"], float(min(initial_values)), rel_tol=0.0, abs_tol=1.0e-8)
@@ -1194,15 +1258,16 @@ def validate_checkpoints(
     """
     import torch
 
-    from .ido import IDO_ADAPTATION_NAME
-
     contract_sha256 = canonical_json_sha256(contract)
+    contract_bmm_mode = resolve_ido_bmm_mode(contract["experiment"].get("bmm_mode", "classwise"))
     expected_common = {
-        "method": IDO_ADAPTATION_NAME,
+        "method": ido_adaptation_name(contract_bmm_mode),
         "seed": task.seed,
-        "ido_adaptation": IDO_ADAPTATION_NAME,
+        "ido_adaptation": ido_adaptation_name(contract_bmm_mode),
         "stage1_epochs": expected_stage1,
         "stage2_epochs": expected_stage2,
+        "bmm_mode": contract_bmm_mode,
+        "bmm_scope": ido_bmm_scope(contract_bmm_mode),
         "task_contract_sha256": contract_sha256,
         "task_id": task.task_id,
         "experiment_signature": contract["experiment_signature"],

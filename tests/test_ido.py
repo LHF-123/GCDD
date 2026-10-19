@@ -13,6 +13,10 @@ from gcdd.ido import (
     BMMDegenerateError,
     ClassConditionalBetaMixture,
     ClasswiseBMM,
+    GlobalBMM,
+    IDO_BMM_MODE_GLOBAL,
+    IDO_GLOBAL_BMM_SCOPE,
+    ido_adaptation_name,
     official_we_loss,
     official_we_loss_per_sample,
     resolve_stage_budget,
@@ -110,6 +114,51 @@ class IDOTests(unittest.TestCase):
         self.assertTrue(np.all((terms["prob1"] >= 0.0) & (terms["prob1"] <= 1.0)))
         self.assertTrue(np.all((terms["cdf1"] >= 0.0) & (terms["cdf1"] <= 1.0)))
         np.testing.assert_allclose(terms["prob1"] + terms["prob2"], np.ones(4), atol=1.0e-5)
+
+    def test_global_bmm_uses_one_pool_model_and_preserves_epsilon_posterior_semantics(self) -> None:
+        values = np.tile(np.arange(11, dtype=np.int64), 24)
+        labels = np.arange(len(values), dtype=np.int64) % 3
+        bmm = GlobalBMM(["a", "b", "c"])
+        rows = bmm.fit(values, labels, stage2_epoch=0, fit_round="stage2_initial", max_iter=20)
+        terms = bmm.predict(values, labels, stage2_epoch=1)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual(IDO_BMM_MODE_GLOBAL, rows[0]["bmm_mode"])
+        self.assertEqual(IDO_GLOBAL_BMM_SCOPE, rows[0]["bmm_scope"])
+        self.assertEqual(len(values), rows[0]["sample_count"])
+        self.assertEqual("", rows[0]["observed_label_id"])
+        self.assertGreater(rows[0]["posterior_mass_deficit"], 0.0)
+        self.assertTrue(np.all(np.isfinite(terms["prob1"])))
+        self.assertTrue(np.all(np.isfinite(terms["cdf1"])))
+        self.assertTrue(np.all(terms["prob1"] + terms["prob2"] < 1.0))
+        self.assertFalse(np.allclose(1.0 - terms["prob1"], terms["prob2"], atol=0.0))
+        import torch
+
+        batch = 3
+        output_s = torch.tensor([[2.0, 0.1], [0.4, 0.8], [1.0, -0.5]], requires_grad=True)
+        output_w = torch.tensor([[1.5, 0.2], [0.1, 1.0], [0.9, -0.2]], requires_grad=True)
+        labels_tensor = torch.tensor([0, 1, 0], dtype=torch.int64)
+        weloss = official_we_loss_per_sample(
+            torch,
+            output_s,
+            output_w,
+            terms["prob1"][:batch],
+            terms["prob2"][:batch],
+            terms["cdf1"][:batch],
+            terms["cdf2"][:batch],
+            labels_tensor,
+        )
+        p1 = torch.as_tensor(terms["prob1"][:batch], dtype=output_s.dtype)
+        p2 = torch.as_tensor(terms["prob2"][:batch], dtype=output_s.dtype)
+        c1 = torch.as_tensor(terms["cdf1"][:batch], dtype=output_s.dtype)
+        c2 = torch.as_tensor(terms["cdf2"][:batch], dtype=output_s.dtype)
+        mse = torch.nn.functional.mse_loss(output_s, output_w, reduction="none").mean(dim=1)
+        expected_weight = p1 * c1 + (1.0 - p2) * (1.0 - c2)
+        self.assertTrue(torch.allclose(weloss["consistency_weight"], expected_weight, atol=1.0e-6))
+        self.assertFalse(torch.allclose(1.0 - p1, p2, atol=0.0))
+
+    def test_global_bmm_identity_is_distinct_from_classwise(self) -> None:
+        self.assertNotEqual(ido_adaptation_name("classwise"), ido_adaptation_name("global"))
 
     def test_classwise_failure_includes_observed_class_epoch_and_reason(self) -> None:
         bmm = ClasswiseBMM(["a", "b"])
@@ -321,10 +370,37 @@ class IDOTests(unittest.TestCase):
                     "prob1": np.full(length, 0.6), "prob2": np.full(length, 0.4),
                     "cdf1": np.full(length, 0.4), "cdf2": np.full(length, 0.6),
                     "fallback_predictions": 0, "clipped_predictions": 0,
+                    "posterior_mass_deficit_sum": 0.0, "posterior_mass_deficit_max": 0.0,
                 }
 
             def fallback_class_count(self) -> int:
                 return 0
+
+        class StableGlobalTestBMM(StableTestBMM):
+            def fit(self, wrong_event: np.ndarray, label_ids: np.ndarray, *, stage2_epoch: int, fit_round: str, max_iter: int) -> list[dict[str, object]]:
+                return [
+                    {
+                        "bmm_mode": "global",
+                        "bmm_scope": "all_observed_training_pool",
+                        "fit_round": fit_round,
+                        "stage2_epoch": stage2_epoch,
+                        "observed_label_id": "",
+                        "observed_label": "",
+                        "sample_count": int(len(wrong_event)),
+                        "unique_wrong_event_count": 2,
+                        "wrong_event_min": 0.0,
+                        "wrong_event_max": 1.0,
+                        "bmm_status": "fitted",
+                        "bmm_reason": "",
+                        "bmm_fit_iterations": max_iter,
+                        "alpha_1": 1.0,
+                        "beta_1": 2.0,
+                        "weight_1": 0.5,
+                        "alpha_2": 2.0,
+                        "beta_2": 1.0,
+                        "weight_2": 0.5,
+                    }
+                ]
 
         cfg = {
             "feature": {"device": "cpu", "input_size": 16},
@@ -344,14 +420,20 @@ class IDOTests(unittest.TestCase):
                 paths.append(str(image_path))
             labels = np.asarray(["a", "a", "b", "b"])
             profiler = RunProfiler("ido-cpu-smoke", mode="basic", device_type="cpu")
-            with mock.patch("gcdd.lora_training.load_dinov2_model", return_value=FakeBackbone()), mock.patch(
+            with mock.patch("gcdd.lora_training.load_dinov2_model", side_effect=lambda *args, **kwargs: FakeBackbone()), mock.patch(
                 "gcdd.ido.ClasswiseBMM", StableTestBMM
-            ):
+            ), mock.patch("gcdd.ido.GlobalBMM", StableGlobalTestBMM):
                 result = train_ido_lora(
                     paths, labels, paths, labels, np.ones(len(labels), dtype=bool), cfg,
                     method="ido-smoke", seed=1, checkpoint_path=root / "best_val.pt",
                     test_paths=paths, test_labels=labels, final_checkpoint_path=root / "last.pt",
                     last5_checkpoint_dir=root / "last5", official_test_selected_only=True, profiler=profiler,
+                )
+                global_result = train_ido_lora(
+                    paths, labels, paths, labels, np.ones(len(labels), dtype=bool), cfg,
+                    method="ido-global-smoke", seed=2, bmm_mode="global", checkpoint_path=root / "global" / "best_val.pt",
+                    final_checkpoint_path=root / "global" / "last.pt", last5_checkpoint_dir=root / "global" / "last5",
+                    profiler=RunProfiler("ido-global-cpu-smoke", mode="basic", device_type="cpu"),
                 )
 
             self.assertEqual(3, len(result.logs))
@@ -400,6 +482,9 @@ class IDOTests(unittest.TestCase):
             self.assertGreaterEqual(result.summary["d1_end_to_end_wall_seconds"], 0.0)
             self.assertGreaterEqual(result.summary["d1_validation_seconds"], 0.0)
             self.assertEqual(0, result.summary["final_bmm_fallback_classes"])
+            self.assertEqual("global", global_result.summary["bmm_mode"])
+            self.assertEqual(2, len(global_result.bmm_fit_rows))
+            self.assertTrue(all(row["bmm_mode"] == "global" for row in global_result.bmm_fit_rows))
 
 
 if __name__ == "__main__":

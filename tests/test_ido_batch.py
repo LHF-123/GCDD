@@ -17,6 +17,7 @@ from PIL import Image
 from gcdd.ido_batch import (
     IDO_RUNTIME_CODE_PATHS,
     build_plan,
+    build_training_command,
     build_task_contract,
     find_reusable_completed_task,
     is_complete,
@@ -80,7 +81,13 @@ class IDOBatchTests(unittest.TestCase):
             "runtime_environment": {"python": "synthetic-test"},
         }
 
-    def _write_fixture_config(self, root: Path, *, protocol_frozen: bool = False) -> Path:
+    def _write_fixture_config(
+        self,
+        root: Path,
+        *,
+        protocol_frozen: bool = False,
+        bmm_mode: str = "classwise",
+    ) -> Path:
         datasets: dict[str, object] = {}
         strategies = {
             "cyclic": "adjacent_cyclic",
@@ -166,14 +173,14 @@ class IDOBatchTests(unittest.TestCase):
             "runtime": {"python_executable": sys.executable},
             "output": {"root": str(root / "outputs"), "instrumentation_root": str(root / "instrumentation")},
             "protocol": {"protocol_frozen": protocol_frozen},
-            "formal": {"epochs": 30, "stage1_epochs": 10, "validation_seed": 20250726},
+            "formal": {"epochs": 30, "stage1_epochs": 10, "validation_seed": 20250726, "bmm_mode": bmm_mode},
             "datasets": datasets,
         }
         config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
         return config_path
 
     def _materialize_complete_task(self, task, config, score: float) -> None:
-        from gcdd.ido import IDO_ADAPTATION_NAME
+        from gcdd.ido import ido_adaptation_name, ido_bmm_scope
 
         task.run_dir.mkdir(parents=True, exist_ok=True)
         task.run_root.mkdir(parents=True, exist_ok=True)
@@ -189,14 +196,16 @@ class IDOBatchTests(unittest.TestCase):
         ).hexdigest()
         (task.run_dir / "checkpoints").mkdir(exist_ok=True)
         common = {
-            "method": IDO_ADAPTATION_NAME,
-            "ido_adaptation": IDO_ADAPTATION_NAME,
+            "method": ido_adaptation_name(config.bmm_mode),
+            "ido_adaptation": ido_adaptation_name(config.bmm_mode),
             "seed": task.seed,
             "classes": ["a", "b"],
             "state_dict": self._valid_controlled_state_dict(),
             "checkpoint_protocol": "fixed_clean_validation_v1",
             "stage1_epochs": int(config.stage1_epochs or config.epochs // 3),
             "stage2_epochs": int(config.epochs - int(config.stage1_epochs or config.epochs // 3)),
+            "bmm_mode": config.bmm_mode,
+            "bmm_scope": ido_bmm_scope(config.bmm_mode),
             "task_contract_sha256": contract_sha256,
             "task_id": task.task_id,
             "experiment_signature": contract["experiment_signature"],
@@ -222,22 +231,33 @@ class IDOBatchTests(unittest.TestCase):
                 )
         with (task.run_dir / "bmm_class_fits.csv").open("w", encoding="utf-8", newline="") as handle:
             fields = [
-                "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
+                "bmm_mode", "bmm_scope", "fit_round", "stage2_epoch", "observed_label_id", "observed_label", "sample_count",
                 "unique_wrong_event_count", "wrong_event_min", "wrong_event_max", "bmm_status", "bmm_reason",
                 "bmm_fit_iterations", "alpha_1", "beta_1", "weight_1", "alpha_2", "beta_2", "weight_2",
                 "component_1_normalized_mean", "component_2_normalized_mean",
+                "component_1_soft_assignment", "component_1_kish_ess", "component_1_weight_times_n",
+                "component_1_max_responsibility", "component_1_responsibility_ge_half_count",
+                "component_2_soft_assignment", "component_2_kish_ess", "component_2_weight_times_n",
+                "component_2_max_responsibility", "component_2_responsibility_ge_half_count",
+                "posterior_1_min", "posterior_1_max", "posterior_2_min", "posterior_2_max",
+                "cdf_1_min", "cdf_1_max", "cdf_2_min", "cdf_2_max",
+                "posterior_mass_sum", "posterior_mass_deficit", "posterior_mass_min", "posterior_mass_max",
+                "bmm_prediction_clipped_count",
             ]
             writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             for stage2_epoch in range(20):
-                for label_id, label in enumerate(("a", "b")):
+                fit_specs = [("", "", 4)] if config.bmm_mode == "global" else [(0, "a", 2), (1, "b", 2)]
+                for label_id, label, sample_count in fit_specs:
                     writer.writerow(
                         {
+                            "bmm_mode": config.bmm_mode,
+                            "bmm_scope": ido_bmm_scope(config.bmm_mode),
                             "fit_round": "stage2_initial" if stage2_epoch == 0 else "stage2_epoch_update",
                             "stage2_epoch": stage2_epoch,
                             "observed_label_id": label_id,
                             "observed_label": label,
-                            "sample_count": 2,
+                            "sample_count": sample_count,
                             "unique_wrong_event_count": 2,
                             "wrong_event_min": 0.0,
                             "wrong_event_max": 1.0,
@@ -252,6 +272,29 @@ class IDOBatchTests(unittest.TestCase):
                             "weight_2": 0.5,
                             "component_1_normalized_mean": 1.0 / 3.0,
                             "component_2_normalized_mean": 2.0 / 3.0,
+                            "component_1_soft_assignment": sample_count / 2.0,
+                            "component_1_kish_ess": sample_count / 2.0,
+                            "component_1_weight_times_n": sample_count / 2.0,
+                            "component_1_max_responsibility": 0.5,
+                            "component_1_responsibility_ge_half_count": sample_count,
+                            "component_2_soft_assignment": sample_count / 2.0,
+                            "component_2_kish_ess": sample_count / 2.0,
+                            "component_2_weight_times_n": sample_count / 2.0,
+                            "component_2_max_responsibility": 0.5,
+                            "component_2_responsibility_ge_half_count": sample_count,
+                            "posterior_1_min": 0.5,
+                            "posterior_1_max": 0.5,
+                            "posterior_2_min": 0.5,
+                            "posterior_2_max": 0.5,
+                            "cdf_1_min": 0.2,
+                            "cdf_1_max": 0.8,
+                            "cdf_2_min": 0.2,
+                            "cdf_2_max": 0.8,
+                            "posterior_mass_sum": sample_count,
+                            "posterior_mass_deficit": 0.0,
+                            "posterior_mass_min": 1.0,
+                            "posterior_mass_max": 1.0,
+                            "bmm_prediction_clipped_count": 0,
                         }
                     )
         with (task.run_dir / "train_log.csv").open("w", encoding="utf-8", newline="") as handle:
@@ -262,6 +305,8 @@ class IDOBatchTests(unittest.TestCase):
             json.dumps(
                 {
                     "method_key": "ido",
+                    "ido_bmm_mode": config.bmm_mode,
+                    "ido_bmm_scope": ido_bmm_scope(config.bmm_mode),
                     "ido_task_contract_sha256": contract_sha256,
                     "ido_experiment_signature": contract["experiment_signature"],
                 }
@@ -272,8 +317,10 @@ class IDOBatchTests(unittest.TestCase):
             json.dumps(
                 {
                     "method_key": "ido",
-                    "method": IDO_ADAPTATION_NAME,
+                    "method": ido_adaptation_name(config.bmm_mode),
                     "seed": task.seed,
+                    "bmm_mode": config.bmm_mode,
+                    "bmm_scope": ido_bmm_scope(config.bmm_mode),
                     "bmm_degenerate_policy": "fail_closed_record_and_abort",
                     "d1_recording_status": "complete",
                     "stage1_epochs": config.stage1_epochs,
@@ -304,6 +351,28 @@ class IDOBatchTests(unittest.TestCase):
             self.assertEqual(27, len({task.task_id for task in all_tasks}))
             findings = preflight(config, all_tasks)
             self.assertTrue(all(item["ok"] for item in findings), findings)
+
+    def test_global_mode_has_a_distinct_contract_signature_and_completion_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            classwise = load_config(self._write_fixture_config(root / "classwise", bmm_mode="classwise"))
+            global_mode = load_config(self._write_fixture_config(root / "global", bmm_mode="global"))
+            classwise_task = build_plan(classwise, ("cyclic",), attempt=1)[0]
+            global_task = build_plan(global_mode, ("cyclic",), attempt=1)[0]
+            self.assertNotEqual(
+                build_task_contract(classwise, classwise_task)["experiment_signature"],
+                build_task_contract(global_mode, global_task)["experiment_signature"],
+            )
+            command = build_training_command(global_mode, global_task)
+            self.assertIn("--ido-bmm-mode", command)
+            self.assertEqual("global", command[command.index("--ido-bmm-mode") + 1])
+            self._materialize_complete_task(global_task, global_mode, score=0.2)
+            complete, detail = is_complete(global_task, global_mode)
+            self.assertTrue(complete, detail)
+            with (global_task.run_dir / "bmm_class_fits.csv").open(encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(20, len(rows))
+            self.assertTrue(all(row["observed_label_id"] == "" for row in rows))
 
     def test_seed_contract_location_matches_the_single_run_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
