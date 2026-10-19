@@ -43,7 +43,13 @@ from gcdd.ido import (
     resolve_stage_budget,
     train_ido_lora,
 )
-from gcdd.lora_dynamic import selection_update_epochs, train_dynamic_loss_lora
+from gcdd.lora_dynamic import (
+    BUDGET_MATCHED_PROTO_STRATEGY,
+    BUDGET_MATCHED_RANDOM_STRATEGY,
+    RANDOM_BUDGET_SELECTION_SCHEME,
+    selection_update_epochs,
+    train_dynamic_loss_lora,
+)
 from gcdd.lora_noisy_baselines import train_coteaching_lora, train_jocor_lora
 from gcdd.lora_training import train_dinov2_lora
 from gcdd.noise_generalization import (
@@ -83,10 +89,15 @@ METHODS = (
 # DINOv2-LoRA adaptation of an external method, not one of the frozen original
 # 13-method comparison runs or a PGDF ablation.
 CONTROLLED_ADAPTATION_METHODS = ("ido",)
+EXACT_BUDGET_CONTROL_METHODS = (
+    "pgdf_exact_budget_proto",
+    "pgdf_exact_budget_random",
+)
 ABLATION_METHODS = (
     "proto_only",
     "dynamic_budget_matched",
     "dynamic_budget_matched_dynamic_proto",
+    *EXACT_BUDGET_CONTROL_METHODS,
     "dynamic_proto_only",
     "pgdf_dynamic_proto",
     "fixed_proto_warmup_matched",
@@ -128,6 +139,7 @@ DYNAMIC_METHODS = (
     "dynamic_r09",
     "dynamic_budget_matched",
     "dynamic_budget_matched_dynamic_proto",
+    *EXACT_BUDGET_CONTROL_METHODS,
     "pgdf_auto",
     "pgdf_fixed",
     "dynamic_proto_only",
@@ -152,6 +164,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Use 'all' for the 13 primary methods, or an explicit subset. "
             "proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, and pgdf_fusion_* are explicit ablations; "
+            "pgdf_exact_budget_{proto,random} are exact class-wise budget controls; "
             "ido is an opt-in controlled adaptation; dynamic aliases dynamic_r08."
         ),
     )
@@ -165,7 +178,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reference directory containing seed*/selection_per_class.csv from the declared PGDF source. "
             "Required by budget-matched methods and pgdf_fusion_*; fixed fusion requires pgdf_fixed and "
-            "pgdf_dynamic_fusion_* requires pgdf_dynamic_proto. Fusion methods read counts only, never PGDF sample identities."
+            "pgdf_dynamic_fusion_* and pgdf_exact_budget_* require pgdf_dynamic_proto. "
+            "Budget-matched methods read counts only, never PGDF sample identities."
         ),
     )
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Dynamic/PGDF full-pool warm-up epochs.")
@@ -185,7 +199,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Evaluate official test only once on best_val.pt for single-branch methods. "
-            "Required for proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, and pgdf_fusion_* methods."
+            "Required for proto_only, dynamic_budget_matched, dynamic_proto_only, pgdf_dynamic_proto, "
+            "pgdf_exact_budget_*, and pgdf_fusion_* methods."
         ),
     )
     parser.add_argument("--epochs", type=int, help="Override number of training epochs.")
@@ -294,6 +309,14 @@ def main() -> None:
     canonical_methods = [canonical_method_key(method) for method in methods]
     validate_ido_pilot_no_official_test_request(args, canonical_methods, seeds)
     dynamic_fusion_requested = bool(set(canonical_methods) & set(DYNAMIC_FUSION_ABLATION_METHODS))
+    dynamic_budget_control_requested = bool(
+        set(canonical_methods)
+        & {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}
+    )
+    dynamic_prototype_score_requested = bool(
+        set(canonical_methods)
+        & {*DYNAMIC_FUSION_ABLATION_METHODS, "pgdf_exact_budget_proto"}
+    )
     fixed_fusion_requested = bool(set(canonical_methods) & set(FIXED_FUSION_ABLATION_METHODS))
     dynamic_budget_source_provenance = ""
     validate_official_test_request(methods, bool(args.official_test_selected_only))
@@ -362,7 +385,9 @@ def main() -> None:
                 "method-specific mixed frozen and current-LoRA prototype similarity"
                 if dynamic_fusion_requested and fixed_fusion_requested
                 else "current LoRA-adapted CLS rebuilt at every selection update"
-                if dynamic_fusion_requested
+                if dynamic_prototype_score_requested
+                else "not used by the requested small-loss-only/random actual-budget controls"
+                if dynamic_budget_control_requested
                 else "existing frozen PGDF prototype similarity"
             ),
             "loss_source": "current-model full-training-pool CE loss",
@@ -374,6 +399,12 @@ def main() -> None:
                 "prototype_weight": 0.5,
                 "positive_weight_floor": 1.0e-6,
                 "class_normalization": "sum_to_reference_pgdf_budget",
+            },
+            "dynamic_pgdf_budget_controls": {
+                "reference": "actual selected_count per observed-label class and selection update only",
+                "source_method": "pgdf_dynamic_proto",
+                "controls": ["dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS],
+                "random_selection": RANDOM_BUDGET_SELECTION_SCHEME,
             },
         },
         "noise_realization": noise_metadata,
@@ -417,7 +448,7 @@ def main() -> None:
         return
     if pgdf_budget_root is not None:
         validate_budget_source_manifest(pgdf_budget_root, split.metadata)
-        if dynamic_fusion_requested:
+        if dynamic_fusion_requested or dynamic_budget_control_requested:
             dynamic_budget_source_provenance = validate_dynamic_pgdf_budget_source_provenance(
                 pgdf_budget_root,
                 dataset_name=str(cfg.get("dataset", {}).get("name", "")),
@@ -650,6 +681,7 @@ def main() -> None:
                 selection_strategy = "loss_only"
                 prototype_mode = "fixed"
                 fusion_mode: str | None = None
+                source_active_budget_audit: dict[str, Any] | None = None
                 if canonical_key in {"dynamic_r08", "dynamic_r09"}:
                     retention_ratio = resolve_retention_ratio(canonical_key, float(args.dynamic_ratio))
                     method_name = f"DINOv2 LoRA Dynamic small-loss r={retention_ratio:g}"
@@ -658,7 +690,7 @@ def main() -> None:
                     proto_keep_ratio = None
                     auto_proto_keep = None
                     selection_mode = f"dynamic_training_pool_small_loss_r{retention_ratio:g}"
-                elif canonical_key in {"dynamic_budget_matched", "dynamic_budget_matched_dynamic_proto"}:
+                elif canonical_key == "dynamic_budget_matched":
                     if pgdf_budget_root is None:
                         raise RuntimeError("PGDF budget root was not configured.")
                     budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
@@ -684,13 +716,8 @@ def main() -> None:
                         budget_schedule.source_retention_ratio,
                         budget_schedule.source_proto_keep_ratio,
                     )
-                    source_label = (
-                        "PGDF-DynamicProto"
-                        if canonical_key == "dynamic_budget_matched_dynamic_proto"
-                        else "PGDF"
-                    )
                     method_name = (
-                        f"DINOv2 LoRA Dynamic small-loss matched to {source_label} class budget "
+                        "DINOv2 LoRA Dynamic small-loss matched to PGDF class budget "
                         f"r={budget_schedule.source_retention_ratio:g} "
                         f"p={budget_schedule.source_proto_keep_ratio:g}"
                     )
@@ -698,15 +725,103 @@ def main() -> None:
                     centroid_mask = None
                     proto_keep_ratio = None
                     auto_proto_keep = None
-                    selection_mode = (
-                        "dynamic_small_loss_pgdf_dynamic_proto_per_class_budget_matched"
-                        if canonical_key == "dynamic_budget_matched_dynamic_proto"
-                        else "dynamic_small_loss_pgdf_per_class_budget_matched"
+                    selection_mode = "dynamic_small_loss_pgdf_per_class_budget_matched"
+                    write_budget_source(run_dir, budget_schedule, source_method="pgdf_fixed")
+                elif canonical_key in {
+                    "dynamic_budget_matched_dynamic_proto",
+                    *EXACT_BUDGET_CONTROL_METHODS,
+                }:
+                    if pgdf_budget_root is None:
+                        raise RuntimeError("Dynamic PGDF budget root was not configured.")
+                    budget_path = pgdf_budget_root / f"seed{seed}" / "selection_per_class.csv"
+                    expected_updates = selection_update_epochs(
+                        int(run_cfg["lora_train"]["epochs"]),
+                        int(args.warmup_epochs),
+                        int(args.update_interval),
                     )
+                    budget_schedule = load_pgdf_class_budget_schedule(
+                        budget_path,
+                        expected_seed=seed,
+                        expected_update_epochs=expected_updates,
+                        labels=data["train_labels"],
+                        candidate_mask=split.train_mask,
+                        expected_selection_strategy="loss_and_proto",
+                        expected_prototype_mode="dynamic_lora",
+                    )
+                    validate_budget_source_hyperparameters(
+                        budget_schedule,
+                        dynamic_ratio=float(args.dynamic_ratio),
+                        fixed_p=float(args.fixed_p),
+                    )
+                    source_active_budget_audit = inspect_pgdf_active_budget_source(
+                        pgdf_budget_root,
+                        budget_schedule,
+                    )
+                    retention_ratio = float(budget_schedule.source_retention_ratio)
+                    proto_keep_ratio = float(budget_schedule.source_proto_keep_ratio)
+                    scheduler_retention_ratio = min(retention_ratio, proto_keep_ratio)
+                    centroid_mask = None
+                    auto_proto_keep = None
+                    if canonical_key in {
+                        "dynamic_budget_matched_dynamic_proto",
+                    }:
+                        method_name = (
+                            "DINOv2 LoRA PGDF-DynamicProto actual-budget Small-loss Only "
+                            f"r={retention_ratio:g} p={proto_keep_ratio:g}"
+                        )
+                        proto_scores = None
+                        proto_keep_ratio = None
+                        selection_strategy = "loss_only"
+                        prototype_mode = "fixed"
+                        selection_mode = "pgdf_dynamic_proto_actual_classwise_budget_small_loss_only"
+                        source_selection_rule = (
+                            "current-model observed-class CE-loss ascending with exact PGDF selected_count"
+                        )
+                        uses_current_model_loss = True
+                        uses_current_model_prototype = False
+                        random_selection_scheme = ""
+                    elif canonical_key == "pgdf_exact_budget_proto":
+                        method_name = (
+                            "DINOv2 LoRA PGDF-DynamicProto actual-budget Prototype Only "
+                            f"r={retention_ratio:g} p={proto_keep_ratio:g}"
+                        )
+                        proto_scores = None
+                        selection_strategy = BUDGET_MATCHED_PROTO_STRATEGY
+                        prototype_mode = "dynamic_lora"
+                        selection_mode = "pgdf_dynamic_proto_actual_classwise_budget_prototype_only"
+                        source_selection_rule = (
+                            "current-model observed-class prototype-similarity descending with exact PGDF selected_count"
+                        )
+                        uses_current_model_loss = False
+                        uses_current_model_prototype = True
+                        random_selection_scheme = ""
+                    else:
+                        method_name = (
+                            "DINOv2 LoRA PGDF-DynamicProto actual-budget Random "
+                            f"r={retention_ratio:g} p={proto_keep_ratio:g}"
+                        )
+                        proto_scores = None
+                        proto_keep_ratio = None
+                        selection_strategy = BUDGET_MATCHED_RANDOM_STRATEGY
+                        prototype_mode = "fixed"
+                        selection_mode = "pgdf_dynamic_proto_actual_classwise_budget_random_sha256_v1"
+                        source_selection_rule = (
+                            "deterministic current-pool observed-class SHA-256 order with exact PGDF selected_count"
+                        )
+                        uses_current_model_loss = False
+                        uses_current_model_prototype = False
+                        random_selection_scheme = RANDOM_BUDGET_SELECTION_SCHEME
                     write_budget_source(
                         run_dir,
                         budget_schedule,
-                        source_method="pgdf_dynamic_proto" if canonical_key == "dynamic_budget_matched_dynamic_proto" else "pgdf_fixed",
+                        source_method="pgdf_dynamic_proto",
+                        source_provenance_status=dynamic_budget_source_provenance,
+                        selection_rule=source_selection_rule,
+                        uses_current_model_loss=uses_current_model_loss,
+                        uses_current_model_prototype=uses_current_model_prototype,
+                        random_selection_scheme=random_selection_scheme,
+                        noise_index_sha256=file_sha256(noise_index),
+                        source_active_budget_audit=source_active_budget_audit,
                     )
                 elif canonical_key in FIXED_FUSION_ABLATION_METHODS:
                     if pgdf_budget_root is None or pgdf_reference is None:
@@ -937,6 +1052,26 @@ def main() -> None:
                         verify_soft_weight_budget_match(result.fusion_per_class_rows, budget_schedule)
                     else:
                         verify_observed_budget_match(result.per_class_rows, budget_schedule)
+                    if canonical_key in {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}:
+                        write_json(
+                            run_dir / "budget_match_validation.json",
+                            {
+                                "status": "PASS",
+                                "method_key": canonical_key,
+                                "source_method": "pgdf_dynamic_proto",
+                                "source_budget_path": budget_schedule.source_path,
+                                "source_budget_sha256": budget_schedule.source_sha256,
+                                "selection_updates": sorted(budget_schedule.budgets),
+                                "expected_classwise_budget": budget_schedule.budgets,
+                                "observed_selection_counts_verified": True,
+                                "membership_rule": {
+                                    "uses_pgdf_sample_identity": False,
+                                    "uses_clean_noisy_oracle": False,
+                                    "uses_official_test_for_selection": False,
+                                },
+                                "source_active_budget_audit": source_active_budget_audit or {},
+                            },
+                        )
                 all_updates.extend(result.update_rows)
                 write_csv(run_dir / "selection_rows.csv", result.selection_rows, selection_fields())
                 write_csv(run_dir / "selection_updates.csv", result.update_rows, update_fields())
@@ -1037,10 +1172,19 @@ def main() -> None:
             )
             all_logs.extend(result.logs)
             write_csv(run_dir / "train_log.csv", result.logs, train_log_fields())
+            budget_source_path = str(result_row.get("budget_source_path", ""))
+            source_root = Path(budget_source_path).parents[2] if budget_source_path else None
+            source_validation_manifest = (
+                source_root / "validation_manifest.json" if source_root is not None else None
+            )
             write_json(
                 run_dir / "selection_policy.json",
                 {
                     "method_key": method_key,
+                    "dataset": str(run_cfg.get("dataset", {}).get("name", "")),
+                    "training_seed": int(seed),
+                    "noise_seed": noise_metadata["noise_seed"],
+                    "validation_seed": int(args.validation_seed),
                     "selection_mode": result_row["selection_mode"],
                     "selected_count": result_row["selected_count"],
                     "selection_ratio": result_row["selection_ratio"],
@@ -1048,9 +1192,33 @@ def main() -> None:
                     "official_test_used_for_checkpoint_selection": False,
                     "budget_source_path": result_row.get("budget_source_path", ""),
                     "budget_source_sha256": result_row.get("budget_source_sha256", ""),
+                    "source_pgdf_method": (
+                        "pgdf_dynamic_proto"
+                        if canonical_key in {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}
+                        else ""
+                    ),
+                    "source_validation_manifest_sha256": (
+                        file_sha256(source_validation_manifest)
+                        if source_validation_manifest is not None and source_validation_manifest.is_file()
+                        else ""
+                    ),
+                    "validation_manifest_sha256": file_sha256(output_dir / "validation_manifest.json"),
+                    "noise_manifest_sha256": file_sha256(noise_index),
+                    "resolved_training_config_sha256": file_sha256(output_dir / "resolved_config.yaml"),
+                    "code_provenance": build_code_provenance(ROOT),
+                    "control_interpretation": (
+                        "internal ablation using PGDF historical class-count budgets; not an autonomous external baseline"
+                        if canonical_key in {"dynamic_budget_matched_dynamic_proto", *EXACT_BUDGET_CONTROL_METHODS}
+                        else ""
+                    ),
                     "budget_match_verified": result_row.get("budget_match_verified", ""),
                     "selection_strategy": result.summary.get("selection_strategy", ""),
                     "prototype_mode": result.summary.get("prototype_mode", ""),
+                    "random_selection_scheme": (
+                        RANDOM_BUDGET_SELECTION_SCHEME
+                        if result.summary.get("selection_strategy") == BUDGET_MATCHED_RANDOM_STRATEGY
+                        else ""
+                    ),
                     "ido_stage1_epochs": result.summary.get("stage1_epochs", ""),
                     "ido_stage2_epochs": result.summary.get("stage2_epochs", ""),
                     "ido_base_stage1_epoch": result.summary.get("base_stage1_epoch", ""),
@@ -1338,6 +1506,7 @@ def validate_budget_method_request(
     budget_matched_methods = {
         "dynamic_budget_matched",
         "dynamic_budget_matched_dynamic_proto",
+        *EXACT_BUDGET_CONTROL_METHODS,
         *FUSION_ABLATION_METHODS,
     }
     requested = bool(budget_matched_methods & {canonical_method_key(method) for method in methods})
@@ -1438,6 +1607,84 @@ def validate_dynamic_pgdf_budget_source_provenance(
         )
     return "exact_noise_index_sha256"
 
+def inspect_pgdf_active_budget_source(
+    pgdf_budget_root: Path,
+    schedule: ClassBudgetSchedule,
+) -> dict[str, Any]:
+    """Fail closed unless PGDF's recorded active subset agrees with class budgets.
+
+    ``selection_per_class.csv`` supplies only the allowed class-wise count
+    schedule. This companion audit reads source aggregate update counts and
+    fallback counts, never identities, scores, oracle labels, or test metrics.
+    """
+    source_path = pgdf_budget_root / f"seed{schedule.seed}" / "selection_updates.csv"
+    if not source_path.is_file():
+        raise FileNotFoundError(
+            "PGDF DynamicProto source is missing selection_updates.csv required to audit "
+            f"active selected counts and fallback counts: {source_path}"
+        )
+    rows = read_csv(source_path)
+    required = {"epoch", "num_selected", "fallback_count"}
+    actual_fields = set(rows[0]) if rows else set()
+    missing_fields = sorted(required - actual_fields)
+    if missing_fields:
+        raise ValueError(
+            f"PGDF DynamicProto source update audit is missing columns {missing_fields}: {source_path}"
+        )
+    expected_epochs = set(schedule.budgets)
+    observed: dict[int, dict[str, int]] = {}
+    for row_number, row in enumerate(rows, start=2):
+        try:
+            epoch = int(row["epoch"])
+            active_count = int(row["num_selected"])
+            fallback_count = int(row["fallback_count"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid PGDF DynamicProto update audit value at {source_path}:{row_number}."
+            ) from exc
+        if epoch not in expected_epochs:
+            raise ValueError(
+                f"Unexpected PGDF DynamicProto update epoch {epoch} in {source_path}; "
+                f"expected {sorted(expected_epochs)}."
+            )
+        if epoch in observed:
+            raise ValueError(f"Duplicate PGDF DynamicProto update epoch {epoch} in {source_path}.")
+        expected_active_count = sum(int(value) for value in schedule.budgets[epoch].values())
+        if active_count != expected_active_count:
+            raise ValueError(
+                "PGDF DynamicProto active selected count disagrees with its class-wise budget schedule "
+                f"at epoch {epoch}: update={active_count}, class_sum={expected_active_count}."
+            )
+        if fallback_count < 0 or fallback_count > active_count:
+            raise ValueError(
+                f"Invalid PGDF DynamicProto fallback_count={fallback_count} at epoch {epoch}."
+            )
+        observed[epoch] = {
+            "epoch": epoch,
+            "active_selected_count": active_count,
+            "fallback_count": fallback_count,
+            "derived_strict_intersection_count": active_count - fallback_count,
+        }
+    if set(observed) != expected_epochs:
+        missing_epochs = sorted(expected_epochs - set(observed))
+        extra_epochs = sorted(set(observed) - expected_epochs)
+        raise ValueError(
+            "PGDF DynamicProto update audit is incomplete: "
+            f"missing_epochs={missing_epochs}, extra_epochs={extra_epochs}."
+        )
+    updates = [observed[epoch] for epoch in sorted(observed)]
+    return {
+        "source_selection_updates_path": str(source_path),
+        "source_selection_updates_sha256": file_sha256(source_path),
+        "active_count_field": "num_selected",
+        "fallback_count_field": "fallback_count",
+        "derived_strict_intersection_count": "num_selected - fallback_count",
+        "fallback_count_total": sum(row["fallback_count"] for row in updates),
+        "active_selected_count_total": sum(row["active_selected_count"] for row in updates),
+        "updates": updates,
+    }
+
+
 
 def validate_budget_source_hyperparameters(
     schedule: ClassBudgetSchedule,
@@ -1462,8 +1709,16 @@ def write_budget_source(
     *,
     source_method: str,
     source_provenance_status: str = "",
+    selection_rule: str = "current-model class-wise small-loss with exact PGDF selected_count",
+    uses_current_model_loss: bool = True,
+    uses_current_model_prototype: bool = False,
+    random_selection_scheme: str = "",
+    noise_index_sha256: str = "",
+    source_active_budget_audit: dict[str, Any] | None = None,
 ) -> None:
     """Freeze only PGDF class counts, never its selected sample identities or scores."""
+    source_root = Path(schedule.source_path).parents[2]
+    source_validation_manifest = source_root / "validation_manifest.json"
     write_csv(
         run_dir / "budget_source.csv",
         schedule.rows,
@@ -1476,13 +1731,27 @@ def write_budget_source(
             "source_sha256": schedule.source_sha256,
             "source_method": source_method,
             "source_provenance_status": source_provenance_status,
+            "source_validation_manifest_path": str(source_validation_manifest),
+            "source_validation_manifest_sha256": (
+                file_sha256(source_validation_manifest) if source_validation_manifest.is_file() else ""
+            ),
+            "source_resolved_config_sha256": (
+                file_sha256(source_root / "resolved_config.yaml")
+                if (source_root / "resolved_config.yaml").is_file()
+                else ""
+            ),
+            "noise_index_sha256": noise_index_sha256,
             "source_retention_ratio": schedule.source_retention_ratio,
             "source_proto_keep_ratio": schedule.source_proto_keep_ratio,
             "seed": schedule.seed,
             "update_epochs": sorted(schedule.budgets),
-            "selection_rule": "current-model class-wise small-loss with exact PGDF selected_count",
+            "selection_rule": selection_rule,
             "uses_pgdf_sample_identity": False,
-            "uses_prototype_or_graph_scores": False,
+            "uses_current_model_loss": uses_current_model_loss,
+            "uses_current_model_prototype": uses_current_model_prototype,
+            "uses_prototype_or_graph_scores": uses_current_model_prototype,
+            "random_selection_scheme": random_selection_scheme,
+            "source_active_budget_audit": source_active_budget_audit or {},
         },
     )
 
@@ -1705,6 +1974,7 @@ def validate_official_test_request(methods: list[str], selected_only: bool) -> N
     strict_methods = {
         "proto_only",
         "dynamic_budget_matched",
+        *EXACT_BUDGET_CONTROL_METHODS,
         "dynamic_budget_matched_dynamic_proto",
         "dynamic_proto_only",
         "pgdf_dynamic_proto",
@@ -1852,7 +2122,7 @@ def result_fields() -> list[str]:
         "last5_test_mean", "last5_test_std", "last5_test_top5_mean", "last5_test_top5_std", "oracle_best_test_epoch",
         "oracle_best_test_top1", "oracle_best_test_top5", "oracle_best_to_final_drop", "retention_ratio", "proto_keep_ratio",
         "auto_proto_keep", "auto_proto_jaccard", "warmup_epochs", "update_interval", "candidate_samples", "final_selected_samples",
-        "selection_updates", "selection_strategy", "prototype_mode", "fusion_mode", "optimizer_steps_attempted", "optimizer_steps_actual", "scheduler_steps_actual", "soft_weighting_effective_budget", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
+        "selection_updates", "selection_strategy", "prototype_mode", "fusion_mode", "optimizer_steps_attempted", "optimizer_steps_actual", "scheduler_steps_actual", "scheduler_estimated_total_steps", "scheduler_warmup_steps", "soft_weighting_effective_budget", "backbone_frozen", "lora_updated_before_selection", "budget_matched", "scheduler_retention_ratio", "budget_source_path", "budget_source_sha256",
         "budget_source_retention_ratio", "budget_source_proto_keep_ratio", "budget_match_verified",
         "remember_mode", "remember_rate", "final_remember_rate", "lambda_cor", "selected_count", "selection_ratio",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
@@ -1902,7 +2172,7 @@ def dual_selection_fields() -> list[str]:
 def update_fields() -> list[str]:
     return [
         "method", "dataset", "seed", "retention_ratio", "proto_keep_ratio", "auto_proto_jaccard", "selection_strategy", "prototype_mode", "epoch", "num_candidates", "full_training_pool_size", "num_loss_selected",
-        "num_proto_pass", "num_selected", "fallback_count", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
+        "num_proto_pass", "num_selected", "selected_identity_sha256", "fallback_count", "optimizer_steps_attempted_since_previous_update", "optimizer_steps_actual_since_previous_update", "scheduler_steps_since_previous_update", "proto_reject_count", "selected_ratio", "mean_loss_selected", "mean_loss_unselected",
         "mean_loss_proto_rejected", "mean_proto_selected", "mean_proto_unselected", "overlap_with_previous_selection", "overlap_with_centroid",
         "prototype_feature_source", "prototype_feature_dim", "prototype_checksum", "prototype_gate_membership_hash",
         "prototype_mean", "prototype_std", "selection_model_state_checksum", "prototype_model_state_checksum",

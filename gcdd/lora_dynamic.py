@@ -41,6 +41,11 @@ from revision_experiments.training_integration import (
 )
 
 
+BUDGET_MATCHED_PROTO_STRATEGY = "proto_budget_matched"
+BUDGET_MATCHED_RANDOM_STRATEGY = "random_budget_matched"
+RANDOM_BUDGET_SELECTION_SCHEME = "sha256-v1(method, dataset, training_seed, update_epoch, observed_label, original_index)"
+
+
 @dataclass
 class DynamicLossRunResult:
     logs: list[dict[str, Any]]
@@ -150,6 +155,8 @@ def train_dynamic_loss_lora(
     if fusion_mode is not None and fusion_mode not in FUSION_MODES:
         raise ValueError(f"Unsupported fusion_mode={fusion_mode!r}.")
     is_fusion_strategy = selection_strategy in fusion_strategy_modes
+    is_budget_matched_proto = selection_strategy == BUDGET_MATCHED_PROTO_STRATEGY
+    is_budget_matched_random = selection_strategy == BUDGET_MATCHED_RANDOM_STRATEGY
 
     validate_dynamic_args(
         retention_ratio,
@@ -188,13 +195,27 @@ def train_dynamic_loss_lora(
                 raise ValueError(
                     "Budget-matched fusion forbids centroid/auto-prototype routing."
                 )
+        elif is_budget_matched_proto:
+            if centroid_mask is not None or auto_proto_keep is not None:
+                raise ValueError(
+                    "Budget-matched prototype-only selection forbids centroid/auto-prototype routing."
+                )
         elif any(value is not None for value in (centroid_mask, proto_scores, proto_keep_ratio, auto_proto_keep)):
             raise ValueError("class_budget_schedule cannot be combined with prototype, centroid, or graph selection inputs.")
     elif is_fusion_strategy:
         raise ValueError("Budget-matched fusion requires a validated PGDF class_budget_schedule.")
+    elif is_budget_matched_proto or is_budget_matched_random:
+        raise ValueError(f"{selection_strategy} requires a validated PGDF class_budget_schedule.")
     if selection_strategy == "proto_only" and class_budget_schedule is not None:
         raise ValueError("proto_only selection cannot use a dynamic small-loss class budget.")
     if prototype_mode == "dynamic_lora":
+        if selection_strategy not in {
+            "proto_only",
+            "loss_and_proto",
+            BUDGET_MATCHED_PROTO_STRATEGY,
+            *fusion_strategy_modes,
+        }:
+            raise ValueError("dynamic_lora prototypes require a prototype-based selection strategy.")
         if proto_scores is not None:
             raise ValueError("dynamic_lora prototypes must not receive frozen prototype scores.")
         if auto_proto_keep is not None:
@@ -204,6 +225,7 @@ def train_dynamic_loss_lora(
     elif prototype_mode == "fixed" and selection_strategy in {
         "proto_only",
         "loss_and_proto",
+        BUDGET_MATCHED_PROTO_STRATEGY,
         *fusion_strategy_modes,
     } and proto_scores is None:
         raise ValueError("fixed prototype selection requires proto_scores.")
@@ -412,7 +434,15 @@ def train_dynamic_loss_lora(
                             else per_sample_loss
                         )
                     scaler.scale(loss).backward()
-                    track_step_counts = selection_strategy in fusion_strategy_modes or profiling_enabled(profiler)
+                    # Exact-budget controls share PGDF's scheduler horizon but
+                    # must also expose their realized update counts.  This is
+                    # a record-only change: optimizer and scheduler calls are
+                    # unchanged for every existing method.
+                    track_step_counts = (
+                        class_budget_schedule is not None
+                        or selection_strategy in fusion_strategy_modes
+                        or profiling_enabled(profiler)
+                    )
                     scale_before = (
                         float(scaler.get_scale())
                         if track_step_counts and scaler.is_enabled()
@@ -528,7 +558,12 @@ def train_dynamic_loss_lora(
                                 losses, train_labels, candidate_mask, retention_ratio
                             )
 
-            if selection_strategy in {"proto_only", "loss_and_proto", *fusion_strategy_modes}:
+            if selection_strategy in {
+                "proto_only",
+                "loss_and_proto",
+                BUDGET_MATCHED_PROTO_STRATEGY,
+                *fusion_strategy_modes,
+            }:
                 if prototype_mode == "dynamic_lora":
                     with profiling_memory_phase(profiler, "selection"):
                         with profiling_stage(
@@ -589,6 +624,28 @@ def train_dynamic_loss_lora(
                         if proto_pass_mask is None:
                             raise RuntimeError("proto_only selection did not produce a prototype gate.")
                         selected_mask = proto_pass_mask
+                    elif selection_strategy == BUDGET_MATCHED_PROTO_STRATEGY:
+                        if class_budget_schedule is None or current_proto_scores is None:
+                            raise RuntimeError(
+                                "Budget-matched prototype-only selection requires prototype scores and reference budgets."
+                            )
+                        selected_mask = select_top_proto_classwise_by_budget(
+                            current_proto_scores,
+                            train_labels,
+                            candidate_mask,
+                            class_budget_schedule[epoch],
+                        )
+                    elif selection_strategy == BUDGET_MATCHED_RANDOM_STRATEGY:
+                        if class_budget_schedule is None:
+                            raise RuntimeError("Budget-matched random selection requires reference budgets.")
+                        selected_mask = select_random_classwise_by_budget(
+                            train_labels,
+                            candidate_mask,
+                            class_budget_schedule[epoch],
+                            dataset=dataset_name,
+                            training_seed=seed,
+                            epoch=epoch,
+                        )
                     elif selection_strategy == "loss_and_proto":
                         if loss_selected_mask is None or proto_pass_mask is None or losses is None:
                             raise RuntimeError("loss_and_proto selection requires loss and prototype masks.")
@@ -648,6 +705,14 @@ def train_dynamic_loss_lora(
                     model_state_identifier=selection_model_checksum,
                     metadata=selection_log_metadata,
                 )
+            # Keep the audit unambiguous: Random deliberately has no
+            # prototype gate, so do not serialize the default all-candidate
+            # placeholder as if it were a prototype decision.
+            audit_proto_pass_mask = (
+                np.zeros(len(candidate_mask), dtype=bool)
+                if selection_strategy == BUDGET_MATCHED_RANDOM_STRATEGY
+                else proto_pass_mask
+            )
             if profiling_enabled(profiler):
                 profiler.record_selection_interval_steps(epoch, optimizer_steps_since_selection)
             if fusion_selection is not None:
@@ -679,8 +744,6 @@ def train_dynamic_loss_lora(
                     }
                     for class_row in fusion_selection.per_class_rows
                 )
-            optimizer_steps_since_selection = 0
-            optimizer_steps_attempted_since_selection = 0
             update_rows.append(
                 build_update_row(
                     method,
@@ -695,7 +758,7 @@ def train_dynamic_loss_lora(
                     centroid_mask,
                     losses,
                     loss_selected_mask=loss_selected_mask,
-                    proto_pass_mask=proto_pass_mask,
+                    proto_pass_mask=audit_proto_pass_mask,
                     proto_scores=current_proto_scores,
                     auto_proto_jaccard=auto_proto_jaccard,
                     selection_strategy=selection_strategy,
@@ -704,6 +767,9 @@ def train_dynamic_loss_lora(
                     selection_model_checksum=selection_model_checksum,
                     lora_updated_since_initial=(selection_model_checksum != initial_trainable_checksum),
                     fallback_count=fallback_count,
+                    optimizer_steps_attempted_since_previous_update=optimizer_steps_attempted_since_selection,
+                    optimizer_steps_actual_since_previous_update=optimizer_steps_since_selection,
+                    scheduler_steps_since_previous_update=optimizer_steps_attempted_since_selection,
                 )
             )
             selection_rows.extend(
@@ -721,7 +787,7 @@ def train_dynamic_loss_lora(
                     losses,
                     confidence,
                     loss_selected_mask=loss_selected_mask,
-                    proto_pass_mask=proto_pass_mask,
+                    proto_pass_mask=audit_proto_pass_mask,
                     proto_scores=current_proto_scores,
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
@@ -740,7 +806,7 @@ def train_dynamic_loss_lora(
                     selected_mask,
                     losses,
                     loss_selected_mask=loss_selected_mask,
-                    proto_pass_mask=proto_pass_mask,
+                    proto_pass_mask=audit_proto_pass_mask,
                     proto_scores=current_proto_scores,
                     selection_strategy=selection_strategy,
                     prototype_mode=prototype_mode,
@@ -751,6 +817,8 @@ def train_dynamic_loss_lora(
                 f"selected={int(selected_mask.sum())}, proto_mode={prototype_mode}, "
                 f"prev_jaccard={update_rows[-1]['overlap_with_previous_selection']:.4f}"
             )
+            optimizer_steps_since_selection = 0
+            optimizer_steps_attempted_since_selection = 0
             if selection_update_token is not None:
                 profiler.stop_stage(selection_update_token)
 
@@ -906,15 +974,23 @@ def train_dynamic_loss_lora(
             "update_interval": int(update_interval),
             "budget_matched": "yes" if class_budget_schedule is not None else "no",
             "scheduler_retention_ratio": float(effective_scheduler_ratio),
+            "scheduler_estimated_total_steps": int(total_steps),
+            "scheduler_warmup_steps": int(warmup_steps),
             "candidate_samples": int(candidate_mask.sum()),
             "final_selected_samples": int(selected_mask.sum()),
             "selection_updates": len(update_rows),
             "selection_strategy": selection_strategy,
             "prototype_mode": prototype_mode,
             "fusion_mode": fusion_mode or "",
-            "optimizer_steps_attempted": optimizer_steps_attempted_total if is_fusion_strategy else "",
-            "optimizer_steps_actual": optimizer_steps_actual_total if is_fusion_strategy else "",
-            "scheduler_steps_actual": scheduler_steps_actual_total if is_fusion_strategy else "",
+            "optimizer_steps_attempted": (
+                optimizer_steps_attempted_total if class_budget_schedule is not None or is_fusion_strategy else ""
+            ),
+            "optimizer_steps_actual": (
+                optimizer_steps_actual_total if class_budget_schedule is not None or is_fusion_strategy else ""
+            ),
+            "scheduler_steps_actual": (
+                scheduler_steps_actual_total if class_budget_schedule is not None or is_fusion_strategy else ""
+            ),
             "soft_weighting_effective_budget": (
                 fusion_update_rows[-1].get("effective_weight_budget", "")
                 if fusion_mode == "soft_weighting" and fusion_update_rows
@@ -966,6 +1042,8 @@ def validate_dynamic_args(
         "loss_only",
         "proto_only",
         "loss_and_proto",
+        BUDGET_MATCHED_PROTO_STRATEGY,
+        BUDGET_MATCHED_RANDOM_STRATEGY,
         "fusion_weighted",
         "fusion_union",
         "fusion_soft",
@@ -974,7 +1052,14 @@ def validate_dynamic_args(
         raise ValueError(f"selection_strategy must be one of {sorted(allowed_strategies)}.")
     if prototype_mode not in {"fixed", "dynamic_lora"}:
         raise ValueError("prototype_mode must be fixed or dynamic_lora.")
-    if selection_strategy in {"proto_only", "loss_and_proto", "fusion_weighted", "fusion_union", "fusion_soft"} and proto_keep_ratio is None:
+    if selection_strategy in {
+        "proto_only",
+        "loss_and_proto",
+        BUDGET_MATCHED_PROTO_STRATEGY,
+        "fusion_weighted",
+        "fusion_union",
+        "fusion_soft",
+    } and proto_keep_ratio is None:
         raise ValueError("Prototype selection requires proto_keep_ratio.")
     if selection_strategy == "proto_only" and auto_proto_keep is not None:
         raise ValueError("proto_only selection cannot use auto_proto_keep.")
@@ -1304,6 +1389,69 @@ def select_top_proto_classwise(proto_scores: np.ndarray, labels: np.ndarray, can
     return selected
 
 
+def select_top_proto_classwise_by_budget(
+    proto_scores: np.ndarray,
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    class_budgets: dict[str, int],
+) -> np.ndarray:
+    """Select exactly the supplied count in each observed-label class by prototype score."""
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    proto_scores = np.asarray(proto_scores, dtype=np.float64)
+    if proto_scores.shape != labels.shape:
+        raise ValueError("proto_scores must align with labels.")
+    validate_class_budgets(labels, candidate_mask, class_budgets)
+    normalized = {str(label): int(count) for label, count in class_budgets.items()}
+    selected = np.zeros(len(labels), dtype=bool)
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        if np.any(~np.isfinite(proto_scores[idx])):
+            raise ValueError(f"Missing prototype scores for class {label}.")
+        # Stable sorting makes equal-score ties reproducible by original index.
+        order = np.argsort(-proto_scores[idx], kind="mergesort")
+        selected[idx[order[: normalized[label]]]] = True
+    return selected
+
+
+def select_random_classwise_by_budget(
+    labels: np.ndarray,
+    candidate_mask: np.ndarray,
+    class_budgets: dict[str, int],
+    *,
+    dataset: str,
+    training_seed: int,
+    epoch: int,
+) -> np.ndarray:
+    """Select an exact observed-class budget with a stateless SHA-256 random order.
+
+    The order is a deterministic function of the fixed method identifier,
+    dataset, training seed, selection update, observed label, and original
+    pool index.  It is therefore stable across Python/NumPy versions without
+    reusing the strict PGDF sample identities or accessing oracle labels.
+    """
+    labels = np.asarray(labels).astype(str)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    validate_class_budgets(labels, candidate_mask, class_budgets)
+    normalized = {str(label): int(count) for label, count in class_budgets.items()}
+    selected = np.zeros(len(labels), dtype=bool)
+    for label in sorted(set(labels[candidate_mask].tolist())):
+        idx = np.where(candidate_mask & (labels == label))[0]
+        ordered = sorted(
+            idx.tolist(),
+            key=lambda index: (
+                hashlib.sha256(
+                    f"pgdf_exact_budget_random|{dataset}|{int(training_seed)}|{int(epoch)}|{label}|{int(index)}".encode(
+                        "utf-8"
+                    )
+                ).digest(),
+                int(index),
+            ),
+        )
+        selected[np.asarray(ordered[: normalized[label]], dtype=np.int64)] = True
+    return selected
+
+
 def combine_loss_and_proto_classwise(
     loss_selected_mask: np.ndarray,
     proto_pass_mask: np.ndarray,
@@ -1363,7 +1511,12 @@ def build_update_row(
     selection_model_checksum: str = "",
     lora_updated_since_initial: bool = False,
     fallback_count: int = 0,
+    optimizer_steps_attempted_since_previous_update: int | str = "",
+    optimizer_steps_actual_since_previous_update: int | str = "",
+    scheduler_steps_since_previous_update: int | str = "",
 ) -> dict[str, Any]:
+    if np.any(np.asarray(selected_mask, dtype=bool) & ~np.asarray(candidate_mask, dtype=bool)):
+        raise RuntimeError("Selection contains samples outside the training candidate pool.")
     selected_losses = losses[selected_mask] if losses is not None else np.asarray([], dtype=np.float32)
     unselected_mask = candidate_mask & ~selected_mask
     unselected_losses = losses[unselected_mask] if losses is not None else np.asarray([], dtype=np.float32)
@@ -1388,7 +1541,11 @@ def build_update_row(
         "num_loss_selected": int(loss_selected_mask.sum()) if loss_selected_mask is not None else "",
         "num_proto_pass": int(proto_pass_mask.sum()),
         "num_selected": int(selected_mask.sum()),
+        "selected_identity_sha256": selected_identity_sha256(selected_mask),
         "fallback_count": int(fallback_count),
+        "optimizer_steps_attempted_since_previous_update": optimizer_steps_attempted_since_previous_update,
+        "optimizer_steps_actual_since_previous_update": optimizer_steps_actual_since_previous_update,
+        "scheduler_steps_since_previous_update": scheduler_steps_since_previous_update,
         "proto_reject_count": int(proto_rejected_mask.sum()),
         "selected_ratio": safe_ratio(int(selected_mask.sum()), int(candidate_mask.sum())),
         "mean_loss_selected": float(np.nanmean(selected_losses)) if selected_losses.size else "",
@@ -1529,3 +1686,11 @@ def mask_jaccard(left: np.ndarray, right: np.ndarray | None) -> float:
     if not np.any(union):
         return 1.0
     return safe_ratio(int(np.sum(left & right)), int(np.sum(union)))
+
+
+def selected_identity_sha256(selected_mask: np.ndarray) -> str:
+    """Hash selected original training-pool indices without exposing a source identity list."""
+    indices = np.flatnonzero(np.asarray(selected_mask, dtype=bool)).astype("<i8", copy=False)
+    digest = hashlib.sha256()
+    digest.update(indices.tobytes())
+    return digest.hexdigest()

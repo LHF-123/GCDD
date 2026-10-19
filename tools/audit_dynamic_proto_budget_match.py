@@ -1,15 +1,18 @@
-"""Verify and summarize Dynamic baseline budgets paired to PGDF-DynamicProto."""
+"""Verify exact class/update budget controls paired to PGDF-DynamicProto."""
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import statistics
 from pathlib import Path
 from typing import Any
 
 
 SEEDS = (1, 42, 88)
+LEGACY_CONTROL_METHOD = "dynamic_budget_matched_dynamic_proto"
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,6 +21,16 @@ def parse_args() -> argparse.Namespace:
         "--dataset", action="append", required=True, metavar="NAME=PGDF_ROOT=BUDGET_ROOT",
         help="Repeat for CUB/Cars/Aircraft; roots contain per-method seed directories.",
     )
+    parser.add_argument(
+        "--method",
+        action="append",
+        default=[],
+        metavar="METHOD_KEY",
+        help=(
+            "Exact-budget control method key to audit; repeat for multiple controls. "
+            f"Defaults to the legacy {LEGACY_CONTROL_METHOD!r} when omitted."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -25,6 +38,43 @@ def parse_args() -> argparse.Namespace:
 def read_csv(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return [dict(row) for row in csv.DictReader(handle)]
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_control_budget_provenance(run_dir: Path, source_budget_path: Path) -> None:
+    """Ensure a completed control still points to the unmodified source budget."""
+    budget_source_path = run_dir / "budget_source.json"
+    validation_path = run_dir / "budget_match_validation.json"
+    if not budget_source_path.is_file() or not validation_path.is_file():
+        raise FileNotFoundError(
+            f"{run_dir}: exact-budget control is missing budget_source.json or budget_match_validation.json."
+        )
+    with budget_source_path.open("r", encoding="utf-8") as handle:
+        budget_source = json.load(handle)
+    with validation_path.open("r", encoding="utf-8") as handle:
+        validation = json.load(handle)
+    actual_source_sha256 = file_sha256(source_budget_path)
+    if budget_source.get("source_sha256") != actual_source_sha256:
+        raise RuntimeError(
+            f"{run_dir}: source budget SHA256 mismatch; source budget changed after this control was run."
+        )
+    if validation.get("source_budget_sha256") != actual_source_sha256:
+        raise RuntimeError(f"{run_dir}: budget_match_validation.json source budget SHA256 mismatch.")
+    if validation.get("status") != "PASS" or not validation.get("observed_selection_counts_verified"):
+        raise RuntimeError(f"{run_dir}: exact class-wise budget validation is not recorded as PASS.")
+    membership_rule = validation.get("membership_rule", {})
+    if any(
+        membership_rule.get(field) is not False
+        for field in ("uses_pgdf_sample_identity", "uses_clean_noisy_oracle", "uses_official_test_for_selection")
+    ):
+        raise RuntimeError(f"{run_dir}: control membership isolation metadata is invalid.")
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> None:
@@ -59,90 +109,110 @@ def main() -> None:
     output = args.output_dir
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Refusing to overwrite existing summary output: {output}")
+    methods = args.method or [LEGACY_CONTROL_METHOD]
+    if len(set(methods)) != len(methods):
+        raise ValueError("--method contains duplicate method keys.")
     cardinality_rows: list[dict[str, Any]] = []
     paired_rows: list[dict[str, Any]] = []
     for raw in args.dataset:
         dataset, pgdf_root, budget_root = parse_dataset(raw)
         pgdf_results = result_by_seed(pgdf_root, "pgdf_dynamic_proto")
-        budget_results = result_by_seed(budget_root, "dynamic_budget_matched_dynamic_proto")
-        for seed in SEEDS:
-            pgdf_path = pgdf_root / "pgdf_dynamic_proto" / f"seed{seed}" / "selection_per_class.csv"
-            budget_path = budget_root / "dynamic_budget_matched_dynamic_proto" / f"seed{seed}" / "selection_per_class.csv"
-            pgdf = {(int(row["epoch"]), str(row["web_label"])): row for row in read_csv(pgdf_path)}
-            budget = {(int(row["epoch"]), str(row["web_label"])): row for row in read_csv(budget_path)}
-            if set(pgdf) != set(budget):
-                raise RuntimeError(f"{dataset}/seed{seed}: budget class/update key set differs from PGDF-DynamicProto.")
-            for key in sorted(pgdf):
-                source = int(pgdf[key]["selected_count"])
-                observed = int(budget[key]["selected_count"])
-                cardinality_rows.append(
+        for method in methods:
+            budget_results = result_by_seed(budget_root, method)
+            for seed in SEEDS:
+                pgdf_path = pgdf_root / "pgdf_dynamic_proto" / f"seed{seed}" / "selection_per_class.csv"
+                budget_path = budget_root / method / f"seed{seed}" / "selection_per_class.csv"
+                verify_control_budget_provenance(budget_root / method / f"seed{seed}", pgdf_path)
+                pgdf = {(int(row["epoch"]), str(row["web_label"])): row for row in read_csv(pgdf_path)}
+                budget = {(int(row["epoch"]), str(row["web_label"])): row for row in read_csv(budget_path)}
+                if set(pgdf) != set(budget):
+                    raise RuntimeError(
+                        f"{dataset}/{method}/seed{seed}: budget class/update key set differs from PGDF-DynamicProto."
+                    )
+                for key in sorted(pgdf):
+                    source = int(pgdf[key]["selected_count"])
+                    observed = int(budget[key]["selected_count"])
+                    cardinality_rows.append(
+                        {
+                            "dataset": dataset, "control_method": method, "seed": seed, "epoch": key[0], "class": key[1],
+                            "pgdf_dynamic_proto_count": source,
+                            "control_selected_count": observed,
+                            "match": "yes" if source == observed else "no",
+                        }
+                    )
+                if any(
+                    row["match"] != "yes"
+                    for row in cardinality_rows
+                    if row["dataset"] == dataset and row["control_method"] == method and row["seed"] == seed
+                ):
+                    raise RuntimeError(f"{dataset}/{method}/seed{seed}: cardinality audit failed.")
+                pgdf_top1 = float(pgdf_results[seed]["validation_selected_test_top1"]) * 100.0
+                control_top1 = float(budget_results[seed]["validation_selected_test_top1"]) * 100.0
+                paired_rows.append(
                     {
-                        "dataset": dataset, "seed": seed, "epoch": key[0], "class": key[1],
-                        "pgdf_dynamic_proto_count": source,
-                        "budget_matched_dynamic_count": observed,
-                        "match": "yes" if source == observed else "no",
+                        "dataset": dataset, "control_method": method, "seed": seed,
+                        "pgdf_dynamic_proto_selected_checkpoint_epoch": int(pgdf_results[seed]["best_val_epoch"]),
+                        "control_selected_checkpoint_epoch": int(budget_results[seed]["best_val_epoch"]),
+                        "pgdf_dynamic_proto_validation_top1_pct": float(pgdf_results[seed]["best_val_top1"]) * 100.0,
+                        "control_validation_top1_pct": float(budget_results[seed]["best_val_top1"]) * 100.0,
+                        "pgdf_dynamic_proto_top1_pct": pgdf_top1,
+                        "control_top1_pct": control_top1,
+                        "paired_difference_pgdf_minus_control_pp": pgdf_top1 - control_top1,
                     }
                 )
-            if any(row["match"] != "yes" for row in cardinality_rows if row["dataset"] == dataset and row["seed"] == seed):
-                raise RuntimeError(f"{dataset}/seed{seed}: cardinality audit failed.")
-            pgdf_top1 = float(pgdf_results[seed]["validation_selected_test_top1"]) * 100.0
-            budget_top1 = float(budget_results[seed]["validation_selected_test_top1"]) * 100.0
-            paired_rows.append(
-                {
-                    "dataset": dataset, "seed": seed,
-                    "pgdf_dynamic_proto_selected_checkpoint_epoch": int(pgdf_results[seed]["best_val_epoch"]),
-                    "budget_matched_dynamic_selected_checkpoint_epoch": int(budget_results[seed]["best_val_epoch"]),
-                    "pgdf_dynamic_proto_validation_top1_pct": float(pgdf_results[seed]["best_val_top1"]) * 100.0,
-                    "budget_matched_dynamic_validation_top1_pct": float(budget_results[seed]["best_val_top1"]) * 100.0,
-                    "pgdf_dynamic_proto_top1_pct": pgdf_top1,
-                    "budget_matched_dynamic_top1_pct": budget_top1,
-                    "paired_difference_pgdf_minus_budget_pp": pgdf_top1 - budget_top1,
-                }
-            )
 
     write_csv(
         output / "cardinality_audit.csv", cardinality_rows,
-        ["dataset", "seed", "epoch", "class", "pgdf_dynamic_proto_count", "budget_matched_dynamic_count", "match"],
+        ["dataset", "control_method", "seed", "epoch", "class", "pgdf_dynamic_proto_count", "control_selected_count", "match"],
     )
     write_csv(
         output / "paired_results.csv", paired_rows,
         [
-            "dataset", "seed", "pgdf_dynamic_proto_selected_checkpoint_epoch",
-            "budget_matched_dynamic_selected_checkpoint_epoch", "pgdf_dynamic_proto_validation_top1_pct",
-            "budget_matched_dynamic_validation_top1_pct", "pgdf_dynamic_proto_top1_pct",
-            "budget_matched_dynamic_top1_pct", "paired_difference_pgdf_minus_budget_pp",
+            "dataset", "control_method", "seed", "pgdf_dynamic_proto_selected_checkpoint_epoch",
+            "control_selected_checkpoint_epoch", "pgdf_dynamic_proto_validation_top1_pct",
+            "control_validation_top1_pct", "pgdf_dynamic_proto_top1_pct",
+            "control_top1_pct", "paired_difference_pgdf_minus_control_pp",
         ],
     )
     summary_rows: list[dict[str, Any]] = []
-    for dataset in sorted({row["dataset"] for row in paired_rows}):
-        values = [float(row["paired_difference_pgdf_minus_budget_pp"]) for row in paired_rows if row["dataset"] == dataset]
+    for method in methods:
+        for dataset in sorted({row["dataset"] for row in paired_rows}):
+            values = [
+                float(row["paired_difference_pgdf_minus_control_pp"])
+                for row in paired_rows
+                if row["dataset"] == dataset and row["control_method"] == method
+            ]
+            mean, std = mean_std(values)
+            summary_rows.append(
+                {
+                    "scope": "dataset", "dataset": dataset, "control_method": method, "pairs": len(values),
+                    "mean_paired_difference_pp": mean, "sample_std_paired_difference_pp": std,
+                    "pgdf_higher_count": sum(value > 0.0 for value in values),
+                    "control_higher_count": sum(value < 0.0 for value in values), "tie_count": sum(value == 0.0 for value in values),
+                }
+            )
+        values = [
+            float(row["paired_difference_pgdf_minus_control_pp"])
+            for row in paired_rows
+            if row["control_method"] == method
+        ]
         mean, std = mean_std(values)
         summary_rows.append(
             {
-                "scope": "dataset", "dataset": dataset, "pairs": len(values),
+                "scope": "overall_descriptive", "dataset": "ALL_3_DATASETS", "control_method": method, "pairs": len(values),
                 "mean_paired_difference_pp": mean, "sample_std_paired_difference_pp": std,
                 "pgdf_higher_count": sum(value > 0.0 for value in values),
-                "budget_higher_count": sum(value < 0.0 for value in values), "tie_count": sum(value == 0.0 for value in values),
+                "control_higher_count": sum(value < 0.0 for value in values), "tie_count": sum(value == 0.0 for value in values),
             }
         )
-    values = [float(row["paired_difference_pgdf_minus_budget_pp"]) for row in paired_rows]
-    mean, std = mean_std(values)
-    summary_rows.append(
-        {
-            "scope": "overall_descriptive", "dataset": "ALL_3_DATASETS", "pairs": len(values),
-            "mean_paired_difference_pp": mean, "sample_std_paired_difference_pp": std,
-            "pgdf_higher_count": sum(value > 0.0 for value in values),
-            "budget_higher_count": sum(value < 0.0 for value in values), "tie_count": sum(value == 0.0 for value in values),
-        }
-    )
-    fields = ["scope", "dataset", "pairs", "mean_paired_difference_pp", "sample_std_paired_difference_pp", "pgdf_higher_count", "budget_higher_count", "tie_count"]
+    fields = ["scope", "dataset", "control_method", "pairs", "mean_paired_difference_pp", "sample_std_paired_difference_pp", "pgdf_higher_count", "control_higher_count", "tie_count"]
     write_csv(output / "summary.csv", summary_rows, fields)
-    lines = ["PGDF-DynamicProto vs exact class/update Budget-Matched Dynamic", ""]
+    lines = ["PGDF-DynamicProto vs exact class/update budget-matched controls", ""]
     for row in summary_rows:
         lines.append(
-            f"{row['dataset']}: {row['mean_paired_difference_pp']:.4f} +/- "
+            f"{row['control_method']} / {row['dataset']}: {row['mean_paired_difference_pp']:.4f} +/- "
             f"{row['sample_std_paired_difference_pp']:.4f} pp; PGDF higher={row['pgdf_higher_count']}, "
-            f"Budget higher={row['budget_higher_count']}, ties={row['tie_count']}."
+            f"control higher={row['control_higher_count']}, ties={row['tie_count']}."
         )
     (output / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"Budget cardinality audit PASS: {len(cardinality_rows)} class/update rows")
