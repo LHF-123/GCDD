@@ -87,6 +87,7 @@ class IDOBatchTests(unittest.TestCase):
         *,
         protocol_frozen: bool = False,
         bmm_mode: str = "classwise",
+        stage2_microbatch_size: int | None = None,
     ) -> Path:
         datasets: dict[str, object] = {}
         strategies = {
@@ -168,12 +169,15 @@ class IDOBatchTests(unittest.TestCase):
                 }
             datasets[dataset] = {"display_name": dataset, "expected_classes": 2, "path_maps": [], "protocols": protocol_data}
         config_path = root / "ido_batch.yaml"
+        formal: dict[str, object] = {"epochs": 30, "stage1_epochs": 10, "validation_seed": 20250726, "bmm_mode": bmm_mode}
+        if stage2_microbatch_size is not None:
+            formal["stage2_microbatch_size"] = stage2_microbatch_size
         payload = {
             "schema_version": 1,
             "runtime": {"python_executable": sys.executable},
             "output": {"root": str(root / "outputs"), "instrumentation_root": str(root / "instrumentation")},
             "protocol": {"protocol_frozen": protocol_frozen},
-            "formal": {"epochs": 30, "stage1_epochs": 10, "validation_seed": 20250726, "bmm_mode": bmm_mode},
+            "formal": formal,
             "datasets": datasets,
         }
         config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
@@ -206,6 +210,8 @@ class IDOBatchTests(unittest.TestCase):
             "stage2_epochs": int(config.epochs - int(config.stage1_epochs or config.epochs // 3)),
             "bmm_mode": config.bmm_mode,
             "bmm_scope": ido_bmm_scope(config.bmm_mode),
+            "stage2_effective_batch_size": 80,
+            "stage2_microbatch_size": config.stage2_microbatch_size,
             "task_contract_sha256": contract_sha256,
             "task_id": task.task_id,
             "experiment_signature": contract["experiment_signature"],
@@ -307,6 +313,7 @@ class IDOBatchTests(unittest.TestCase):
                     "method_key": "ido",
                     "ido_bmm_mode": config.bmm_mode,
                     "ido_bmm_scope": ido_bmm_scope(config.bmm_mode),
+                    "ido_stage2_microbatch_size": config.stage2_microbatch_size,
                     "ido_task_contract_sha256": contract_sha256,
                     "ido_experiment_signature": contract["experiment_signature"],
                 }
@@ -325,6 +332,8 @@ class IDOBatchTests(unittest.TestCase):
                     "d1_recording_status": "complete",
                     "stage1_epochs": config.stage1_epochs,
                     "stage2_epochs": config.epochs - int(config.stage1_epochs or 0),
+                    "stage2_effective_batch_size": 80,
+                    "stage2_microbatch_size": config.stage2_microbatch_size,
                     "checkpoint_protocol": "fixed_clean_validation_v1",
                     "official_test_evaluation": "validation_selected_only",
                     "validation_selected_test_top5": score,
@@ -373,6 +382,19 @@ class IDOBatchTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(20, len(rows))
             self.assertTrue(all(row["observed_label_id"] == "" for row in rows))
+
+    def test_stage2_microbatch_is_frozen_in_contract_command_and_completion_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(self._write_fixture_config(Path(tmp), stage2_microbatch_size=20))
+            task = build_plan(config, ("cyclic",), attempt=1)[0]
+            contract = build_task_contract(config, task)
+            self.assertEqual(20, contract["experiment"]["stage2_microbatch_size"])
+            command = build_training_command(config, task)
+            self.assertIn("--ido-stage2-microbatch-size", command)
+            self.assertEqual("20", command[command.index("--ido-stage2-microbatch-size") + 1])
+            self._materialize_complete_task(task, config, score=0.2)
+            complete, detail = is_complete(task, config)
+            self.assertTrue(complete, detail)
 
     def test_seed_contract_location_matches_the_single_run_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

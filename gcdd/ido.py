@@ -90,6 +90,58 @@ def ido_adaptation_name(mode: str | None) -> str:
     )
 
 
+def resolve_stage2_microbatch_size(size: int | None) -> int | None:
+    """Validate the optional physical Stage-2 microbatch size.
+
+    ``None`` deliberately preserves the historical one-forward-per-effective-
+    batch path.  A configured value only changes Stage 2 memory scheduling;
+    it never changes the DataLoader's effective batch size.
+    """
+    if size is None:
+        return None
+    if isinstance(size, bool):
+        raise ValueError("ido_stage2_microbatch_size must be a positive integer or None.")
+    try:
+        resolved = int(size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ido_stage2_microbatch_size must be a positive integer or None.") from exc
+    if resolved <= 0:
+        raise ValueError("ido_stage2_microbatch_size must be positive when specified.")
+    return resolved
+
+
+def stage2_microbatch_slices(batch_size: int, microbatch_size: int | None) -> tuple[slice, ...]:
+    """Split one effective Stage-2 batch without changing its sample order."""
+    if batch_size <= 0:
+        raise ValueError("Stage-2 effective batches must be non-empty.")
+    resolved = resolve_stage2_microbatch_size(microbatch_size)
+    if resolved is None or resolved >= batch_size:
+        return (slice(0, batch_size),)
+    return tuple(slice(start, min(batch_size, start + resolved)) for start in range(0, batch_size, resolved))
+
+
+def _capture_torch_rng_state(torch: Any, device: str) -> dict[str, Any]:
+    """Capture the RNG needed to replay a no-grad Stage-2 prediction pass.
+
+    The microbatch path first obtains every weak/strong prediction without a
+    graph so it can apply the original whole-effective-batch wrong-event
+    update.  Restoring this state before the corresponding gradient forward
+    preserves the intended stochastic LoRA-dropout realization rather than
+    deriving reliability terms from a different forward pass.
+    """
+    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def _restore_torch_rng_state(torch: Any, device: str, state: dict[str, Any]) -> None:
+    """Restore a state created by :func:`_capture_torch_rng_state`."""
+    torch.set_rng_state(state["cpu"])
+    if "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"], device)
+
+
 @dataclass
 class IDOLoraRunResult:
     """Artifacts returned from one IDO-style seed run."""
@@ -755,6 +807,7 @@ def _ido_d1_summary(
     *,
     stage1_processed_samples: int,
     stage2_processed_samples: int,
+    stage2_prediction_prepass_view_forwards: int,
 ) -> dict[str, Any]:
     """Expose IDO D1 metrics without inventing measurements while profiling is off."""
     if not profiling_enabled(profiler):
@@ -776,6 +829,7 @@ def _ido_d1_summary(
             "d1_stage1_processed_samples": int(stage1_processed_samples),
             "d1_stage2_processed_samples": int(stage2_processed_samples),
             "d1_stage2_extra_view_forwards": int(stage2_processed_samples),
+            "d1_stage2_prediction_prepass_view_forwards": int(stage2_prediction_prepass_view_forwards),
         }
     assert profiler is not None
     payload = profiler.to_dict()
@@ -808,6 +862,7 @@ def _ido_d1_summary(
         "d1_stage1_processed_samples": int(stage1_processed_samples),
         "d1_stage2_processed_samples": int(stage2_processed_samples),
         "d1_stage2_extra_view_forwards": int(stage2_processed_samples),
+        "d1_stage2_prediction_prepass_view_forwards": int(stage2_prediction_prepass_view_forwards),
     }
 
 
@@ -937,6 +992,7 @@ def train_ido_lora(
     seed: int,
     stage1_epochs: int | None = None,
     bmm_mode: str | None = None,
+    stage2_microbatch_size: int | None = None,
     path_maps: list[tuple[str, str]] | None = None,
     checkpoint_path: Path | None = None,
     test_paths: list[str] | None = None,
@@ -950,6 +1006,7 @@ def train_ido_lora(
     task_contract_sha256: str = "",
     task_id: str = "",
     experiment_signature: str = "",
+    execution_signature: str = "",
 ) -> IDOLoraRunResult:
     """Run a validation-selected IDO-style DINOv2-LoRA controlled adaptation."""
     import torch
@@ -972,6 +1029,14 @@ def train_ido_lora(
 
     feature_cfg = cfg["feature"]
     train_cfg = cfg["lora_train"]
+    resolved_stage2_microbatch_size = resolve_stage2_microbatch_size(stage2_microbatch_size)
+    stage2_effective_batch_size = int(train_cfg["batch_size"])
+    if stage2_effective_batch_size <= 0:
+        raise ValueError("lora_train.batch_size must be positive for IDO Stage 2.")
+    stage2_gradient_accumulation_enabled = bool(
+        resolved_stage2_microbatch_size is not None
+        and resolved_stage2_microbatch_size < stage2_effective_batch_size
+    )
     device = resolve_device(torch, feature_cfg.get("device", "auto"))
     if profiling_enabled(profiler):
         assert profiler is not None
@@ -1037,7 +1102,9 @@ def train_ido_lora(
 
     log_stage(
         f"[ido] seed={seed}: Stage 1={resolved_stage1_epochs}, Stage 2={resolved_stage2_epochs}, "
-        f"BMM={bmm_scope}, train_images={len(train_idx)}, trainable_params={trainable_params}"
+        f"BMM={bmm_scope}, train_images={len(train_idx)}, trainable_params={trainable_params}, "
+        f"stage2_effective_batch={stage2_effective_batch_size}, "
+        f"stage2_microbatch={resolved_stage2_microbatch_size if resolved_stage2_microbatch_size is not None else 'disabled'}"
     )
     base_state, base_stage_epoch = _run_stage1(
         torch=torch,
@@ -1085,6 +1152,10 @@ def train_ido_lora(
             lora_structure_metadata=lora_structure_metadata,
             bmm_mode=resolved_bmm_mode,
             bmm_scope=bmm_scope,
+            stage2_effective_batch_size=stage2_effective_batch_size,
+            stage2_microbatch_size=resolved_stage2_microbatch_size,
+            stage2_gradient_accumulation_enabled=stage2_gradient_accumulation_enabled,
+            execution_signature=execution_signature,
         )
     if stage1_checkpoint_token is not None:
         profiler.stop_stage(stage1_checkpoint_token)
@@ -1137,6 +1208,9 @@ def train_ido_lora(
         seen = 0
         fallback_predictions = 0
         clipped_predictions = 0
+        microbatch_count_total = 0
+        microbatch_count_min: int | None = None
+        microbatch_count_max = 0
         progress = progress_iter(
             stage2_loader,
             total=len(stage2_loader),
@@ -1146,31 +1220,125 @@ def train_ido_lora(
             if profiling_enabled(profiler):
                 assert profiler is not None
                 profiler.record_training_batch()
-            weak_images = weak_images.to(device, non_blocking=True)
-            strong_images = strong_images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            batch_size = int(labels.shape[0])
+            micro_slices = stage2_microbatch_slices(batch_size, resolved_stage2_microbatch_size)
+            use_microbatch_accumulation = len(micro_slices) > 1
+            microbatch_count = len(micro_slices)
+            microbatch_count_total += microbatch_count
+            microbatch_count_min = microbatch_count if microbatch_count_min is None else min(microbatch_count_min, microbatch_count)
+            microbatch_count_max = max(microbatch_count_max, microbatch_count)
             index_np = original_indices.detach().cpu().numpy().astype(np.int64)
             label_np = labels.detach().cpu().numpy().astype(np.int64)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                weak_logits = model(weak_images)
-                strong_logits = model(strong_images)
-                weak_predicted = torch.argmax(weak_logits.detach(), dim=1).cpu().numpy()
-                strong_predicted = torch.argmax(strong_logits.detach(), dim=1).cpu().numpy()
+            if not use_microbatch_accumulation:
+                # Preserve the pre-existing full-effective-batch execution path
+                # when microbatching is disabled (or the final batch is already
+                # no larger than the configured physical batch size).
+                weak_images_device = weak_images.to(device, non_blocking=True)
+                strong_images_device = strong_images.to(device, non_blocking=True)
+                labels_device = labels.to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                    weak_logits = model(weak_images_device)
+                    strong_logits = model(strong_images_device)
+                    weak_predicted = torch.argmax(weak_logits.detach(), dim=1).cpu().numpy()
+                    strong_predicted = torch.argmax(strong_logits.detach(), dim=1).cpu().numpy()
+                    wrong_event[index_np[weak_predicted != label_np]] += 1
+                    wrong_event[index_np[strong_predicted != label_np]] += 1
+                    bmm_terms = bmm.predict(wrong_event[index_np], label_np, stage2_epoch=stage_epoch)
+                    loss, parts = official_we_loss(
+                        torch,
+                        strong_logits,
+                        weak_logits,
+                        bmm_terms["prob1"],
+                        bmm_terms["prob2"],
+                        bmm_terms["cdf1"],
+                        bmm_terms["cdf2"],
+                        labels_device,
+                    )
+                scaler.scale(loss).backward()
+                batch_loss = float(loss.detach().cpu())
+                batch_ce = parts["ce_term"]
+                batch_mse = parts["mse_term"]
+                batch_entropy = parts["entropy_term"]
+                batch_posterior = parts["clean_posterior_mean"]
+            else:
+                # Wrong-event is stateful at effective-batch scope in the
+                # original code.  Obtain both predictions without retaining
+                # weak/strong graphs, apply its two updates once for all B
+                # samples, then replay each microbatch from the saved RNG state
+                # for gradient accumulation.  This prevents a microbatch from
+                # observing a partially updated effective batch while keeping
+                # LoRA dropout aligned with the prediction used for its BMM
+                # terms.
+                rng_states: list[dict[str, Any]] = []
+                weak_prediction_parts: list[np.ndarray] = []
+                strong_prediction_parts: list[np.ndarray] = []
+                with torch.no_grad():
+                    for batch_slice in micro_slices:
+                        rng_states.append(_capture_torch_rng_state(torch, device))
+                        weak_micro = weak_images[batch_slice].to(device, non_blocking=True)
+                        strong_micro = strong_images[batch_slice].to(device, non_blocking=True)
+                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                            weak_logits = model(weak_micro)
+                            strong_logits = model(strong_micro)
+                        weak_prediction_parts.append(torch.argmax(weak_logits, dim=1).cpu().numpy())
+                        strong_prediction_parts.append(torch.argmax(strong_logits, dim=1).cpu().numpy())
+                        del weak_logits, strong_logits, weak_micro, strong_micro
+                rng_after_prediction = _capture_torch_rng_state(torch, device)
+                weak_predicted = np.concatenate(weak_prediction_parts)
+                strong_predicted = np.concatenate(strong_prediction_parts)
                 wrong_event[index_np[weak_predicted != label_np]] += 1
                 wrong_event[index_np[strong_predicted != label_np]] += 1
                 bmm_terms = bmm.predict(wrong_event[index_np], label_np, stage2_epoch=stage_epoch)
-                loss, parts = official_we_loss(
-                    torch,
-                    strong_logits,
-                    weak_logits,
-                    bmm_terms["prob1"],
-                    bmm_terms["prob2"],
-                    bmm_terms["cdf1"],
-                    bmm_terms["cdf2"],
-                    labels,
-                )
-            scaler.scale(loss).backward()
+
+                batch_loss_sum = 0.0
+                batch_ce_sum = 0.0
+                batch_mse_sum = 0.0
+                batch_entropy_sum = 0.0
+                batch_posterior_sum = 0.0
+                try:
+                    for batch_slice, rng_state in zip(micro_slices, rng_states):
+                        _restore_torch_rng_state(torch, device, rng_state)
+                        micro_size = int(batch_slice.stop - batch_slice.start)
+                        weak_micro = weak_images[batch_slice].to(device, non_blocking=True)
+                        strong_micro = strong_images[batch_slice].to(device, non_blocking=True)
+                        labels_micro = labels[batch_slice].to(device, non_blocking=True)
+                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                            weak_logits = model(weak_micro)
+                            strong_logits = model(strong_micro)
+                            loss, parts = official_we_loss(
+                                torch,
+                                strong_logits,
+                                weak_logits,
+                                bmm_terms["prob1"][batch_slice],
+                                bmm_terms["prob2"][batch_slice],
+                                bmm_terms["cdf1"][batch_slice],
+                                bmm_terms["cdf2"][batch_slice],
+                                labels_micro,
+                            )
+                            # WELoss is the sum of three per-sample means.
+                            # Scaling each microbatch by b_m / B reproduces the
+                            # one full-effective-batch mean even for a short
+                            # final microbatch; ``loss / accumulation_steps``
+                            # would not.
+                            scaled_loss = loss * (float(micro_size) / float(batch_size))
+                        scaler.scale(scaled_loss).backward()
+                        batch_loss_sum += float(loss.detach().cpu()) * micro_size
+                        batch_ce_sum += parts["ce_term"] * micro_size
+                        batch_mse_sum += parts["mse_term"] * micro_size
+                        batch_entropy_sum += parts["entropy_term"] * micro_size
+                        batch_posterior_sum += parts["clean_posterior_mean"] * micro_size
+                        del scaled_loss, loss, weak_logits, strong_logits, weak_micro, strong_micro, labels_micro
+                finally:
+                    # The replayed gradient forwards consume the same random
+                    # draws as the no-grad pass.  Restoring the post-prediction
+                    # state makes the rest of the epoch advance exactly once.
+                    _restore_torch_rng_state(torch, device, rng_after_prediction)
+                batch_loss = safe_ratio(batch_loss_sum, batch_size)
+                batch_ce = safe_ratio(batch_ce_sum, batch_size)
+                batch_mse = safe_ratio(batch_mse_sum, batch_size)
+                batch_entropy = safe_ratio(batch_entropy_sum, batch_size)
+                batch_posterior = safe_ratio(batch_posterior_sum, batch_size)
             _assert_finite_trainable_gradients(torch, model)
             scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
             scaler.step(optimizer)
@@ -1184,12 +1352,11 @@ def train_ido_lora(
                 scale_before=scale_before,
                 scale_after=scale_after,
             )
-            batch_size = int(labels.shape[0])
-            loss_sum += float(loss.detach().cpu()) * batch_size
-            ce_sum += parts["ce_term"] * batch_size
-            mse_sum += parts["mse_term"] * batch_size
-            entropy_sum += parts["entropy_term"] * batch_size
-            posterior_sum += parts["clean_posterior_mean"] * batch_size
+            loss_sum += batch_loss * batch_size
+            ce_sum += batch_ce * batch_size
+            mse_sum += batch_mse * batch_size
+            entropy_sum += batch_entropy * batch_size
+            posterior_sum += batch_posterior * batch_size
             posterior_mass_deficit_sum += float(bmm_terms["posterior_mass_deficit_sum"])
             posterior_mass_deficit_max = max(
                 posterior_mass_deficit_max,
@@ -1233,6 +1400,12 @@ def train_ido_lora(
                 "bmm_scope": bmm_scope,
                 "bmm_posterior_mass_deficit_sum": float(posterior_mass_deficit_sum),
                 "bmm_posterior_mass_deficit_max": float(posterior_mass_deficit_max),
+                "stage2_effective_batch_size": stage2_effective_batch_size,
+                "stage2_microbatch_size": resolved_stage2_microbatch_size,
+                "stage2_gradient_accumulation_enabled": stage2_gradient_accumulation_enabled,
+                "stage2_microbatch_count_total": microbatch_count_total,
+                "stage2_microbatch_count_min": microbatch_count_min,
+                "stage2_microbatch_count_max": microbatch_count_max,
             }
         )
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -1329,6 +1502,10 @@ def train_ido_lora(
         lora_structure_metadata=lora_structure_metadata,
         bmm_mode=resolved_bmm_mode,
         bmm_scope=bmm_scope,
+        stage2_effective_batch_size=stage2_effective_batch_size,
+        stage2_microbatch_size=resolved_stage2_microbatch_size,
+        stage2_gradient_accumulation_enabled=stage2_gradient_accumulation_enabled,
+        execution_signature=execution_signature,
     )
     if checkpoint_save_token is not None:
         profiler.stop_stage(checkpoint_save_token)
@@ -1342,6 +1519,9 @@ def train_ido_lora(
         bmm=bmm,
         bmm_mode=resolved_bmm_mode,
         bmm_scope=bmm_scope,
+        stage2_effective_batch_size=stage2_effective_batch_size,
+        stage2_microbatch_size=resolved_stage2_microbatch_size,
+        stage2_gradient_accumulation_enabled=stage2_gradient_accumulation_enabled,
     )
     summary["stage1_base_checkpoint"] = str(stage1_base_checkpoint_path) if stage1_base_checkpoint_path is not None else ""
     summary.update(protocol_metrics)
@@ -1351,6 +1531,7 @@ def train_ido_lora(
             "lora_runtime_structure_sha256": lora_structure_metadata["lora_runtime_structure_sha256"],
             "dinov2_pretrained_source": lora_structure_metadata["dinov2_pretrained_source"],
             "runtime_environment": lora_structure_metadata["runtime_environment"],
+            "ido_execution_signature": execution_signature,
         }
     )
     if total_training_token is not None:
@@ -1360,6 +1541,11 @@ def train_ido_lora(
             profiler,
             stage1_processed_samples=len(train_idx) * resolved_stage1_epochs,
             stage2_processed_samples=len(train_idx) * resolved_stage2_epochs,
+            stage2_prediction_prepass_view_forwards=(
+                2 * len(train_idx) * resolved_stage2_epochs
+                if stage2_gradient_accumulation_enabled
+                else 0
+            ),
         )
     )
     return IDOLoraRunResult(
@@ -1707,6 +1893,10 @@ def _save_stage1_base_checkpoint(
     lora_structure_metadata: dict[str, Any],
     bmm_mode: str,
     bmm_scope: str,
+    stage2_effective_batch_size: int,
+    stage2_microbatch_size: int | None,
+    stage2_gradient_accumulation_enabled: bool,
+    execution_signature: str,
 ) -> None:
     """Persist the selected Stage-1 boundary for audit, not in-place resume.
 
@@ -1733,6 +1923,10 @@ def _save_stage1_base_checkpoint(
             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
             "bmm_mode": bmm_mode,
             "bmm_scope": bmm_scope,
+            "stage2_effective_batch_size": int(stage2_effective_batch_size),
+            "stage2_microbatch_size": stage2_microbatch_size,
+            "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
+            "ido_execution_signature": execution_signature,
             "task_contract_sha256": task_contract_sha256,
             "task_id": task_id,
             "experiment_signature": experiment_signature,
@@ -1767,6 +1961,10 @@ def _save_checkpoints(
     lora_structure_metadata: dict[str, Any],
     bmm_mode: str,
     bmm_scope: str,
+    stage2_effective_batch_size: int,
+    stage2_microbatch_size: int | None,
+    stage2_gradient_accumulation_enabled: bool,
+    execution_signature: str,
 ) -> None:
     del model
     metadata = {
@@ -1780,6 +1978,10 @@ def _save_checkpoints(
         "base_stage1_epoch": int(base_stage_epoch),
         "bmm_mode": bmm_mode,
         "bmm_scope": bmm_scope,
+        "stage2_effective_batch_size": int(stage2_effective_batch_size),
+        "stage2_microbatch_size": stage2_microbatch_size,
+        "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
+        "ido_execution_signature": execution_signature,
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
         "weloss_source": IDO_WELoss_SOURCE,
@@ -1812,6 +2014,9 @@ def _summarize_ido_logs(
     bmm: ClasswiseBMM | GlobalBMM,
     bmm_mode: str,
     bmm_scope: str,
+    stage2_effective_batch_size: int,
+    stage2_microbatch_size: int | None,
+    stage2_gradient_accumulation_enabled: bool,
 ) -> dict[str, Any]:
     stage2_logs = [row for row in logs if row["stage"] == "stage2"]
     if not stage2_logs:
@@ -1842,6 +2047,18 @@ def _summarize_ido_logs(
         "base_stage1_epoch": int(base_stage_epoch),
         "bmm_mode": bmm_mode,
         "bmm_scope": bmm_scope,
+        "stage2_effective_batch_size": int(stage2_effective_batch_size),
+        "stage2_microbatch_size": stage2_microbatch_size,
+        "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
+        "stage2_microbatch_count_total": int(
+            sum(int(row.get("stage2_microbatch_count_total", 0)) for row in stage2_logs)
+        ),
+        "stage2_microbatch_count_min": int(
+            min(int(row.get("stage2_microbatch_count_min", 0)) for row in stage2_logs)
+        ),
+        "stage2_microbatch_count_max": int(
+            max(int(row.get("stage2_microbatch_count_max", 0)) for row in stage2_logs)
+        ),
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
         "weloss_source": IDO_WELoss_SOURCE,

@@ -41,6 +41,7 @@ from gcdd.ido import (
     ido_adaptation_name,
     ido_bmm_scope,
     resolve_ido_bmm_mode,
+    resolve_stage2_microbatch_size,
     resolve_stage_budget,
     train_ido_lora,
 )
@@ -244,6 +245,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ido-stage2-microbatch-size",
+        type=int,
+        help=(
+            "Optional physical Stage-2 microbatch size for gradient accumulation. "
+            "The IDO DataLoader/effective batch, optimizer-step count, and scheduler-step count remain unchanged."
+        ),
+    )
+    parser.add_argument(
         "--ido-task-contract",
         type=Path,
         help=(
@@ -339,6 +348,8 @@ def main() -> None:
     validate_args(args)
     ido_stage_budget: tuple[int, int] | None = None
     ido_bmm_mode = "classwise"
+    ido_stage2_microbatch_size: int | None = None
+    ido_execution_signature = ""
     if "ido" in canonical_methods:
         ido_stage_budget = resolve_stage_budget(int(cfg["lora_train"]["epochs"]), args.ido_stage1_epochs)
         existing_ido = cfg.get("ido_controlled_adaptation", {})
@@ -346,6 +357,32 @@ def main() -> None:
             raise ValueError("ido_controlled_adaptation must be a mapping when supplied in config.")
         configured_mode = existing_ido.get("bmm_mode")
         ido_bmm_mode = resolve_ido_bmm_mode(args.ido_bmm_mode if args.ido_bmm_mode is not None else configured_mode)
+        configured_microbatch = existing_ido.get("stage2_microbatch_size")
+        ido_stage2_microbatch_size = resolve_stage2_microbatch_size(
+            args.ido_stage2_microbatch_size
+            if args.ido_stage2_microbatch_size is not None
+            else configured_microbatch
+        )
+        stage2_effective_batch_size = int(cfg["lora_train"]["batch_size"])
+        if stage2_effective_batch_size <= 0:
+            raise ValueError("lora_train.batch_size must be positive for IDO Stage 2.")
+        accumulation_enabled = bool(
+            ido_stage2_microbatch_size is not None
+            and ido_stage2_microbatch_size < stage2_effective_batch_size
+        )
+        ido_execution_signature = canonical_json_sha256(
+            {
+                "schema": "ido_execution_protocol_v1",
+                "identity": ido_adaptation_name(ido_bmm_mode),
+                "stage1_epochs": int(ido_stage_budget[0]),
+                "stage2_epochs": int(ido_stage_budget[1]),
+                "bmm_mode": ido_bmm_mode,
+                "bmm_scope": ido_bmm_scope(ido_bmm_mode),
+                "stage2_effective_batch_size": stage2_effective_batch_size,
+                "stage2_microbatch_size": ido_stage2_microbatch_size,
+                "stage2_gradient_accumulation_enabled": accumulation_enabled,
+            }
+        )
         cfg["ido_controlled_adaptation"] = {
             "identity": ido_adaptation_name(ido_bmm_mode),
             "official_reference": "https://github.com/iTheresaApocalypse/IDO",
@@ -357,6 +394,18 @@ def main() -> None:
             "bmm_mode": ido_bmm_mode,
             "bmm_scope": ido_bmm_scope(ido_bmm_mode),
             "bmm_mode_source": "explicit_cli" if args.ido_bmm_mode is not None else ("config" if configured_mode is not None else "backward_compatible_default"),
+            "stage2_effective_batch_size": stage2_effective_batch_size,
+            "stage2_microbatch_size": ido_stage2_microbatch_size,
+            "stage2_microbatch_size_source": (
+                "explicit_cli" if args.ido_stage2_microbatch_size is not None
+                else ("config" if configured_microbatch is not None else "disabled_default")
+            ),
+            "stage2_gradient_accumulation_enabled": accumulation_enabled,
+            "stage2_nominal_accumulation_steps": (
+                1 if ido_stage2_microbatch_size is None
+                else (stage2_effective_batch_size + ido_stage2_microbatch_size - 1) // ido_stage2_microbatch_size
+            ),
+            "execution_signature": ido_execution_signature,
             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
             "bmm_initialization": {
                 "alpha": [1.0, 2.0],
@@ -386,6 +435,7 @@ def main() -> None:
         official_test_selected_only=bool(args.official_test_selected_only),
         posthoc_oracle_test=bool(args.posthoc_oracle_test),
         bmm_mode=ido_bmm_mode,
+        stage2_microbatch_size=ido_stage2_microbatch_size,
     )
     if ido_task_contract is not None:
         cfg["ido_batch_task_contract"] = {
@@ -627,6 +677,7 @@ def main() -> None:
                         seed=seed,
                         stage1_epochs=int(ido_stage_budget[0]),
                         bmm_mode=ido_bmm_mode,
+                        stage2_microbatch_size=ido_stage2_microbatch_size,
                         path_maps=path_maps,
                         checkpoint_path=checkpoints / "best_val.pt",
                         test_paths=None if args.ido_pilot_no_official_test else data["test_paths"],
@@ -640,6 +691,7 @@ def main() -> None:
                         task_contract_sha256="" if ido_task_contract is None else canonical_json_sha256(ido_task_contract),
                         task_id="" if ido_task_contract is None else str(ido_task_contract["task"]["task_id"]),
                         experiment_signature="" if ido_task_contract is None else str(ido_task_contract["experiment_signature"]),
+                        execution_signature=ido_execution_signature,
                     )
                 except BMMDegenerateError as exc:
                     write_csv(run_dir / "bmm_class_fits.csv", [exc.record], ido_bmm_fit_fields())
@@ -680,6 +732,12 @@ def main() -> None:
                             "ido_stage2_epochs": int(ido_stage_budget[1]),
                             "ido_bmm_mode": ido_bmm_mode,
                             "ido_bmm_scope": ido_bmm_scope(ido_bmm_mode),
+                            "ido_stage2_effective_batch_size": int(run_cfg["lora_train"]["batch_size"]),
+                            "ido_stage2_microbatch_size": ido_stage2_microbatch_size,
+                            "ido_stage2_gradient_accumulation_enabled": bool(
+                                run_cfg["ido_controlled_adaptation"]["stage2_gradient_accumulation_enabled"]
+                            ),
+                            "ido_execution_signature": ido_execution_signature,
                             "weloss_source": IDO_WELoss_SOURCE,
                             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
                             "code_commit": code_provenance["git_head"],
@@ -1258,6 +1316,11 @@ def main() -> None:
                     "ido_base_stage1_epoch": result.summary.get("base_stage1_epoch", ""),
                     "ido_bmm_scope": result.summary.get("bmm_scope", ""),
                     "ido_bmm_mode": result.summary.get("bmm_mode", ""),
+                    "ido_stage2_effective_batch_size": result.summary.get("stage2_effective_batch_size", ""),
+                    "ido_stage2_microbatch_size": result.summary.get("stage2_microbatch_size", ""),
+                    "ido_stage2_gradient_accumulation_enabled": result.summary.get("stage2_gradient_accumulation_enabled", ""),
+                    "ido_stage2_microbatch_count_total": result.summary.get("stage2_microbatch_count_total", ""),
+                    "ido_execution_signature": result.summary.get("ido_execution_signature", ""),
                     "ido_bmm_degenerate_policy": result.summary.get("bmm_degenerate_policy", ""),
                     "ido_final_bmm_fallback_classes": result.summary.get("final_bmm_fallback_classes", ""),
                     "ido_task_id": result_row.get("ido_task_id", ""),
@@ -1429,6 +1492,7 @@ def load_ido_task_contract(
     official_test_selected_only: bool,
     posthoc_oracle_test: bool,
     bmm_mode: str = "classwise",
+    stage2_microbatch_size: int | None = None,
 ) -> dict[str, Any] | None:
     """Load and verify the batch-owned immutable IDO task contract.
 
@@ -1467,6 +1531,8 @@ def load_ido_task_contract(
         raise ValueError("IDO task contract stage budget differs from resolved CLI/config budget.")
     if experiment.get("bmm_mode", "classwise") != resolve_ido_bmm_mode(bmm_mode):
         raise ValueError("IDO task contract BMM mode differs from the resolved CLI/config mode.")
+    if experiment.get("stage2_microbatch_size") != resolve_stage2_microbatch_size(stage2_microbatch_size):
+        raise ValueError("IDO task contract Stage-2 microbatch size differs from the resolved CLI/config mode.")
     if experiment.get("official_test_selected_only") is not True or official_test_selected_only is not True or posthoc_oracle_test:
         raise ValueError("IDO task contract requires validation-selected-only test evaluation with no post-hoc oracle test.")
     if experiment.get("path_maps") != [f"{old}={new}" for old, new in path_maps]:
@@ -1983,6 +2049,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--jocor-lambda must be non-negative.")
     if args.ido_stage1_epochs is not None and args.ido_stage1_epochs <= 0:
         raise ValueError("--ido-stage1-epochs must be positive when provided.")
+    if args.ido_stage2_microbatch_size is not None and args.ido_stage2_microbatch_size <= 0:
+        raise ValueError("--ido-stage2-microbatch-size must be positive when provided.")
     if args.official_test_selected_only and args.posthoc_oracle_test:
         raise ValueError("--official-test-selected-only cannot be combined with --posthoc-oracle-test.")
 
@@ -2152,6 +2220,8 @@ def train_log_fields() -> list[str]:
         "ce_term", "mse_term", "entropy_term", "bmm_clean_posterior_mean", "bmm_fallback_predictions",
         "bmm_clipped_predictions", "bmm_fallback_classes", "bmm_mode", "bmm_scope",
         "bmm_posterior_mass_deficit_sum", "bmm_posterior_mass_deficit_max",
+        "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
+        "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max",
     ]
 
 
@@ -2170,11 +2240,14 @@ def result_fields() -> list[str]:
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode",
         "stage1_epochs", "stage2_epochs", "base_stage1_epoch", "bmm_mode", "bmm_scope", "bmm_degenerate_policy",
         "label_wave_snapshot_policy", "weloss_source", "final_bmm_fallback_classes", "stage1_base_checkpoint",
+        "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
+        "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max", "ido_execution_signature",
         "d1_recording_status", "d1_stage1_wall_seconds", "d1_stage2_wall_seconds", "d1_optimizer_loop_wall_seconds",
         "d1_bmm_fit_seconds", "d1_checkpoint_seconds", "d1_official_test_seconds", "d1_end_to_end_wall_seconds",
         "d1_total_wall_seconds", "d1_optimizer_steps_attempted", "d1_optimizer_steps_actual",
         "d1_peak_cuda_allocated_bytes", "d1_peak_cuda_reserved_bytes", "d1_validation_seconds",
         "d1_stage1_processed_samples", "d1_stage2_processed_samples", "d1_stage2_extra_view_forwards",
+        "d1_stage2_prediction_prepass_view_forwards",
         "ido_task_id", "ido_task_contract_sha256", "ido_experiment_signature",
     ]
 

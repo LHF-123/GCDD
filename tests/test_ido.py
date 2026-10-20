@@ -20,7 +20,9 @@ from gcdd.ido import (
     official_we_loss,
     official_we_loss_per_sample,
     resolve_stage_budget,
+    resolve_stage2_microbatch_size,
     snapshot_trainable_state,
+    stage2_microbatch_slices,
     train_ido_lora,
     update_label_wave_state,
 )
@@ -259,6 +261,105 @@ class IDOTests(unittest.TestCase):
                 torch.tensor([0, 1]),
             )
 
+    def test_stage2_microbatch_weloss_accumulation_matches_full_effective_batch(self) -> None:
+        """Exercise the exact b_m / B scaling used by Stage 2 on CPU.
+
+        The inputs use non-complementary posteriors to cover the global-BMM
+        denominator semantics.  No dropout or AMP is used here so meaningful
+        gradient/parameter equality is expected rather than masked by ordinary
+        floating-point stochasticity.
+        """
+        import torch
+
+        class CountingSGD(torch.optim.SGD):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                super().__init__(*args, **kwargs)
+                self.step_calls = 0
+
+            def step(self, closure: object | None = None) -> object:
+                self.step_calls += 1
+                return super().step(closure=closure)
+
+        class CountingScheduler:
+            def __init__(self) -> None:
+                self.step_calls = 0
+
+            def step(self) -> None:
+                self.step_calls += 1
+
+        def run_once(batch_size: int, microbatch_size: int | None) -> dict[str, object]:
+            torch.manual_seed(20261019)
+            weak_images = torch.randn(batch_size, 7)
+            strong_images = torch.randn(batch_size, 7)
+            labels = torch.arange(batch_size, dtype=torch.int64) % 3
+            prob1 = np.linspace(0.15, 0.85, batch_size, dtype=np.float64)
+            # Deliberately do not force prob1 + prob2 == 1: global BMM uses a
+            # density-sum-plus-epsilon denominator and WELoss consumes both.
+            prob2 = np.linspace(0.78, 0.06, batch_size, dtype=np.float64)
+            cdf1 = np.linspace(0.11, 0.91, batch_size, dtype=np.float64)
+            cdf2 = np.linspace(0.88, 0.18, batch_size, dtype=np.float64)
+            model = torch.nn.Linear(7, 3, bias=True)
+            optimizer = CountingSGD(model.parameters(), lr=0.05)
+            scheduler = CountingScheduler()
+            optimizer.zero_grad(set_to_none=True)
+            total_loss_sum = 0.0
+            ce_sum = 0.0
+            mse_sum = 0.0
+            entropy_sum = 0.0
+            for batch_slice in stage2_microbatch_slices(batch_size, microbatch_size):
+                size = int(batch_slice.stop - batch_slice.start)
+                weak_logits = model(weak_images[batch_slice])
+                strong_logits = model(strong_images[batch_slice])
+                loss, parts = official_we_loss(
+                    torch,
+                    strong_logits,
+                    weak_logits,
+                    prob1[batch_slice],
+                    prob2[batch_slice],
+                    cdf1[batch_slice],
+                    cdf2[batch_slice],
+                    labels[batch_slice],
+                )
+                (loss * (float(size) / float(batch_size))).backward()
+                total_loss_sum += float(loss.detach()) * size
+                ce_sum += parts["ce_term"] * size
+                mse_sum += parts["mse_term"] * size
+                entropy_sum += parts["entropy_term"] * size
+            gradients = {name: parameter.grad.detach().clone() for name, parameter in model.named_parameters()}
+            optimizer.step()
+            scheduler.step()
+            return {
+                "loss": total_loss_sum / batch_size,
+                "ce": ce_sum / batch_size,
+                "mse": mse_sum / batch_size,
+                "entropy": entropy_sum / batch_size,
+                "gradients": gradients,
+                "state": {name: value.detach().clone() for name, value in model.state_dict().items()},
+                "optimizer_steps": optimizer.step_calls,
+                "scheduler_steps": scheduler.step_calls,
+            }
+
+        for batch_size, microbatch_size in ((80, 20), (53, 20), (17, 20), (80, 80)):
+            with self.subTest(batch_size=batch_size, microbatch_size=microbatch_size):
+                full = run_once(batch_size, None)
+                accumulated = run_once(batch_size, microbatch_size)
+                for key in ("loss", "ce", "mse", "entropy"):
+                    self.assertAlmostEqual(float(full[key]), float(accumulated[key]), places=6, msg=key)
+                for name, gradient in full["gradients"].items():
+                    torch.testing.assert_close(gradient, accumulated["gradients"][name], rtol=1.0e-6, atol=1.0e-6)
+                for name, value in full["state"].items():
+                    torch.testing.assert_close(value, accumulated["state"][name], rtol=1.0e-6, atol=1.0e-6)
+                self.assertEqual(1, full["optimizer_steps"])
+                self.assertEqual(1, accumulated["optimizer_steps"])
+                self.assertEqual(1, full["scheduler_steps"])
+                self.assertEqual(1, accumulated["scheduler_steps"])
+
+        self.assertEqual((slice(0, 20), slice(20, 40), slice(40, 53)), stage2_microbatch_slices(53, 20))
+        self.assertEqual((slice(0, 17),), stage2_microbatch_slices(17, 20))
+        self.assertIsNone(resolve_stage2_microbatch_size(None))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            resolve_stage2_microbatch_size(0)
+
     def test_snapshot_deep_clones_mutable_trainable_state(self) -> None:
         import torch
 
@@ -428,6 +529,7 @@ class IDOTests(unittest.TestCase):
                     method="ido-smoke", seed=1, checkpoint_path=root / "best_val.pt",
                     test_paths=paths, test_labels=labels, final_checkpoint_path=root / "last.pt",
                     last5_checkpoint_dir=root / "last5", official_test_selected_only=True, profiler=profiler,
+                    stage2_microbatch_size=2,
                 )
                 global_result = train_ido_lora(
                     paths, labels, paths, labels, np.ones(len(labels), dtype=bool), cfg,
@@ -446,6 +548,9 @@ class IDOTests(unittest.TestCase):
             self.assertTrue((root / "stage1_base.pt").is_file())
             stage1_state = torch.load(root / "stage1_base.pt", map_location="cpu", weights_only=False)
             self.assertEqual("not_implemented_fail_closed_new_attempt_required", stage1_state["resume_support"])
+            self.assertEqual(4, stage1_state["stage2_effective_batch_size"])
+            self.assertEqual(2, stage1_state["stage2_microbatch_size"])
+            self.assertTrue(stage1_state["stage2_gradient_accumulation_enabled"])
             self.assertEqual(
                 stage1_state["lora_structure_contract_sha256"],
                 result.summary["lora_structure_contract_sha256"],
@@ -471,6 +576,11 @@ class IDOTests(unittest.TestCase):
             self.assertEqual(4, result.summary["d1_stage1_processed_samples"])
             self.assertEqual(8, result.summary["d1_stage2_processed_samples"])
             self.assertEqual(8, result.summary["d1_stage2_extra_view_forwards"])
+            self.assertEqual(16, result.summary["d1_stage2_prediction_prepass_view_forwards"])
+            self.assertEqual(4, result.summary["stage2_effective_batch_size"])
+            self.assertEqual(2, result.summary["stage2_microbatch_size"])
+            self.assertTrue(result.summary["stage2_gradient_accumulation_enabled"])
+            self.assertEqual(4, result.summary["stage2_microbatch_count_total"])
             self.assertEqual(3, result.summary["d1_optimizer_steps_attempted"])
             self.assertEqual(3, result.summary["d1_optimizer_steps_actual"])
             self.assertGreaterEqual(result.summary["d1_stage1_wall_seconds"], 0.0)

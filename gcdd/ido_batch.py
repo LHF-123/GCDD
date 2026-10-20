@@ -28,7 +28,12 @@ from .lora_training import (
     build_dinov2_vitb14_lora_structure_contract,
     canonical_structure_sha256,
 )
-from .ido import ido_adaptation_name, ido_bmm_scope, resolve_ido_bmm_mode
+from .ido import (
+    ido_adaptation_name,
+    ido_bmm_scope,
+    resolve_ido_bmm_mode,
+    resolve_stage2_microbatch_size,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -101,6 +106,7 @@ class IDOBatchConfig:
     protocol_frozen: bool
     epochs: int
     stage1_epochs: int | None
+    stage2_microbatch_size: int | None
     validation_seed: int
     bmm_mode: str
     datasets: tuple[DatasetSpec, ...]
@@ -236,6 +242,7 @@ def load_config(path: Path) -> IDOBatchConfig:
     if stage1_epochs is None and int(formal["epochs"]) % 3:
         raise ValueError("formal.stage1_epochs is required when formal.epochs is not divisible by 3.")
     bmm_mode = resolve_ido_bmm_mode(formal.get("bmm_mode", "classwise"))
+    stage2_microbatch_size = resolve_stage2_microbatch_size(formal.get("stage2_microbatch_size"))
     datasets_data = require_mapping(payload, "datasets")
     if set(datasets_data) != set(DATASET_ORDER):
         raise ValueError(f"datasets must contain exactly {list(DATASET_ORDER)}.")
@@ -278,6 +285,7 @@ def load_config(path: Path) -> IDOBatchConfig:
         protocol_frozen=frozen_value,
         epochs=int(formal["epochs"]),
         stage1_epochs=stage1_epochs,
+        stage2_microbatch_size=stage2_microbatch_size,
         validation_seed=int(formal["validation_seed"]),
         bmm_mode=bmm_mode,
         datasets=tuple(datasets),
@@ -608,6 +616,8 @@ def build_training_command(config: IDOBatchConfig, task: IDOTask) -> list[str]:
     ]
     if config.stage1_epochs is not None:
         command.extend(["--ido-stage1-epochs", str(config.stage1_epochs)])
+    if config.stage2_microbatch_size is not None:
+        command.extend(["--ido-stage2-microbatch-size", str(config.stage2_microbatch_size)])
     for mapping in task.dataset.path_maps:
         command.extend(["--path-map", mapping])
     return command
@@ -681,6 +691,7 @@ def build_task_contract(config: IDOBatchConfig, task: IDOTask) -> dict[str, Any]
         "epochs": int(config.epochs),
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
+        "stage2_microbatch_size": config.stage2_microbatch_size,
         "validation_seed": int(config.validation_seed),
         "official_test_selected_only": True,
         "posthoc_oracle_test": False,
@@ -757,6 +768,10 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         return False, "result BMM mode/scope does not match the frozen batch config"
     if policy.get("ido_bmm_mode") != config.bmm_mode or policy.get("ido_bmm_scope") != ido_bmm_scope(config.bmm_mode):
         return False, "selection policy BMM mode/scope does not match the frozen batch config"
+    if result.get("stage2_microbatch_size") != config.stage2_microbatch_size:
+        return False, "result Stage-2 microbatch size does not match the frozen batch config"
+    if policy.get("ido_stage2_microbatch_size") != config.stage2_microbatch_size:
+        return False, "selection policy Stage-2 microbatch size does not match the frozen batch config"
     if result.get("d1_recording_status") != "complete":
         return False, "IDO D1 output is incomplete"
     expected_stage1 = config.stage1_epochs if config.stage1_epochs is not None else config.epochs // 3
@@ -1268,6 +1283,7 @@ def validate_checkpoints(
         "stage2_epochs": expected_stage2,
         "bmm_mode": contract_bmm_mode,
         "bmm_scope": ido_bmm_scope(contract_bmm_mode),
+        "stage2_microbatch_size": contract["experiment"].get("stage2_microbatch_size"),
         "task_contract_sha256": contract_sha256,
         "task_id": task.task_id,
         "experiment_signature": contract["experiment_signature"],
@@ -1286,9 +1302,11 @@ def validate_checkpoints(
         effective_config = yaml.safe_load(effective_config_path.read_text(encoding="utf-8")) or {}
         lora_config = effective_config.get("lora", {})
         feature_config = effective_config.get("feature", {})
-        if not isinstance(lora_config, dict) or not isinstance(feature_config, dict):
-            return "prepared V1 resolved_config.yaml has an invalid feature/lora mapping"
+        train_config = effective_config.get("lora_train", {})
+        if not isinstance(lora_config, dict) or not isinstance(feature_config, dict) or not isinstance(train_config, dict):
+            return "prepared V1 resolved_config.yaml has an invalid feature/lora/lora_train mapping"
         expected_lora_rank = int(lora_config.get("rank", 8))
+        expected_effective_batch_size = int(train_config.get("batch_size", 80))
         target_modules_raw = lora_config.get("target_modules", "qkv")
         if not isinstance(target_modules_raw, str):
             return "prepared V1 LoRA target_modules must be a comma-separated string"
@@ -1298,6 +1316,9 @@ def validate_checkpoints(
         return f"unable to obtain effective DINOv2-LoRA checkpoint audit settings: {exc}"
     if expected_lora_rank <= 0:
         return "prepared V1 LoRA rank is not a positive integer"
+    if expected_effective_batch_size <= 0:
+        return "prepared V1 Stage-2 effective batch size is not positive"
+    expected_common["stage2_effective_batch_size"] = expected_effective_batch_size
     if not expected_target_modules:
         return "prepared V1 LoRA target_modules is empty"
     if backend != "dinov2_vitb14":
