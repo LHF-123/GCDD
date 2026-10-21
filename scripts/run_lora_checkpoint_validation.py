@@ -340,7 +340,21 @@ def main() -> None:
     validate_official_test_request(methods, bool(args.official_test_selected_only))
     pgdf_budget_root = Path(args.pgdf_budget_root) if args.pgdf_budget_root else None
     validate_budget_method_request(methods, pgdf_budget_root, seeds)
-    preflight_run_dirs(output_dir, methods, seeds)
+    # A formal IDO batch materializes its immutable task contract before this
+    # entry point starts.  That contract is the sole permitted pre-existing
+    # item in the otherwise fresh raw run directory; all result artifacts and
+    # any unrelated residue remain fail-closed.
+    ido_task_contract_path = (
+        Path(args.ido_task_contract).resolve()
+        if args.ido_task_contract is not None
+        else None
+    )
+    preflight_run_dirs(
+        output_dir,
+        methods,
+        seeds,
+        permitted_existing_file=ido_task_contract_path,
+    )
     path_maps = parse_path_maps(args.path_map)
     cfg = load_config(input_dir, Path(args.config) if args.config else None)
     apply_lora_defaults(cfg)
@@ -586,7 +600,10 @@ def main() -> None:
         canonical_key = canonical_method_key(method_key)
         for seed in seeds:
             run_dir = output_dir / method_key / f"seed{seed}"
-            require_fresh_run_dir(run_dir)
+            require_fresh_run_dir(
+                run_dir,
+                permitted_existing_file=ido_task_contract_path,
+            )
             ensure_dir(run_dir)
             checkpoints = run_dir / "checkpoints"
             run_cfg = copy.deepcopy(cfg)
@@ -1923,20 +1940,47 @@ def verify_soft_weight_budget_match(
             raise RuntimeError(f"Soft-weight fusion has no positive-weight samples for {key}.")
 
 
-def require_fresh_run_dir(run_dir: Path) -> None:
-    """Protect completed or partial raw runs from accidental overwrite."""
-    if run_dir.exists() and any(run_dir.iterdir()):
+def require_fresh_run_dir(
+    run_dir: Path,
+    *,
+    permitted_existing_file: Path | None = None,
+) -> None:
+    """Protect raw runs, except for the formal batch's sole task contract."""
+    if not run_dir.exists():
+        return
+    entries = list(run_dir.iterdir())
+    if not entries:
+        return
+    if permitted_existing_file is not None:
+        permitted_path = permitted_existing_file.resolve()
+        if (
+            len(entries) == 1
+            and entries[0].is_file()
+            and entries[0].resolve() == permitted_path
+            and permitted_path.parent == run_dir.resolve()
+        ):
+            return
+    if entries:
         raise FileExistsError(
             f"Run directory is not empty and will not be overwritten: {run_dir}. "
             "Choose a new --output-dir or remove/move the partial run explicitly."
         )
 
 
-def preflight_run_dirs(output_dir: Path, methods: list[str], seeds: list[int]) -> None:
+def preflight_run_dirs(
+    output_dir: Path,
+    methods: list[str],
+    seeds: list[int],
+    *,
+    permitted_existing_file: Path | None = None,
+) -> None:
     """Check the complete request before any config/reference file is rewritten."""
     for method_key in methods:
         for seed in seeds:
-            require_fresh_run_dir(output_dir / method_key / f"seed{seed}")
+            require_fresh_run_dir(
+                output_dir / method_key / f"seed{seed}",
+                permitted_existing_file=permitted_existing_file,
+            )
 
 
 def load_config(input_dir: Path, override_path: Path | None) -> dict[str, Any]:

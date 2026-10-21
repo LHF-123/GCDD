@@ -31,11 +31,38 @@ from scripts.run_lora_checkpoint_validation import (
     CONTROLLED_ADAPTATION_METHODS,
     METHODS,
     parse_methods,
+    preflight_run_dirs,
+    require_fresh_run_dir,
     validate_ido_pilot_no_official_test_request,
 )
 
 
 class IDOTests(unittest.TestCase):
+    def test_formal_task_contract_is_the_only_permitted_preexisting_run_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "ido" / "seed1"
+            run_dir.mkdir(parents=True)
+            contract = run_dir / "ido_task_contract.json"
+            contract.write_text("{}", encoding="utf-8")
+
+            # The formal batch writes this immutable input before invoking the
+            # single-run entry point.  It must not be mistaken for a partial
+            # training result.
+            require_fresh_run_dir(run_dir, permitted_existing_file=contract)
+            preflight_run_dirs(root, ["ido"], [1], permitted_existing_file=contract)
+
+            (run_dir / "unexpected.txt").write_text("partial run", encoding="utf-8")
+            with self.assertRaisesRegex(FileExistsError, "not empty"):
+                require_fresh_run_dir(run_dir, permitted_existing_file=contract)
+
+            (run_dir / "unexpected.txt").unlink()
+            with self.assertRaisesRegex(FileExistsError, "not empty"):
+                require_fresh_run_dir(
+                    run_dir,
+                    permitted_existing_file=root / "other" / "ido_task_contract.json",
+                )
+
     def test_ido_pilot_no_official_test_is_strictly_isolated_from_formal_runs(self) -> None:
         pilot = SimpleNamespace(
             ido_pilot_no_official_test=True,
