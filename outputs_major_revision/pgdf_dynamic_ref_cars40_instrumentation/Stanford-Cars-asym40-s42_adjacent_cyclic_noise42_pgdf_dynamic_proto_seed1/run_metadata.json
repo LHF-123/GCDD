@@ -1,0 +1,32 @@
+{
+  "code_commit": "c42688d5df01218fbd422aae40995c088a6aeb02",
+  "code_provenance": {
+    "d1_d2_module_sha256": {
+      "revision_experiments/_paths.py": "7a385ef275ac78941447179362ce5e3699f0f2f0be039fb80887e80b537f6898",
+      "revision_experiments/offline_diagnostics.py": "0469cbe446d6a7126902c36b5c4216620c685a2d6315ac6f53b1c8285db2c194",
+      "revision_experiments/profiling.py": "78c8b3d2e56b386b57db7e2381a6dd1ea5fb6a2a924511855b3ce88be5618446",
+      "revision_experiments/selection_logging.py": "8592cf0b311c9ef72df998266171148448d485b5c589617f7d2e9c0f95ec7c64",
+      "revision_experiments/training_integration.py": "c7079bae35cb5101f6ffca199a2cc4b65fd1b7aa06c0009c9af3479ab161d9f0"
+    },
+    "git_dirty": true,
+    "git_head": "c42688d5df01218fbd422aae40995c088a6aeb02",
+    "training_entry_sha256": "1cb9b42d6c9d18ec55fa9336756687aabaf981188cd5aef2adb7aa12e849e70a",
+    "training_function_sha256": "23cb113d2e6416cdf45558bab33e1259026ef2fcd59baf1d798147c8229499e4"
+  },
+  "dataset": "Stanford-Cars-asym40-s42",
+  "experiment_id": "Stanford-Cars-asym40-s42_adjacent_cyclic_noise42_pgdf_dynamic_proto_seed1",
+  "fusion_mode": "",
+  "method": "pgdf_dynamic_proto",
+  "noise_protocol": "adjacent_cyclic",
+  "noise_seed": 42,
+  "profiling_mode": "basic",
+  "proto_keep_ratio": 0.4,
+  "prototype_mode": "dynamic_lora",
+  "retention_ratio": 0.8,
+  "schema_version": "revision_training_integration_v1",
+  "selection_logging_enabled": true,
+  "selection_strategy": "loss_and_proto",
+  "training_seed": 1,
+  "update_interval": 5,
+  "warmup_epochs": 5
+}

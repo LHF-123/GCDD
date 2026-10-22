@@ -1,0 +1,11 @@
+{
+  "protocol": "fixed_clean_validation_v1",
+  "validation_ratio": 0.1,
+  "validation_seed": 20250726,
+  "train_paths_sha256": "5c2fc1bb7792c256c901f8ad0bca9087456a5c02feb969d399b64fe621b125fb",
+  "source_train_samples": 6667,
+  "training_pool_samples": 6067,
+  "validation_samples": 600,
+  "stratification_label": "clean_label",
+  "validation_label": "clean_label"
+}
