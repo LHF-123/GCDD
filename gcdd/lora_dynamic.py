@@ -106,6 +106,7 @@ def train_dynamic_loss_lora(
     checkpoint_protocol: str = "legacy_test_selected",
     posthoc_oracle_test: bool = False,
     class_budget_schedule: dict[int, dict[str, int]] | None = None,
+    replay_selection_masks: dict[int, np.ndarray] | None = None,
     scheduler_retention_ratio: float | None = None,
     official_test_selected_only: bool = False,
     selection_strategy: str = "auto",
@@ -157,6 +158,7 @@ def train_dynamic_loss_lora(
     is_fusion_strategy = selection_strategy in fusion_strategy_modes
     is_budget_matched_proto = selection_strategy == BUDGET_MATCHED_PROTO_STRATEGY
     is_budget_matched_random = selection_strategy == BUDGET_MATCHED_RANDOM_STRATEGY
+    is_fixed_replay = selection_strategy == "fixed_replay"
 
     validate_dynamic_args(
         retention_ratio,
@@ -189,7 +191,16 @@ def train_dynamic_loss_lora(
             raise ValueError("proto_scores contains NaN values for candidate samples.")
     if auto_proto_keep is not None and centroid_mask is None:
         raise ValueError("auto_proto_keep requires centroid_mask to compute dynamic/prototype overlap.")
-    if class_budget_schedule is not None:
+    if is_fixed_replay:
+        if replay_selection_masks is None:
+            raise ValueError("fixed_replay requires replay_selection_masks.")
+        if class_budget_schedule is not None:
+            raise ValueError("fixed_replay cannot be combined with class_budget_schedule.")
+        if centroid_mask is not None or proto_scores is not None or auto_proto_keep is not None:
+            raise ValueError("fixed_replay cannot receive live selection inputs.")
+    elif replay_selection_masks is not None:
+        raise ValueError("replay_selection_masks is only valid with selection_strategy='fixed_replay'.")
+    elif class_budget_schedule is not None:
         if selection_strategy in fusion_strategy_modes:
             if centroid_mask is not None or auto_proto_keep is not None:
                 raise ValueError(
@@ -318,6 +329,17 @@ def train_dynamic_loss_lora(
     epochs = int(train_cfg["epochs"])
     batch_size = int(train_cfg["batch_size"])
     expected_budget_epochs = selection_update_epochs(epochs, warmup_epochs, update_interval)
+    if is_fixed_replay:
+        assert replay_selection_masks is not None
+        validate_replay_selection_masks(
+            replay_selection_masks,
+            candidate_mask,
+            expected_budget_epochs,
+        )
+        if scheduler_retention_ratio is None:
+            raise ValueError(
+                "fixed_replay requires scheduler_retention_ratio so its LR schedule is pre-declared."
+            )
     if class_budget_schedule is not None:
         validate_class_budget_schedule(
             class_budget_schedule,
@@ -441,6 +463,7 @@ def train_dynamic_loss_lora(
                     track_step_counts = (
                         class_budget_schedule is not None
                         or selection_strategy in fusion_strategy_modes
+                        or is_fixed_replay
                         or profiling_enabled(profiler)
                     )
                     scale_before = (
@@ -616,7 +639,10 @@ def train_dynamic_loss_lora(
 
             with profiling_memory_phase(profiler, "selection"):
                 with profiling_stage(profiler, "fusion_selection", phase=f"epoch_{epoch}"):
-                    if selection_strategy == "loss_only":
+                    if is_fixed_replay:
+                        assert replay_selection_masks is not None
+                        selected_mask = np.asarray(replay_selection_masks[epoch], dtype=bool).copy()
+                    elif selection_strategy == "loss_only":
                         if loss_selected_mask is None:
                             raise RuntimeError("loss_only selection did not produce a small-loss mask.")
                         selected_mask = loss_selected_mask
@@ -982,14 +1008,21 @@ def train_dynamic_loss_lora(
             "selection_strategy": selection_strategy,
             "prototype_mode": prototype_mode,
             "fusion_mode": fusion_mode or "",
+            "initial_trainable_checksum": initial_trainable_checksum,
             "optimizer_steps_attempted": (
-                optimizer_steps_attempted_total if class_budget_schedule is not None or is_fusion_strategy else ""
+                optimizer_steps_attempted_total
+                if class_budget_schedule is not None or is_fusion_strategy or is_fixed_replay
+                else ""
             ),
             "optimizer_steps_actual": (
-                optimizer_steps_actual_total if class_budget_schedule is not None or is_fusion_strategy else ""
+                optimizer_steps_actual_total
+                if class_budget_schedule is not None or is_fusion_strategy or is_fixed_replay
+                else ""
             ),
             "scheduler_steps_actual": (
-                scheduler_steps_actual_total if class_budget_schedule is not None or is_fusion_strategy else ""
+                scheduler_steps_actual_total
+                if class_budget_schedule is not None or is_fusion_strategy or is_fixed_replay
+                else ""
             ),
             "soft_weighting_effective_budget": (
                 fusion_update_rows[-1].get("effective_weight_budget", "")
@@ -1044,6 +1077,7 @@ def validate_dynamic_args(
         "loss_and_proto",
         BUDGET_MATCHED_PROTO_STRATEGY,
         BUDGET_MATCHED_RANDOM_STRATEGY,
+        "fixed_replay",
         "fusion_weighted",
         "fusion_union",
         "fusion_soft",
@@ -1080,6 +1114,36 @@ def selection_update_epochs(epochs: int, warmup_epochs: int, update_interval: in
         for epoch in range(1, max(0, int(epochs)))
         if should_update_selection(epoch, warmup_epochs, update_interval)
     ]
+
+
+def validate_replay_selection_masks(
+    replay_selection_masks: dict[int, np.ndarray],
+    candidate_mask: np.ndarray,
+    expected_update_epochs: list[int],
+) -> None:
+    """Fail closed on a fixed replay trajectory before any model is created.
+
+    The masks are full-original-training-pool boolean arrays.  They are applied
+    after each historic update and therefore must cover precisely the update
+    epochs that have a successor; no current-model selection signal is read.
+    """
+    expected = set(int(epoch) for epoch in expected_update_epochs)
+    found = set(int(epoch) for epoch in replay_selection_masks)
+    if found != expected:
+        raise ValueError(
+            f"Replay mask epochs {sorted(found)} do not match expected updates {sorted(expected)}."
+        )
+    candidate = np.asarray(candidate_mask, dtype=bool)
+    for epoch in sorted(expected):
+        mask = np.asarray(replay_selection_masks[epoch], dtype=bool)
+        if mask.shape != candidate.shape:
+            raise ValueError(
+                f"Replay mask at epoch {epoch} has shape {mask.shape}; expected {candidate.shape}."
+            )
+        if np.any(mask & ~candidate):
+            raise ValueError(f"Replay mask at epoch {epoch} selects samples outside the candidate pool.")
+        if not np.any(mask):
+            raise ValueError(f"Replay mask at epoch {epoch} is empty.")
 
 
 def estimate_dynamic_total_steps(candidate_count: int, batch_size: int, epochs: int, warmup_epochs: int, retention_ratio: float) -> int:
