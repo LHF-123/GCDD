@@ -14,8 +14,10 @@ from gcdd.ido import (
     ClassConditionalBetaMixture,
     ClasswiseBMM,
     GlobalBMM,
+    IDO_AMP_OVERFLOW_POLICY,
     IDO_BMM_MODE_GLOBAL,
     IDO_GLOBAL_BMM_SCOPE,
+    _run_stage2_backward_with_amp_retry,
     ido_adaptation_name,
     official_we_loss,
     official_we_loss_per_sample,
@@ -386,6 +388,131 @@ class IDOTests(unittest.TestCase):
         self.assertIsNone(resolve_stage2_microbatch_size(None))
         with self.assertRaisesRegex(ValueError, "positive"):
             resolve_stage2_microbatch_size(0)
+
+    def test_stage2_amp_overflow_retries_same_batch_once_then_remains_fail_closed(self) -> None:
+        """A recovered AMP overflow must not consume an optimizer/scheduler step.
+
+        This CPU test uses a minimal scaler double to exercise the control
+        flow without requiring CUDA.  The first backward deliberately injects
+        an infinite gradient; the replay computes the same finite toy loss.
+        """
+        import torch
+
+        class FakeGradScaler:
+            def __init__(self) -> None:
+                self.scale_value = 1024.0
+                self.unscale_calls = 0
+                self.update_calls = 0
+
+            def is_enabled(self) -> bool:
+                return True
+
+            def get_scale(self) -> float:
+                return self.scale_value
+
+            def scale(self, value: torch.Tensor) -> torch.Tensor:
+                return value
+
+            def unscale_(self, _optimizer: torch.optim.Optimizer) -> None:
+                self.unscale_calls += 1
+
+            def update(self) -> None:
+                self.update_calls += 1
+                self.scale_value /= 2.0
+
+        model = torch.nn.Linear(3, 2, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        scaler = FakeGradScaler()
+        events: list[dict[str, object]] = []
+        recovered: list[int] = []
+        inputs = torch.tensor([[1.0, -2.0, 0.5]])
+        targets = torch.zeros(1, 2)
+
+        def backward_once(retry_index: int) -> dict[str, object]:
+            loss = torch.nn.functional.mse_loss(model(inputs), targets)
+            scaler.scale(loss).backward()
+            if retry_index == 0:
+                with torch.no_grad():
+                    model.weight.grad.fill_(float("inf"))
+            return {"loss_terms": {"total": float(loss.detach())}}
+
+        def on_overflow(
+            retry_index: int,
+            scale_before: float | None,
+            scale_after: float | None,
+            failures: list[dict[str, object]],
+            _payload: dict[str, object],
+            terminal: bool,
+        ) -> None:
+            events.append(
+                {
+                    "retry_index": retry_index,
+                    "scale_before": scale_before,
+                    "scale_after": scale_after,
+                    "failures": failures,
+                    "terminal": terminal,
+                }
+            )
+
+        payload, retry_count = _run_stage2_backward_with_amp_retry(
+            torch,
+            model,
+            optimizer,
+            scaler,
+            backward_once,
+            on_overflow,
+            recovered.append,
+        )
+        self.assertEqual({"loss_terms"}, set(payload))
+        self.assertEqual(1, retry_count)
+        self.assertEqual(1, scaler.update_calls)
+        self.assertEqual(2, scaler.unscale_calls)
+        self.assertEqual([1], recovered)
+        self.assertEqual(1, len(events))
+        self.assertFalse(bool(events[0]["terminal"]))
+        self.assertEqual(1024.0, events[0]["scale_before"])
+        self.assertEqual(512.0, events[0]["scale_after"])
+        self.assertTrue(torch.isfinite(model.weight.grad).all())
+
+        terminal_model = torch.nn.Linear(3, 2, bias=False)
+        terminal_optimizer = torch.optim.SGD(terminal_model.parameters(), lr=0.1)
+        terminal_scaler = FakeGradScaler()
+        terminal_events: list[dict[str, object]] = []
+
+        def always_nonfinite(retry_index: int) -> dict[str, object]:
+            loss = torch.nn.functional.mse_loss(terminal_model(inputs), targets)
+            terminal_scaler.scale(loss).backward()
+            with torch.no_grad():
+                terminal_model.weight.grad.fill_(float("nan"))
+            return {"loss_terms": {"total": float(loss.detach()), "retry_index": retry_index}}
+
+        with self.assertRaisesRegex(FloatingPointError, "non-finite gradient"):
+            _run_stage2_backward_with_amp_retry(
+                torch,
+                terminal_model,
+                terminal_optimizer,
+                terminal_scaler,
+                always_nonfinite,
+                lambda retry, before, after, failures, payload, terminal: terminal_events.append(
+                    {
+                        "retry_index": retry,
+                        "scale_before": before,
+                        "scale_after": after,
+                        "failure_count": len(failures),
+                        "terminal": terminal,
+                        "payload": payload,
+                    }
+                ),
+                lambda _retries: self.fail("a terminal AMP overflow must not report recovery"),
+            )
+        self.assertEqual(2, len(terminal_events))
+        self.assertFalse(bool(terminal_events[0]["terminal"]))
+        self.assertTrue(bool(terminal_events[1]["terminal"]))
+        self.assertEqual(1, terminal_scaler.update_calls)
+        self.assertEqual(
+            "stage2_retry_same_effective_batch_once_after_gradscaler_backoff_then_fail_closed",
+            IDO_AMP_OVERFLOW_POLICY,
+        )
 
     def test_snapshot_deep_clones_mutable_trainable_state(self) -> None:
         import torch

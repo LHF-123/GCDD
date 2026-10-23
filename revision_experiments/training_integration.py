@@ -182,18 +182,22 @@ def record_optimizer_and_scheduler_step(
     amp_enabled: bool,
     scale_before: float | None,
     scale_after: float | None,
+    scheduler_stepped: bool = True,
 ) -> bool:
     """Record existing step calls and return whether AMP applied an update.
 
     A disabled scaler always updates.  With AMP, a reduced post-update scale is
     the public GradScaler signal for an overflow-skipped optimizer update.  The
-    caller still performs the exact original optimizer/scaler/scheduler calls.
+    ``scheduler_stepped`` lets a caller record a corrected AMP path that does
+    not advance its scheduler for a skipped optimizer update.  The default
+    preserves existing callers' record-only behavior.
     """
     actual_update = not amp_enabled or scale_before is None or scale_after is None or scale_after >= scale_before
     if profiling_enabled(profiler):
         assert profiler is not None
         profiler.record_optimizer_step(actual_update=actual_update, epoch=epoch)
-        profiler.record_scheduler_step()
+        if scheduler_stepped:
+            profiler.record_scheduler_step()
     return actual_update
 
 

@@ -35,6 +35,7 @@ from gcdd.config import deep_update
 from gcdd.io_utils import ensure_dir, read_csv, write_csv, write_json, write_yaml
 from gcdd.ido import (
     BMMDegenerateError,
+    IDO_AMP_OVERFLOW_POLICY,
     IDO_DEGENERATE_POLICY,
     IDO_WAVE_SNAPSHOT_POLICY,
     IDO_WELoss_SOURCE,
@@ -754,6 +755,7 @@ def main() -> None:
                             "ido_stage2_gradient_accumulation_enabled": bool(
                                 run_cfg["ido_controlled_adaptation"]["stage2_gradient_accumulation_enabled"]
                             ),
+                            "ido_amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
                             "ido_execution_signature": ido_execution_signature,
                             "weloss_source": IDO_WELoss_SOURCE,
                             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
@@ -1337,6 +1339,10 @@ def main() -> None:
                     "ido_stage2_microbatch_size": result.summary.get("stage2_microbatch_size", ""),
                     "ido_stage2_gradient_accumulation_enabled": result.summary.get("stage2_gradient_accumulation_enabled", ""),
                     "ido_stage2_microbatch_count_total": result.summary.get("stage2_microbatch_count_total", ""),
+                    "ido_amp_overflow_policy": result.summary.get("amp_overflow_policy", ""),
+                    "ido_amp_overflow_events": result.summary.get("amp_overflow_events", ""),
+                    "ido_amp_overflow_recovered_batches": result.summary.get("amp_overflow_recovered_batches", ""),
+                    "ido_amp_overflow_diagnostic_path": result.summary.get("amp_overflow_diagnostic_path", ""),
                     "ido_execution_signature": result.summary.get("ido_execution_signature", ""),
                     "ido_bmm_degenerate_policy": result.summary.get("bmm_degenerate_policy", ""),
                     "ido_final_bmm_fallback_classes": result.summary.get("final_bmm_fallback_classes", ""),
@@ -2266,6 +2272,7 @@ def train_log_fields() -> list[str]:
         "bmm_posterior_mass_deficit_sum", "bmm_posterior_mass_deficit_max",
         "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
         "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max",
+        "amp_overflow_policy", "amp_overflow_events_cumulative", "amp_overflow_recovered_batches_cumulative",
     ]
 
 
@@ -2285,7 +2292,8 @@ def result_fields() -> list[str]:
         "stage1_epochs", "stage2_epochs", "base_stage1_epoch", "bmm_mode", "bmm_scope", "bmm_degenerate_policy",
         "label_wave_snapshot_policy", "weloss_source", "final_bmm_fallback_classes", "stage1_base_checkpoint",
         "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
-        "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max", "ido_execution_signature",
+        "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max",
+        "amp_overflow_policy", "amp_overflow_events", "amp_overflow_recovered_batches", "amp_overflow_diagnostic_path", "ido_execution_signature",
         "d1_recording_status", "d1_stage1_wall_seconds", "d1_stage2_wall_seconds", "d1_optimizer_loop_wall_seconds",
         "d1_bmm_fit_seconds", "d1_checkpoint_seconds", "d1_official_test_seconds", "d1_end_to_end_wall_seconds",
         "d1_total_wall_seconds", "d1_optimizer_steps_attempted", "d1_optimizer_steps_actual",

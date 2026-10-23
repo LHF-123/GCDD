@@ -199,7 +199,12 @@ class TrainingIntegrationTests(unittest.TestCase):
                         )
                         self.assertFalse(
                             record_optimizer_and_scheduler_step(
-                                profiler, epoch=1, amp_enabled=True, scale_before=1024.0, scale_after=512.0
+                                profiler,
+                                epoch=1,
+                                amp_enabled=True,
+                                scale_before=1024.0,
+                                scale_after=512.0,
+                                scheduler_stepped=False,
                             )
                         )
             with profiling_memory_phase(profiler, "selection"):
@@ -212,7 +217,7 @@ class TrainingIntegrationTests(unittest.TestCase):
         payload = profiler.to_dict()
         self.assertEqual(payload["optimizer_steps_attempted"], 2)
         self.assertEqual(payload["optimizer_steps_actual"], 1)
-        self.assertEqual(payload["scheduler_steps_actual"], 2)
+        self.assertEqual(payload["scheduler_steps_actual"], 1)
         self.assertEqual(payload["training_batches_seen"], 2)
         self.assertEqual(payload["selection_interval_steps"], {1: 1})
         self.assertEqual(payload["stage_totals"]["selection_loss_forward"]["count"], 1)

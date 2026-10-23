@@ -14,10 +14,12 @@ rather than silently changing the objective.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import os
 import platform
 from pathlib import Path
 import sys
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -60,6 +62,8 @@ IDO_GLOBAL_BMM_SCOPE = "all_observed_training_pool"
 IDO_DEGENERATE_POLICY = "fail_closed_record_and_abort"
 IDO_WAVE_SNAPSHOT_POLICY = "deep_clone_trainable_state"
 IDO_WELoss_SOURCE = "official_repository_WELoss_logits_mse_with_per_sample_entropy_broadcast_fix"
+IDO_AMP_OVERFLOW_RETRY_LIMIT = 1
+IDO_AMP_OVERFLOW_POLICY = "stage2_retry_same_effective_batch_once_after_gradscaler_backoff_then_fail_closed"
 
 
 def resolve_ido_bmm_mode(mode: str | None) -> str:
@@ -793,13 +797,128 @@ def update_label_wave_state(
     return prediction_changes, False, previous_prediction, int(previous_change), True
 
 
-def _assert_finite_trainable_gradients(torch: Any, model: Any) -> None:
-    """Stop before an optimizer update if any LoRA/head gradient is non-finite."""
+def _nonfinite_trainable_gradient_records(torch: Any, model: Any) -> list[dict[str, Any]]:
+    """Return serializable diagnostics for non-finite LoRA/head gradients.
+
+    This is deliberately evaluated only after a backward pass.  It records no
+    labels, images, or clean/noisy oracle state, and it avoids retaining full
+    gradient tensors in an output artifact.
+    """
+    records: list[dict[str, Any]] = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad or parameter.grad is None:
             continue
-        if not bool(torch.isfinite(parameter.grad).all()):
-            raise FloatingPointError(f"IDO non-finite gradient for trainable parameter {name!r}.")
+        gradient = parameter.grad.detach()
+        finite = torch.isfinite(gradient)
+        if bool(finite.all()):
+            continue
+        finite_values = gradient[finite]
+        records.append(
+            {
+                "parameter": name,
+                "shape": [int(size) for size in gradient.shape],
+                "numel": int(gradient.numel()),
+                "nonfinite_count": int((~finite).sum().item()),
+                "nan_count": int(torch.isnan(gradient).sum().item()),
+                "positive_inf_count": int(torch.isposinf(gradient).sum().item()),
+                "negative_inf_count": int(torch.isneginf(gradient).sum().item()),
+                "finite_abs_max": (
+                    float(torch.abs(finite_values).max().item()) if int(finite_values.numel()) else None
+                ),
+            }
+        )
+    return records
+
+
+def _assert_finite_trainable_gradients(torch: Any, model: Any) -> None:
+    """Stop before an optimizer update if any LoRA/head gradient is non-finite."""
+    records = _nonfinite_trainable_gradient_records(torch, model)
+    if records:
+        raise FloatingPointError(f"IDO non-finite gradient for trainable parameter {records[0]['parameter']!r}.")
+
+
+def _ido_amp_overflow_diagnostic_path(checkpoint_path: Path | None) -> Path | None:
+    """Locate a seed-run diagnostic file without assuming a formal output path."""
+    if checkpoint_path is None:
+        return None
+    parent = checkpoint_path.parent
+    run_dir = parent.parent if parent.name == "checkpoints" else parent
+    return run_dir / "amp_overflow_diagnostics.json"
+
+
+def _write_ido_amp_overflow_diagnostics(path: Path, events: list[dict[str, Any]]) -> None:
+    """Durably persist overflow evidence before a retry or fail-closed abort."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "policy": IDO_AMP_OVERFLOW_POLICY,
+        "retry_limit": IDO_AMP_OVERFLOW_RETRY_LIMIT,
+        "events": events,
+    }
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _bmm_term_range_summary(bmm_terms: dict[str, np.ndarray | int | float]) -> dict[str, Any]:
+    """Record compact, non-oracle BMM output ranges for an AMP failure event."""
+    summary: dict[str, Any] = {}
+    for name in ("prob1", "prob2", "cdf1", "cdf2"):
+        values = np.asarray(bmm_terms[name], dtype=np.float64)
+        summary[name] = {
+            "min": float(values.min()) if len(values) else None,
+            "max": float(values.max()) if len(values) else None,
+            "nonfinite_count": int(np.size(values) - np.isfinite(values).sum()),
+        }
+    summary["posterior_mass_deficit_sum"] = float(bmm_terms["posterior_mass_deficit_sum"])
+    summary["posterior_mass_deficit_max"] = float(bmm_terms["posterior_mass_deficit_max"])
+    return summary
+
+
+def _run_stage2_backward_with_amp_retry(
+    torch: Any,
+    model: Any,
+    optimizer: Any,
+    scaler: Any,
+    backward_once: Callable[[int], dict[str, Any]],
+    on_overflow: Callable[[int, float | None, float | None, list[dict[str, Any]], dict[str, Any], bool], None],
+    on_recovered: Callable[[int], None],
+) -> tuple[dict[str, Any], int]:
+    """Backpropagate one Stage-2 effective batch with one AMP-scale retry.
+
+    ``backward_once`` must replay the exact same effective batch and must not
+    mutate wrong-event or BMM state.  On a scaled-gradient overflow, this
+    routine clears the bad gradients, lets ``GradScaler`` apply its configured
+    backoff, and replays the batch once.  A second non-finite gradient remains
+    fail-closed.  No optimizer or scheduler step occurs before a finite retry.
+    """
+    retry_count = 0
+    while True:
+        optimizer.zero_grad(set_to_none=True)
+        payload = backward_once(retry_count)
+        scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
+        if scaler.is_enabled():
+            # The prior implementation inspected scaled gradients before the
+            # scaler could identify an overflow.  Unscale exactly once before
+            # inspection so ``scaler.update`` has the required found-inf state.
+            scaler.unscale_(optimizer)
+        failures = _nonfinite_trainable_gradient_records(torch, model)
+        if not failures:
+            if retry_count:
+                on_recovered(retry_count)
+            return payload, retry_count
+
+        terminal = (not scaler.is_enabled()) or retry_count >= IDO_AMP_OVERFLOW_RETRY_LIMIT
+        scale_after = None
+        if not terminal:
+            scaler.update()
+            scale_after = float(scaler.get_scale())
+        on_overflow(retry_count, scale_before, scale_after, failures, payload, terminal)
+        if terminal:
+            raise FloatingPointError(f"IDO non-finite gradient for trainable parameter {failures[0]['parameter']!r}.")
+        retry_count += 1
 
 
 def _ido_d1_summary(
@@ -1180,6 +1299,14 @@ def train_ido_lora(
     best_state: dict[str, Any] | None = None
     last5_states: list[tuple[int, dict[str, Any]]] = []
     oracle_states: list[tuple[int, dict[str, Any]]] = []
+    amp_overflow_events: list[dict[str, Any]] = []
+    amp_overflow_diagnostic_path = _ido_amp_overflow_diagnostic_path(checkpoint_path)
+
+    def persist_amp_overflow_event(event: dict[str, Any]) -> None:
+        """Write each Stage-2 AMP event before a retry can fail elsewhere."""
+        amp_overflow_events.append(event)
+        if amp_overflow_diagnostic_path is not None:
+            _write_ido_amp_overflow_diagnostics(amp_overflow_diagnostic_path, amp_overflow_events)
 
     stage2_training_token = (
         profiler.start_stage("ido_stage2_training", phase="stage2_epoch_loop", data_loading_included=True)
@@ -1216,7 +1343,7 @@ def train_ido_lora(
             total=len(stage2_loader),
             desc=f"IDO Stage2 seed={seed} epoch {stage_epoch}/{resolved_stage2_epochs}",
         )
-        for weak_images, strong_images, labels, original_indices in progress:
+        for batch_number, (weak_images, strong_images, labels, original_indices) in enumerate(progress, start=1):
             if profiling_enabled(profiler):
                 assert profiler is not None
                 profiler.record_training_batch()
@@ -1229,11 +1356,11 @@ def train_ido_lora(
             microbatch_count_max = max(microbatch_count_max, microbatch_count)
             index_np = original_indices.detach().cpu().numpy().astype(np.int64)
             label_np = labels.detach().cpu().numpy().astype(np.int64)
-            optimizer.zero_grad(set_to_none=True)
             if not use_microbatch_accumulation:
                 # Preserve the pre-existing full-effective-batch execution path
                 # when microbatching is disabled (or the final batch is already
                 # no larger than the configured physical batch size).
+                optimizer.zero_grad(set_to_none=True)
                 weak_images_device = weak_images.to(device, non_blocking=True)
                 strong_images_device = strong_images.to(device, non_blocking=True)
                 labels_device = labels.to(device, non_blocking=True)
@@ -1291,66 +1418,147 @@ def train_ido_lora(
                 wrong_event[index_np[strong_predicted != label_np]] += 1
                 bmm_terms = bmm.predict(wrong_event[index_np], label_np, stage2_epoch=stage_epoch)
 
-                batch_loss_sum = 0.0
-                batch_ce_sum = 0.0
-                batch_mse_sum = 0.0
-                batch_entropy_sum = 0.0
-                batch_posterior_sum = 0.0
-                try:
-                    for batch_slice, rng_state in zip(micro_slices, rng_states):
-                        _restore_torch_rng_state(torch, device, rng_state)
-                        micro_size = int(batch_slice.stop - batch_slice.start)
-                        weak_micro = weak_images[batch_slice].to(device, non_blocking=True)
-                        strong_micro = strong_images[batch_slice].to(device, non_blocking=True)
-                        labels_micro = labels[batch_slice].to(device, non_blocking=True)
-                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                            weak_logits = model(weak_micro)
-                            strong_logits = model(strong_micro)
-                            loss, parts = official_we_loss(
-                                torch,
-                                strong_logits,
-                                weak_logits,
-                                bmm_terms["prob1"][batch_slice],
-                                bmm_terms["prob2"][batch_slice],
-                                bmm_terms["cdf1"][batch_slice],
-                                bmm_terms["cdf2"][batch_slice],
-                                labels_micro,
-                            )
-                            # WELoss is the sum of three per-sample means.
-                            # Scaling each microbatch by b_m / B reproduces the
-                            # one full-effective-batch mean even for a short
-                            # final microbatch; ``loss / accumulation_steps``
-                            # would not.
-                            scaled_loss = loss * (float(micro_size) / float(batch_size))
-                        scaler.scale(scaled_loss).backward()
-                        batch_loss_sum += float(loss.detach().cpu()) * micro_size
-                        batch_ce_sum += parts["ce_term"] * micro_size
-                        batch_mse_sum += parts["mse_term"] * micro_size
-                        batch_entropy_sum += parts["entropy_term"] * micro_size
-                        batch_posterior_sum += parts["clean_posterior_mean"] * micro_size
-                        del scaled_loss, loss, weak_logits, strong_logits, weak_micro, strong_micro, labels_micro
-                finally:
-                    # The replayed gradient forwards consume the same random
-                    # draws as the no-grad pass.  Restoring the post-prediction
-                    # state makes the rest of the epoch advance exactly once.
-                    _restore_torch_rng_state(torch, device, rng_after_prediction)
-                batch_loss = safe_ratio(batch_loss_sum, batch_size)
-                batch_ce = safe_ratio(batch_ce_sum, batch_size)
-                batch_mse = safe_ratio(batch_mse_sum, batch_size)
-                batch_entropy = safe_ratio(batch_entropy_sum, batch_size)
-                batch_posterior = safe_ratio(batch_posterior_sum, batch_size)
-            _assert_finite_trainable_gradients(torch, model)
+                def backward_microbatches_once(_retry_index: int) -> dict[str, Any]:
+                    batch_loss_sum = 0.0
+                    batch_ce_sum = 0.0
+                    batch_mse_sum = 0.0
+                    batch_entropy_sum = 0.0
+                    batch_posterior_sum = 0.0
+                    try:
+                        for batch_slice, rng_state in zip(micro_slices, rng_states):
+                            _restore_torch_rng_state(torch, device, rng_state)
+                            micro_size = int(batch_slice.stop - batch_slice.start)
+                            weak_micro = weak_images[batch_slice].to(device, non_blocking=True)
+                            strong_micro = strong_images[batch_slice].to(device, non_blocking=True)
+                            labels_micro = labels[batch_slice].to(device, non_blocking=True)
+                            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                                weak_logits = model(weak_micro)
+                                strong_logits = model(strong_micro)
+                                loss, parts = official_we_loss(
+                                    torch,
+                                    strong_logits,
+                                    weak_logits,
+                                    bmm_terms["prob1"][batch_slice],
+                                    bmm_terms["prob2"][batch_slice],
+                                    bmm_terms["cdf1"][batch_slice],
+                                    bmm_terms["cdf2"][batch_slice],
+                                    labels_micro,
+                                )
+                                # WELoss is the sum of three per-sample means.
+                                # Scaling each microbatch by b_m / B reproduces
+                                # the one full-effective-batch mean even for a
+                                # short final microbatch; ``loss / steps`` would
+                                # not.  The same expression is replayed on an
+                                # AMP overflow without another state update.
+                                scaled_loss = loss * (float(micro_size) / float(batch_size))
+                            scaler.scale(scaled_loss).backward()
+                            batch_loss_sum += float(loss.detach().cpu()) * micro_size
+                            batch_ce_sum += parts["ce_term"] * micro_size
+                            batch_mse_sum += parts["mse_term"] * micro_size
+                            batch_entropy_sum += parts["entropy_term"] * micro_size
+                            batch_posterior_sum += parts["clean_posterior_mean"] * micro_size
+                            del scaled_loss, loss, weak_logits, strong_logits, weak_micro, strong_micro, labels_micro
+                    finally:
+                        # Each replay uses the gradient-forward RNG states from
+                        # the original prediction pass.  Afterwards advance the
+                        # global RNG only once, exactly as without a retry.
+                        _restore_torch_rng_state(torch, device, rng_after_prediction)
+                    return {
+                        "batch_loss": safe_ratio(batch_loss_sum, batch_size),
+                        "batch_ce": safe_ratio(batch_ce_sum, batch_size),
+                        "batch_mse": safe_ratio(batch_mse_sum, batch_size),
+                        "batch_entropy": safe_ratio(batch_entropy_sum, batch_size),
+                        "batch_posterior": safe_ratio(batch_posterior_sum, batch_size),
+                        "loss_terms": {
+                            "total": safe_ratio(batch_loss_sum, batch_size),
+                            "ce": safe_ratio(batch_ce_sum, batch_size),
+                            "mse": safe_ratio(batch_mse_sum, batch_size),
+                            "entropy": safe_ratio(batch_entropy_sum, batch_size),
+                        },
+                    }
+
+                def record_overflow(
+                    retry_index: int,
+                    scale_before: float | None,
+                    scale_after: float | None,
+                    failures: list[dict[str, Any]],
+                    payload: dict[str, Any],
+                    terminal: bool,
+                ) -> None:
+                    event = {
+                        "event": "nonfinite_gradient_terminal" if terminal else "nonfinite_gradient_retrying",
+                        "seed": int(seed),
+                        "stage2_epoch": int(stage_epoch),
+                        "effective_batch_number": int(batch_number),
+                        "effective_batch_size": int(batch_size),
+                        "microbatch_size": int(resolved_stage2_microbatch_size or batch_size),
+                        "microbatch_count": int(microbatch_count),
+                        "retry_index": int(retry_index),
+                        "amp_scale_before": scale_before,
+                        "amp_scale_after_backoff": scale_after,
+                        "loss_terms": payload["loss_terms"],
+                        "bmm_output_ranges": _bmm_term_range_summary(bmm_terms),
+                        "nonfinite_gradients": failures,
+                    }
+                    persist_amp_overflow_event(event)
+                    log_stage(
+                        f"[ido] AMP non-finite gradient seed={seed} stage2={stage_epoch} "
+                        f"batch={batch_number} retry={retry_index}/{IDO_AMP_OVERFLOW_RETRY_LIMIT} "
+                        f"status={'fail_closed' if terminal else 'backoff_and_replay'}"
+                    )
+
+                def record_recovery(retry_count: int) -> None:
+                    event = {
+                        "event": "recovery_succeeded",
+                        "seed": int(seed),
+                        "stage2_epoch": int(stage_epoch),
+                        "effective_batch_number": int(batch_number),
+                        "effective_batch_size": int(batch_size),
+                        "microbatch_size": int(resolved_stage2_microbatch_size or batch_size),
+                        "microbatch_count": int(microbatch_count),
+                        "retry_count": int(retry_count),
+                    }
+                    persist_amp_overflow_event(event)
+                    log_stage(
+                        f"[ido] AMP gradient recovery seed={seed} stage2={stage_epoch} "
+                        f"batch={batch_number} retries={retry_count}"
+                    )
+
+                payload, _ = _run_stage2_backward_with_amp_retry(
+                    torch,
+                    model,
+                    optimizer,
+                    scaler,
+                    backward_microbatches_once,
+                    record_overflow,
+                    record_recovery,
+                )
+                batch_loss = float(payload["batch_loss"])
+                batch_ce = float(payload["batch_ce"])
+                batch_mse = float(payload["batch_mse"])
+                batch_entropy = float(payload["batch_entropy"])
+                batch_posterior = float(payload["batch_posterior"])
+            if not use_microbatch_accumulation:
+                _assert_finite_trainable_gradients(torch, model)
             scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             scale_after = float(scaler.get_scale()) if scaler.is_enabled() else None
+            actual_update = (
+                not scaler.is_enabled()
+                or scale_before is None
+                or scale_after is None
+                or scale_after >= scale_before
+            )
+            if actual_update:
+                scheduler.step()
             record_optimizer_and_scheduler_step(
                 profiler,
                 epoch=resolved_stage1_epochs + stage_epoch,
                 amp_enabled=bool(scaler.is_enabled()),
                 scale_before=scale_before,
                 scale_after=scale_after,
+                scheduler_stepped=actual_update,
             )
             loss_sum += batch_loss * batch_size
             ce_sum += batch_ce * batch_size
@@ -1406,6 +1614,13 @@ def train_ido_lora(
                 "stage2_microbatch_count_total": microbatch_count_total,
                 "stage2_microbatch_count_min": microbatch_count_min,
                 "stage2_microbatch_count_max": microbatch_count_max,
+                "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+                "amp_overflow_events_cumulative": int(
+                    sum(event["event"].startswith("nonfinite_gradient") for event in amp_overflow_events)
+                ),
+                "amp_overflow_recovered_batches_cumulative": int(
+                    sum(event["event"] == "recovery_succeeded" for event in amp_overflow_events)
+                ),
             }
         )
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -1532,6 +1747,18 @@ def train_ido_lora(
             "dinov2_pretrained_source": lora_structure_metadata["dinov2_pretrained_source"],
             "runtime_environment": lora_structure_metadata["runtime_environment"],
             "ido_execution_signature": execution_signature,
+            "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+            "amp_overflow_events": int(
+                sum(event["event"].startswith("nonfinite_gradient") for event in amp_overflow_events)
+            ),
+            "amp_overflow_recovered_batches": int(
+                sum(event["event"] == "recovery_succeeded" for event in amp_overflow_events)
+            ),
+            "amp_overflow_diagnostic_path": (
+                str(amp_overflow_diagnostic_path)
+                if amp_overflow_events and amp_overflow_diagnostic_path is not None
+                else ""
+            ),
         }
     )
     if total_training_token is not None:
@@ -1667,14 +1894,22 @@ def _run_stage1(
             scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
             scale_after = float(scaler.get_scale()) if scaler.is_enabled() else None
+            actual_update = (
+                not scaler.is_enabled()
+                or scale_before is None
+                or scale_after is None
+                or scale_after >= scale_before
+            )
+            if actual_update:
+                scheduler.step()
             record_optimizer_and_scheduler_step(
                 profiler,
                 epoch=stage_epoch,
                 amp_enabled=bool(scaler.is_enabled()),
                 scale_before=scale_before,
                 scale_after=scale_after,
+                scheduler_stepped=actual_update,
             )
             batch_size = int(labels.shape[0])
             loss_sum += float(loss.detach().cpu()) * batch_size
@@ -1926,6 +2161,7 @@ def _save_stage1_base_checkpoint(
             "stage2_effective_batch_size": int(stage2_effective_batch_size),
             "stage2_microbatch_size": stage2_microbatch_size,
             "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
+            "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
             "ido_execution_signature": execution_signature,
             "task_contract_sha256": task_contract_sha256,
             "task_id": task_id,
@@ -1981,6 +2217,7 @@ def _save_checkpoints(
         "stage2_effective_batch_size": int(stage2_effective_batch_size),
         "stage2_microbatch_size": stage2_microbatch_size,
         "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
+        "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
         "ido_execution_signature": execution_signature,
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,
