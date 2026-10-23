@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import sys
 import tempfile
@@ -26,6 +27,7 @@ from gcdd.ido_batch import (
     materialize_validation_manifest,
     main_for_protocols,
     preflight,
+    run_logged_subprocess,
     summarize_all,
     validate_ido_trainable_state_dict,
 )
@@ -37,6 +39,27 @@ from scripts.run_lora_checkpoint_validation import load_ido_task_contract
 
 
 class IDOBatchTests(unittest.TestCase):
+    def test_task_subprocess_log_captures_stdout_stderr_and_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "attempt-001" / "logs" / "cub__idn__ido__seed42.log"
+            command = [
+                sys.executable,
+                "-c",
+                "import sys; print('child stdout'); print('child stderr', file=sys.stderr); raise SystemExit(7)",
+            ]
+            with mock.patch("gcdd.ido_batch.sys.stdout", new_callable=io.StringIO) as terminal:
+                return_code = run_logged_subprocess(command, cwd=Path(tmp), log_path=log_path)
+            self.assertEqual(7, return_code)
+            self.assertIn("child stdout", terminal.getvalue())
+            self.assertIn("child stderr", terminal.getvalue())
+            recorded = log_path.read_text(encoding="utf-8")
+            self.assertIn("[batch] COMMAND:", recorded)
+            self.assertIn("child stdout", recorded)
+            self.assertIn("child stderr", recorded)
+            self.assertIn("[batch] RETURN_CODE: 7", recorded)
+            with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+                run_logged_subprocess(command, cwd=Path(tmp), log_path=log_path)
+
     @staticmethod
     def _valid_controlled_state_dict() -> dict[str, torch.Tensor]:
         state: dict[str, torch.Tensor] = {

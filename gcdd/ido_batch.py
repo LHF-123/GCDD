@@ -13,6 +13,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
@@ -142,6 +143,21 @@ class IDOTask:
         # in ``run_root``.
         return self.run_dir / TASK_CONTRACT_FILENAME
 
+    @property
+    def attempt_root(self) -> Path:
+        """Return the immutable attempt directory shared by all its tasks."""
+        return self.run_root.parent.parent
+
+    @property
+    def console_log_path(self) -> Path:
+        """Return the persistent combined stdout/stderr log for this task.
+
+        Logs deliberately live beside, rather than inside, the seed run
+        directory.  The single-run entry point must see that directory as
+        fresh except for its formal task contract.
+        """
+        return self.attempt_root / "logs" / f"{self.task_id}.log"
+
 
 def parse_cli(*, protocols: Sequence[str], description: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
@@ -214,12 +230,75 @@ def main_for_protocols(*, protocols: Sequence[str], description: str) -> None:
         materialize_task_contract(config, task)
         command = build_training_command(config, task)
         print(f"START {task.task_id} ({task.attempt_id})", flush=True)
-        return_code = subprocess.call(command, cwd=ROOT)
+        print(f"TASK LOG {task.task_id}: {task.console_log_path}", flush=True)
+        return_code = run_logged_subprocess(command, cwd=ROOT, log_path=task.console_log_path)
         complete, detail = is_complete(task, config)
         if return_code != 0 or not complete:
-            raise RuntimeError(f"IDO task failed: {task.task_id}; return_code={return_code}; completion={detail}")
+            message = f"IDO task failed: {task.task_id}; return_code={return_code}; completion={detail}"
+            append_task_log(task.console_log_path, f"[batch] FAILURE: {message}")
+            raise RuntimeError(message)
+        append_task_log(task.console_log_path, f"[batch] COMPLETE: {task.task_id} ({task.attempt_id})")
         print(f"END COMPLETE {task.task_id} ({task.attempt_id})", flush=True)
     summarize_all(config, selected)
+
+
+def append_task_log(log_path: Path, message: str) -> None:
+    """Append and durably flush one batch-runner event to a task log."""
+    with log_path.open("a", encoding="utf-8", newline="") as handle:
+        handle.write(f"{message}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def run_logged_subprocess(command: Sequence[str], *, cwd: Path, log_path: Path) -> int:
+    """Run one task while teeing its combined output into a durable log file.
+
+    A task log is created before the training subprocess.  Every completed
+    output line is flushed and synced so a later CUDA/process failure leaves
+    the traceback available outside the raw seed directory.  The raw run
+    directory remains protected by its own fresh-directory checks.
+    """
+    if log_path.exists():
+        raise FileExistsError(f"refusing to overwrite existing IDO task log: {log_path}")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command_record = json.dumps([str(item) for item in command], ensure_ascii=False)
+    with log_path.open("x", encoding="utf-8", newline="") as handle:
+        handle.write(f"[batch] COMMAND: {command_record}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        environment = dict(os.environ)
+        environment["PYTHONUNBUFFERED"] = "1"
+        try:
+            with subprocess.Popen(
+                list(command),
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=environment,
+            ) as process:
+                if process.stdout is None:  # pragma: no cover - guaranteed by stdout=PIPE
+                    raise RuntimeError("failed to capture IDO task stdout")
+                with process.stdout:
+                    for line in process.stdout:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        handle.write(line)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                return_code = process.wait()
+        except BaseException as exc:
+            handle.write(f"[batch] LAUNCH_EXCEPTION: {type(exc).__name__}: {exc}\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            raise
+        handle.write(f"[batch] RETURN_CODE: {return_code}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return return_code
 
 
 def load_config(path: Path) -> IDOBatchConfig:
