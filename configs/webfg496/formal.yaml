@@ -1,0 +1,81 @@
+schema_version: 1
+experiment_id: webfg496_pgdf_major_revision
+output_root: outputs_major_revision/webfg496
+
+data:
+  # AutoDL default. Override only at invocation time for local inspection:
+  # --data-root 'E:\\下载\\dataset\\webfg496'
+  root: /root/autodl-tmp
+  expected_classes:
+    web-bird: 200
+    web-car: 196
+    web-aircraft: 100
+  train_split: train
+  evaluation_split: val
+  training_label_source: official_train_list_observed_web_labels
+  evaluation_label_source: official_val_list_labels
+
+protocol:
+  epoch_selection_rule: fixed_last_epoch
+  final_epoch: 30
+  final_evaluation_rule: epoch_30_official_val_top1
+  use_clean_validation: false
+  use_oracle_clean_noisy_identity: false
+  synthetic_noise_injection: false
+  official_reference: https://github.com/NUST-Machine-Intelligence-Laboratory/weblyFG-dataset
+
+model:
+  backbone: dinov2_vitb14
+  feature_input_size: 448
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.05
+  lora_target_modules: qkv
+
+training:
+  epochs: 30
+  batch_size: 48
+  eval_batch_size: 96
+  num_workers: 4
+  pin_memory: true
+  lora_lr: 1.0e-4
+  head_lr: 1.0e-3
+  weight_decay: 0.05
+  scheduler: cosine
+  warmup_ratio: 0.1
+  amp: true
+  seeds: [1, 42, 88]
+
+methods:
+  pgdf_dynamic_proto:
+    display_name: PGDF DynamicProto
+    selection_ratio: 0.8
+    prototype_keep_ratio: 0.4
+    warmup_epochs: 5
+    selection_interval: 5
+    selection_strategy: loss_and_proto
+    prototype_mode: dynamic_lora
+  all_noisy_ce:
+    display_name: All-noisy CE
+    loss_type: ce
+  jal_ce:
+    display_name: JAL-CE
+    loss_type: jal_ce
+    jal_alpha: 1.0
+    jal_beta: 1.0
+    jal_a: 30.0
+    jal_eps: 1.0e-8
+  coteaching:
+    display_name: Co-teaching
+    remember_mode: fixed
+    remember_rate: 0.8
+    final_remember_rate: 0.8
+    warmup_epochs: 5
+    grad_accum_steps: 1
+    primary_report_rule: epoch_30_arithmetic_mean_of_branch_a_and_branch_b_top1
+
+hardware:
+  device: cuda
+  gpu_index: 0
+  require_exclusive_gpu: true
+  profiling_mode: detailed
