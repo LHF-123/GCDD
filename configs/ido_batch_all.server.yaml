@@ -1,7 +1,7 @@
 # IDO controlled-adaptation 9+18 matrix.  Paths are relative to this file, so
 # the same YAML layout works on Windows and Linux after a server-specific copy
-# replaces only root/path-map values.  It is intentionally not execution-ready
-# until an authorized maintainer sets protocol.protocol_frozen: true.
+# replaces only root/path-map values.  This reviewed formal matrix freezes the
+# global-BMM, effective-batch-80/microbatch-20 execution contract below.
 schema_version: 1
 
 runtime:
@@ -12,14 +12,15 @@ output:
   instrumentation_root: /root/GCDD-ido/outputs_major_revision/ido_controlled_batch_instrumentation
 
 protocol:
-  protocol_frozen: false
-  approval_note: "10+20 candidate only; WELoss broadcast correction and BMM fail-closed policy require external review."
+  protocol_frozen: true
+  approval_note: "Formal 27-run contract: global BMM, Stage 1=10, Stage 2=20, effective batch=80, microbatch=20, bounded AMP replay=4."
 
 formal:
   epochs: 30
   stage1_epochs: 10
+  stage2_microbatch_size: 20
   validation_seed: 20250726
-  bmm_mode: classwise
+  bmm_mode: global
   # IDO-only numerical execution guard: same effective batch replayed at
   # successively lower GradScaler scales; it does not skip data or alter loss.
   amp_overflow_retry_limit: 4
