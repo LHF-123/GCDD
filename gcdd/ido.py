@@ -13,12 +13,16 @@ rather than silently changing the objective.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
+import csv
 import json
 import os
 import platform
 from pathlib import Path
+import random
 import sys
+from time import perf_counter
 from typing import Any, Callable
 
 import numpy as np
@@ -62,8 +66,22 @@ IDO_GLOBAL_BMM_SCOPE = "all_observed_training_pool"
 IDO_DEGENERATE_POLICY = "fail_closed_record_and_abort"
 IDO_WAVE_SNAPSHOT_POLICY = "deep_clone_trainable_state"
 IDO_WELoss_SOURCE = "official_repository_WELoss_logits_mse_with_per_sample_entropy_broadcast_fix"
-IDO_AMP_OVERFLOW_RETRY_LIMIT = 1
-IDO_AMP_OVERFLOW_POLICY = "stage2_retry_same_effective_batch_once_after_gradscaler_backoff_then_fail_closed"
+# This is an execution-stability guard, not an IDO optimization hyperparameter:
+# every retry replays the same effective batch with the same inputs, BMM terms,
+# random states, and pre-update model state. Four backoffs yield at most five
+# backwards (for example 65536 -> 32768 -> 16384 -> 8192 -> 4096).
+IDO_AMP_OVERFLOW_RETRY_LIMIT = 4
+IDO_AMP_OVERFLOW_POLICY = "stage2_replay_same_effective_batch_with_up_to_four_gradscaler_backoffs_then_fail_closed"
+IDO_AMP_RETRY_EVENT_FIELDS = (
+    "event", "seed", "stage2_epoch", "effective_batch_number",
+    "effective_batch_size", "microbatch_size", "microbatch_count",
+    "retry_index", "retry_count", "amp_scale_initial", "amp_scale_before",
+    "amp_scale_after_backoff", "amp_scale_success", "amp_scale_min",
+    "amp_scale_min_so_far", "attempt_wall_seconds", "successful_attempt_wall_seconds",
+    "amp_retry_wall_seconds", "amp_retry_wall_seconds_so_far", "loss_terms",
+    "bmm_output_ranges", "replay_capsule_path", "stable_training_indices",
+    "nonfinite_gradients",
+)
 
 
 def resolve_ido_bmm_mode(mode: str | None) -> str:
@@ -77,6 +95,26 @@ def resolve_ido_bmm_mode(mode: str | None) -> str:
     resolved = IDO_BMM_MODE_CLASSWISE if mode in (None, "") else str(mode).strip().lower()
     if resolved not in IDO_BMM_MODES:
         raise ValueError(f"ido_bmm_mode must be one of {IDO_BMM_MODES}, got {mode!r}.")
+    return resolved
+
+
+def resolve_ido_amp_overflow_retry_limit(limit: int | None) -> int:
+    """Resolve the bounded IDO-only AMP replay count.
+
+    The upper bound prevents a pathological effective batch from silently
+    consuming unbounded wall time. A value of four means at most four extra
+    full-batch replays after the initial attempt.
+    """
+    if limit is None:
+        return IDO_AMP_OVERFLOW_RETRY_LIMIT
+    if isinstance(limit, bool):
+        raise ValueError("ido_amp_overflow_retry_limit must be an integer from 0 through 4.")
+    try:
+        resolved = int(limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ido_amp_overflow_retry_limit must be an integer from 0 through 4.") from exc
+    if not 0 <= resolved <= IDO_AMP_OVERFLOW_RETRY_LIMIT:
+        raise ValueError("ido_amp_overflow_retry_limit must be an integer from 0 through 4.")
     return resolved
 
 
@@ -133,7 +171,11 @@ def _capture_torch_rng_state(torch: Any, device: str) -> dict[str, Any]:
     preserves the intended stochastic LoRA-dropout realization rather than
     deriving reliability terms from a different forward pass.
     """
-    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    state: dict[str, Any] = {
+        "cpu": torch.get_rng_state(),
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
     if str(device).startswith("cuda") and torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state(device)
     return state
@@ -142,6 +184,8 @@ def _capture_torch_rng_state(torch: Any, device: str) -> dict[str, Any]:
 def _restore_torch_rng_state(torch: Any, device: str, state: dict[str, Any]) -> None:
     """Restore a state created by :func:`_capture_torch_rng_state`."""
     torch.set_rng_state(state["cpu"])
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
     if "cuda" in state:
         torch.cuda.set_rng_state(state["cuda"], device)
 
@@ -153,6 +197,7 @@ class IDOLoraRunResult:
     logs: list[dict[str, Any]]
     summary: dict[str, Any]
     bmm_fit_rows: list[dict[str, Any]]
+    amp_overflow_events: list[dict[str, Any]]
     stage1_wrong_event: np.ndarray
     wrong_event: np.ndarray
     trainable_modules: list[str]
@@ -837,6 +882,30 @@ def _assert_finite_trainable_gradients(torch: Any, model: Any) -> None:
         raise FloatingPointError(f"IDO non-finite gradient for trainable parameter {records[0]['parameter']!r}.")
 
 
+def _snapshot_model_buffers(model: Any) -> dict[str, Any]:
+    """Clone mutable buffers so an AMP replay cannot compound buffer updates.
+
+    Optimizer parameters, optimizer state, scheduler state, wrong-event state,
+    and BMM state are not changed before the finite-gradient decision. Buffers
+    are the remaining model state that a forward can mutate (for example a
+    BatchNorm running statistic in a future backbone), so they are explicitly
+    restored before every full-effective-batch replay.
+    """
+    return {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+
+
+def _restore_model_buffers(model: Any, snapshot: dict[str, Any]) -> None:
+    """Restore a buffer snapshot and fail closed if model structure changed."""
+    current = dict(model.named_buffers())
+    if set(current) != set(snapshot):
+        raise RuntimeError("IDO model buffers changed during an AMP replayable effective batch.")
+    for name, saved in snapshot.items():
+        buffer = current[name]
+        if tuple(buffer.shape) != tuple(saved.shape) or buffer.dtype != saved.dtype:
+            raise RuntimeError(f"IDO buffer {name!r} changed shape or dtype during an AMP replayable effective batch.")
+        buffer.copy_(saved.to(device=buffer.device))
+
+
 def _ido_amp_overflow_diagnostic_path(checkpoint_path: Path | None) -> Path | None:
     """Locate a seed-run diagnostic file without assuming a formal output path."""
     if checkpoint_path is None:
@@ -844,6 +913,12 @@ def _ido_amp_overflow_diagnostic_path(checkpoint_path: Path | None) -> Path | No
     parent = checkpoint_path.parent
     run_dir = parent.parent if parent.name == "checkpoints" else parent
     return run_dir / "amp_overflow_diagnostics.json"
+
+
+def _ido_amp_replay_capsule_path(checkpoint_path: Path | None) -> Path | None:
+    """Locate the one terminal-failure capsule for a seed run."""
+    diagnostic_path = _ido_amp_overflow_diagnostic_path(checkpoint_path)
+    return None if diagnostic_path is None else diagnostic_path.with_name("amp_retry_replay_capsule.pt")
 
 
 def _write_ido_amp_overflow_diagnostics(path: Path, events: list[dict[str, Any]]) -> None:
@@ -858,6 +933,22 @@ def _write_ido_amp_overflow_diagnostics(path: Path, events: list[dict[str, Any]]
     with path.open("w", encoding="utf-8", newline="") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    csv_path = path.with_name("amp_retry_events.csv")
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(IDO_AMP_RETRY_EVENT_FIELDS))
+        writer.writeheader()
+        for event in events:
+            row = {
+                field: (
+                    json.dumps(event[field], ensure_ascii=False, sort_keys=True)
+                    if isinstance(event.get(field), (dict, list))
+                    else event.get(field, "")
+                )
+                for field in IDO_AMP_RETRY_EVENT_FIELDS
+            }
+            writer.writerow(row)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -883,42 +974,112 @@ def _run_stage2_backward_with_amp_retry(
     optimizer: Any,
     scaler: Any,
     backward_once: Callable[[int], dict[str, Any]],
-    on_overflow: Callable[[int, float | None, float | None, list[dict[str, Any]], dict[str, Any], bool], None],
-    on_recovered: Callable[[int], None],
-) -> tuple[dict[str, Any], int]:
-    """Backpropagate one Stage-2 effective batch with one AMP-scale retry.
+    on_overflow: Callable[[int, float | None, float | None, list[dict[str, Any]], dict[str, Any], bool, dict[str, Any]], None],
+    on_recovered: Callable[[dict[str, Any]], None],
+    *,
+    retry_limit: int = IDO_AMP_OVERFLOW_RETRY_LIMIT,
+    restore_retry_state: Callable[[], None] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Replay one Stage-2 effective batch after bounded AMP scale backoff.
 
-    ``backward_once`` must replay the exact same effective batch and must not
-    mutate wrong-event or BMM state.  On a scaled-gradient overflow, this
-    routine clears the bad gradients, lets ``GradScaler`` apply its configured
-    backoff, and replays the batch once.  A second non-finite gradient remains
-    fail-closed.  No optimizer or scheduler step occurs before a finite retry.
+    ``backward_once`` must use cached effective-batch tensors and immutable
+    BMM targets; it must not update wrong-event/BMM state.  The callback
+    restores buffers/RNG before each attempt. ``GradScaler.update`` is called
+    only after one public ``unscale_`` for a failed attempt, which resets that
+    optimizer's scaler state before the next retry. No private scaler fields
+    are accessed.
     """
+    retry_limit = resolve_ido_amp_overflow_retry_limit(retry_limit)
     retry_count = 0
+    initial_scale = float(scaler.get_scale()) if scaler.is_enabled() else None
+    minimum_scale = initial_scale
+    retry_wall_seconds = 0.0
+    overflow_event_count = 0
     while True:
+        if restore_retry_state is not None:
+            restore_retry_state()
         optimizer.zero_grad(set_to_none=True)
+        attempt_started = perf_counter()
         payload = backward_once(retry_count)
+        attempt_wall_seconds = perf_counter() - attempt_started
+        if retry_count:
+            retry_wall_seconds += attempt_wall_seconds
         scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
+        if scale_before is not None:
+            minimum_scale = scale_before if minimum_scale is None else min(minimum_scale, scale_before)
         if scaler.is_enabled():
-            # The prior implementation inspected scaled gradients before the
-            # scaler could identify an overflow.  Unscale exactly once before
-            # inspection so ``scaler.update`` has the required found-inf state.
+            # Exactly one unscale call per GradScaler/optimizer attempt. A
+            # following update resets the documented per-optimizer scaler
+            # state before the next replay.
             scaler.unscale_(optimizer)
         failures = _nonfinite_trainable_gradient_records(torch, model)
         if not failures:
+            retry_metadata = {
+                "retry_count": int(retry_count),
+                "overflow_event_count": int(overflow_event_count),
+                "amp_scale_initial": initial_scale,
+                "amp_scale_success": scale_before,
+                "amp_scale_min": minimum_scale,
+                "amp_retry_wall_seconds": float(retry_wall_seconds),
+                "successful_attempt_wall_seconds": float(attempt_wall_seconds),
+            }
             if retry_count:
-                on_recovered(retry_count)
-            return payload, retry_count
+                on_recovered(retry_metadata)
+            return payload, retry_metadata
 
-        terminal = (not scaler.is_enabled()) or retry_count >= IDO_AMP_OVERFLOW_RETRY_LIMIT
+        overflow_event_count += 1
+        terminal = (not scaler.is_enabled()) or retry_count >= retry_limit
         scale_after = None
         if not terminal:
             scaler.update()
             scale_after = float(scaler.get_scale())
-        on_overflow(retry_count, scale_before, scale_after, failures, payload, terminal)
+            minimum_scale = scale_after if minimum_scale is None else min(minimum_scale, scale_after)
+        # Drop all failed gradients before diagnostics/callbacks and before a
+        # possible replay. The callback already holds compact copied records.
+        optimizer.zero_grad(set_to_none=True)
+        retry_metadata = {
+            "retry_count": int(retry_count),
+            "overflow_event_count": int(overflow_event_count),
+            "amp_scale_initial": initial_scale,
+            "amp_scale_min": minimum_scale,
+            "amp_retry_wall_seconds": float(retry_wall_seconds),
+            "attempt_wall_seconds": float(attempt_wall_seconds),
+        }
+        on_overflow(retry_count, scale_before, scale_after, failures, payload, terminal, retry_metadata)
         if terminal:
+            # No parameter update has run, but a forward may mutate buffers
+            # and consume RNG. Restore those states before preserving the
+            # fail-closed exception so post-mortem state is unambiguous.
+            if restore_retry_state is not None:
+                restore_retry_state()
             raise FloatingPointError(f"IDO non-finite gradient for trainable parameter {failures[0]['parameter']!r}.")
         retry_count += 1
+
+
+def _scaler_step_with_observed_optimizer_update(scaler: Any, optimizer: Any) -> bool:
+    """Call ``GradScaler.step`` and observe whether it invoked this optimizer.
+
+    Optimizer ``step`` methods commonly return ``None``, so their return value
+    cannot establish whether GradScaler skipped an update. This short-lived
+    instance-level wrapper observes the public call without modifying a shared
+    optimizer class or any non-IDO code path.
+    """
+    original_step = optimizer.step
+    call_count = 0
+
+    def observed_step(*args: Any, **kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        return original_step(*args, **kwargs)
+
+    optimizer.step = observed_step
+    try:
+        scaler.step(optimizer)
+    finally:
+        optimizer.step = original_step
+    if call_count > 1:
+        raise RuntimeError("IDO GradScaler invoked optimizer.step more than once for one effective batch.")
+    return call_count == 1
 
 
 def _ido_d1_summary(
@@ -942,6 +1103,7 @@ def _ido_d1_summary(
             "d1_total_wall_seconds": "",
             "d1_optimizer_steps_attempted": "",
             "d1_optimizer_steps_actual": "",
+            "d1_scheduler_steps_actual": "",
             "d1_peak_cuda_allocated_bytes": "",
             "d1_peak_cuda_reserved_bytes": "",
             "d1_validation_seconds": "",
@@ -975,6 +1137,7 @@ def _ido_d1_summary(
         "d1_total_wall_seconds": duration("total_training"),
         "d1_optimizer_steps_attempted": int(payload["optimizer_steps_attempted"]),
         "d1_optimizer_steps_actual": int(payload["optimizer_steps_actual"]),
+        "d1_scheduler_steps_actual": int(payload["scheduler_steps_actual"]),
         "d1_peak_cuda_allocated_bytes": overall_memory["allocated_bytes"],
         "d1_peak_cuda_reserved_bytes": overall_memory["reserved_bytes"],
         "d1_validation_seconds": duration("validation"),
@@ -1112,6 +1275,7 @@ def train_ido_lora(
     stage1_epochs: int | None = None,
     bmm_mode: str | None = None,
     stage2_microbatch_size: int | None = None,
+    amp_overflow_retry_limit: int | None = None,
     path_maps: list[tuple[str, str]] | None = None,
     checkpoint_path: Path | None = None,
     test_paths: list[str] | None = None,
@@ -1149,6 +1313,7 @@ def train_ido_lora(
     feature_cfg = cfg["feature"]
     train_cfg = cfg["lora_train"]
     resolved_stage2_microbatch_size = resolve_stage2_microbatch_size(stage2_microbatch_size)
+    resolved_amp_overflow_retry_limit = resolve_ido_amp_overflow_retry_limit(amp_overflow_retry_limit)
     stage2_effective_batch_size = int(train_cfg["batch_size"])
     if stage2_effective_batch_size <= 0:
         raise ValueError("lora_train.batch_size must be positive for IDO Stage 2.")
@@ -1223,7 +1388,8 @@ def train_ido_lora(
         f"[ido] seed={seed}: Stage 1={resolved_stage1_epochs}, Stage 2={resolved_stage2_epochs}, "
         f"BMM={bmm_scope}, train_images={len(train_idx)}, trainable_params={trainable_params}, "
         f"stage2_effective_batch={stage2_effective_batch_size}, "
-        f"stage2_microbatch={resolved_stage2_microbatch_size if resolved_stage2_microbatch_size is not None else 'disabled'}"
+        f"stage2_microbatch={resolved_stage2_microbatch_size if resolved_stage2_microbatch_size is not None else 'disabled'}, "
+        f"amp_retry_limit={resolved_amp_overflow_retry_limit}"
     )
     base_state, base_stage_epoch = _run_stage1(
         torch=torch,
@@ -1274,6 +1440,7 @@ def train_ido_lora(
             stage2_effective_batch_size=stage2_effective_batch_size,
             stage2_microbatch_size=resolved_stage2_microbatch_size,
             stage2_gradient_accumulation_enabled=stage2_gradient_accumulation_enabled,
+            amp_overflow_retry_limit=resolved_amp_overflow_retry_limit,
             execution_signature=execution_signature,
         )
     if stage1_checkpoint_token is not None:
@@ -1300,7 +1467,14 @@ def train_ido_lora(
     last5_states: list[tuple[int, dict[str, Any]]] = []
     oracle_states: list[tuple[int, dict[str, Any]]] = []
     amp_overflow_events: list[dict[str, Any]] = []
+    amp_retry_attempts = 0
+    amp_retry_successes = 0
+    amp_retry_wall_seconds = 0.0
+    amp_scale_initial_values: list[float] = []
+    amp_scale_success_values: list[float] = []
+    amp_scale_min_values: list[float] = []
     amp_overflow_diagnostic_path = _ido_amp_overflow_diagnostic_path(checkpoint_path)
+    amp_replay_capsule_path = _ido_amp_replay_capsule_path(checkpoint_path)
 
     def persist_amp_overflow_event(event: dict[str, Any]) -> None:
         """Write each Stage-2 AMP event before a retry can fail elsewhere."""
@@ -1417,6 +1591,15 @@ def train_ido_lora(
                 wrong_event[index_np[weak_predicted != label_np]] += 1
                 wrong_event[index_np[strong_predicted != label_np]] += 1
                 bmm_terms = bmm.predict(wrong_event[index_np], label_np, stage2_epoch=stage_epoch)
+                # The DataLoader already materialized the weak/strong views on
+                # CPU. Keep those tensors and all BMM terms fixed throughout
+                # every retry. Snapshot buffers after the required prediction
+                # prepass, then restore them before every gradient replay.
+                replay_buffer_state = _snapshot_model_buffers(model)
+                replay_model_state = snapshot_trainable_state(model)
+                replay_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                replay_scheduler_state = copy.deepcopy(scheduler.state_dict())
+                replay_scaler_state = copy.deepcopy(scaler.state_dict()) if scaler.is_enabled() else {}
 
                 def backward_microbatches_once(_retry_index: int) -> dict[str, Any]:
                     batch_loss_sum = 0.0
@@ -1477,6 +1660,62 @@ def train_ido_lora(
                         },
                     }
 
+                def restore_replay_state() -> None:
+                    _restore_model_buffers(model, replay_buffer_state)
+                    _restore_torch_rng_state(torch, device, rng_after_prediction)
+
+                def save_terminal_replay_capsule(
+                    *,
+                    retry_index: int,
+                    scale_before: float | None,
+                    failures: list[dict[str, Any]],
+                ) -> str:
+                    """Persist one exact live-batch replay capsule after terminal failure.
+
+                    The raw augmented CPU tensors are intentionally included
+                    only for an unrecovered terminal event. Successful retries
+                    do not emit this potentially large artifact. No clean-label
+                    or clean/noisy oracle information is stored.
+                    """
+                    if amp_replay_capsule_path is None:
+                        return ""
+                    amp_replay_capsule_path.parent.mkdir(parents=True, exist_ok=True)
+                    payload = {
+                        "schema_version": 1,
+                        "replay_status": "captured_live_terminal_effective_batch",
+                        "seed": int(seed),
+                        "stage2_epoch": int(stage_epoch),
+                        "effective_batch_number": int(batch_number),
+                        "retry_index": int(retry_index),
+                        "effective_batch_size": int(batch_size),
+                        "microbatch_size": int(resolved_stage2_microbatch_size or batch_size),
+                        "microbatch_slices": [(int(item.start), int(item.stop)) for item in micro_slices],
+                        "stable_training_indices": index_np.copy(),
+                        "observed_label_ids": label_np.copy(),
+                        "weak_images": weak_images.detach().cpu(),
+                        "strong_images": strong_images.detach().cpu(),
+                        "bmm_terms": {
+                            name: np.asarray(value).copy() if isinstance(value, np.ndarray) else value
+                            for name, value in bmm_terms.items()
+                        },
+                        "wrong_event_after_effective_batch_prediction": wrong_event.copy(),
+                        "trainable_model_state_before_effective_batch": replay_model_state,
+                        "model_buffers_before_effective_batch": replay_buffer_state,
+                        "optimizer_state_before_effective_batch": replay_optimizer_state,
+                        "scheduler_state_before_effective_batch": replay_scheduler_state,
+                        "gradscaler_state_before_effective_batch": replay_scaler_state,
+                        "rng_state_after_prediction_prepass": rng_after_prediction,
+                        "amp_scale_before_terminal_attempt": scale_before,
+                        "nonfinite_gradients": failures,
+                        "bmm_mode": resolved_bmm_mode,
+                        "bmm_scope": bmm_scope,
+                        "weloss_source": IDO_WELoss_SOURCE,
+                    }
+                    temporary_path = amp_replay_capsule_path.with_name(amp_replay_capsule_path.name + ".tmp")
+                    torch.save(payload, temporary_path)
+                    os.replace(temporary_path, amp_replay_capsule_path)
+                    return str(amp_replay_capsule_path)
+
                 def record_overflow(
                     retry_index: int,
                     scale_before: float | None,
@@ -1484,7 +1723,17 @@ def train_ido_lora(
                     failures: list[dict[str, Any]],
                     payload: dict[str, Any],
                     terminal: bool,
+                    retry_metadata: dict[str, Any],
                 ) -> None:
+                    replay_capsule = (
+                        save_terminal_replay_capsule(
+                            retry_index=retry_index,
+                            scale_before=scale_before,
+                            failures=failures,
+                        )
+                        if terminal
+                        else ""
+                    )
                     event = {
                         "event": "nonfinite_gradient_terminal" if terminal else "nonfinite_gradient_retrying",
                         "seed": int(seed),
@@ -1496,6 +1745,14 @@ def train_ido_lora(
                         "retry_index": int(retry_index),
                         "amp_scale_before": scale_before,
                         "amp_scale_after_backoff": scale_after,
+                        "amp_scale_initial": retry_metadata["amp_scale_initial"],
+                        "amp_scale_min": retry_metadata["amp_scale_min"],
+                        "amp_scale_min_so_far": retry_metadata["amp_scale_min"],
+                        "retry_count": int(retry_index),
+                        "attempt_wall_seconds": retry_metadata["attempt_wall_seconds"],
+                        "amp_retry_wall_seconds_so_far": retry_metadata["amp_retry_wall_seconds"],
+                        "replay_capsule_path": replay_capsule,
+                        "stable_training_indices": index_np.astype(np.int64).tolist(),
                         "loss_terms": payload["loss_terms"],
                         "bmm_output_ranges": _bmm_term_range_summary(bmm_terms),
                         "nonfinite_gradients": failures,
@@ -1503,11 +1760,11 @@ def train_ido_lora(
                     persist_amp_overflow_event(event)
                     log_stage(
                         f"[ido] AMP non-finite gradient seed={seed} stage2={stage_epoch} "
-                        f"batch={batch_number} retry={retry_index}/{IDO_AMP_OVERFLOW_RETRY_LIMIT} "
+                        f"batch={batch_number} retry={retry_index}/{resolved_amp_overflow_retry_limit} "
                         f"status={'fail_closed' if terminal else 'backoff_and_replay'}"
                     )
 
-                def record_recovery(retry_count: int) -> None:
+                def record_recovery(retry_metadata: dict[str, Any]) -> None:
                     event = {
                         "event": "recovery_succeeded",
                         "seed": int(seed),
@@ -1516,15 +1773,21 @@ def train_ido_lora(
                         "effective_batch_size": int(batch_size),
                         "microbatch_size": int(resolved_stage2_microbatch_size or batch_size),
                         "microbatch_count": int(microbatch_count),
-                        "retry_count": int(retry_count),
+                        "retry_count": int(retry_metadata["retry_count"]),
+                        "amp_scale_initial": retry_metadata["amp_scale_initial"],
+                        "amp_scale_success": retry_metadata["amp_scale_success"],
+                        "amp_scale_min": retry_metadata["amp_scale_min"],
+                        "amp_retry_wall_seconds": retry_metadata["amp_retry_wall_seconds"],
+                        "successful_attempt_wall_seconds": retry_metadata["successful_attempt_wall_seconds"],
                     }
                     persist_amp_overflow_event(event)
                     log_stage(
                         f"[ido] AMP gradient recovery seed={seed} stage2={stage_epoch} "
-                        f"batch={batch_number} retries={retry_count}"
+                        f"batch={batch_number} retries={retry_metadata['retry_count']} "
+                        f"scale={retry_metadata['amp_scale_success']}"
                     )
 
-                payload, _ = _run_stage2_backward_with_amp_retry(
+                payload, retry_metadata = _run_stage2_backward_with_amp_retry(
                     torch,
                     model,
                     optimizer,
@@ -1532,7 +1795,20 @@ def train_ido_lora(
                     backward_microbatches_once,
                     record_overflow,
                     record_recovery,
+                    retry_limit=resolved_amp_overflow_retry_limit,
+                    restore_retry_state=restore_replay_state,
                 )
+                amp_retry_attempts += int(retry_metadata["retry_count"])
+                amp_retry_successes += int(int(retry_metadata["retry_count"]) > 0)
+                amp_retry_wall_seconds += float(retry_metadata["amp_retry_wall_seconds"])
+                for key, values in (
+                    ("amp_scale_initial", amp_scale_initial_values),
+                    ("amp_scale_success", amp_scale_success_values),
+                    ("amp_scale_min", amp_scale_min_values),
+                ):
+                    value = retry_metadata[key]
+                    if value is not None:
+                        values.append(float(value))
                 batch_loss = float(payload["batch_loss"])
                 batch_ce = float(payload["batch_ce"])
                 batch_mse = float(payload["batch_mse"])
@@ -1541,15 +1817,14 @@ def train_ido_lora(
             if not use_microbatch_accumulation:
                 _assert_finite_trainable_gradients(torch, model)
             scale_before = float(scaler.get_scale()) if scaler.is_enabled() else None
-            scaler.step(optimizer)
+            actual_update = _scaler_step_with_observed_optimizer_update(scaler, optimizer)
             scaler.update()
             scale_after = float(scaler.get_scale()) if scaler.is_enabled() else None
-            actual_update = (
-                not scaler.is_enabled()
-                or scale_before is None
-                or scale_after is None
-                or scale_after >= scale_before
-            )
+            if not actual_update:
+                raise FloatingPointError(
+                    "IDO GradScaler skipped an optimizer update after finite-gradient verification; "
+                    "the effective batch remains fail-closed."
+                )
             if actual_update:
                 scheduler.step()
             record_optimizer_and_scheduler_step(
@@ -1615,12 +1890,22 @@ def train_ido_lora(
                 "stage2_microbatch_count_min": microbatch_count_min,
                 "stage2_microbatch_count_max": microbatch_count_max,
                 "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+                "amp_overflow_retry_limit": int(resolved_amp_overflow_retry_limit),
                 "amp_overflow_events_cumulative": int(
-                    sum(event["event"].startswith("nonfinite_gradient") for event in amp_overflow_events)
+                    len(
+                        {
+                            (int(event["stage2_epoch"]), int(event["effective_batch_number"]))
+                            for event in amp_overflow_events
+                            if event["event"].startswith("nonfinite_gradient")
+                        }
+                    )
                 ),
                 "amp_overflow_recovered_batches_cumulative": int(
                     sum(event["event"] == "recovery_succeeded" for event in amp_overflow_events)
                 ),
+                "amp_retry_attempts_cumulative": int(amp_retry_attempts),
+                "amp_retry_successes_cumulative": int(amp_retry_successes),
+                "amp_retry_wall_seconds_cumulative": float(amp_retry_wall_seconds),
             }
         )
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -1720,6 +2005,7 @@ def train_ido_lora(
         stage2_effective_batch_size=stage2_effective_batch_size,
         stage2_microbatch_size=resolved_stage2_microbatch_size,
         stage2_gradient_accumulation_enabled=stage2_gradient_accumulation_enabled,
+        amp_overflow_retry_limit=resolved_amp_overflow_retry_limit,
         execution_signature=execution_signature,
     )
     if checkpoint_save_token is not None:
@@ -1748,12 +2034,32 @@ def train_ido_lora(
             "runtime_environment": lora_structure_metadata["runtime_environment"],
             "ido_execution_signature": execution_signature,
             "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+            "amp_overflow_retry_limit": int(resolved_amp_overflow_retry_limit),
             "amp_overflow_events": int(
-                sum(event["event"].startswith("nonfinite_gradient") for event in amp_overflow_events)
+                len(
+                    {
+                        (int(event["stage2_epoch"]), int(event["effective_batch_number"]))
+                        for event in amp_overflow_events
+                        if event["event"].startswith("nonfinite_gradient")
+                    }
+                )
             ),
             "amp_overflow_recovered_batches": int(
                 sum(event["event"] == "recovery_succeeded" for event in amp_overflow_events)
             ),
+            "amp_retry_attempts": int(amp_retry_attempts),
+            "amp_retry_successes": int(amp_retry_successes),
+            "amp_retry_wall_seconds": float(amp_retry_wall_seconds),
+            "amp_scale_initial": (
+                float(amp_scale_initial_values[0]) if amp_scale_initial_values else ""
+            ),
+            "amp_scale_success": (
+                float(amp_scale_success_values[-1]) if amp_scale_success_values else ""
+            ),
+            "amp_scale_min": float(min(amp_scale_min_values)) if amp_scale_min_values else "",
+            "successful_optimizer_steps": "",
+            "successful_scheduler_steps": "",
+            "unrecovered_amp_failures": 0,
             "amp_overflow_diagnostic_path": (
                 str(amp_overflow_diagnostic_path)
                 if amp_overflow_events and amp_overflow_diagnostic_path is not None
@@ -1763,8 +2069,7 @@ def train_ido_lora(
     )
     if total_training_token is not None:
         profiler.stop_stage(total_training_token)
-    summary.update(
-        _ido_d1_summary(
+    d1_summary = _ido_d1_summary(
             profiler,
             stage1_processed_samples=len(train_idx) * resolved_stage1_epochs,
             stage2_processed_samples=len(train_idx) * resolved_stage2_epochs,
@@ -1774,11 +2079,14 @@ def train_ido_lora(
                 else 0
             ),
         )
-    )
+    summary.update(d1_summary)
+    summary["successful_optimizer_steps"] = d1_summary["d1_optimizer_steps_actual"]
+    summary["successful_scheduler_steps"] = d1_summary["d1_scheduler_steps_actual"]
     return IDOLoraRunResult(
         logs=logs,
         summary=summary,
         bmm_fit_rows=bmm_fit_rows,
+        amp_overflow_events=amp_overflow_events,
         stage1_wrong_event=stage1_wrong_event,
         wrong_event=wrong_event,
         trainable_modules=trainable_modules,
@@ -2131,6 +2439,7 @@ def _save_stage1_base_checkpoint(
     stage2_effective_batch_size: int,
     stage2_microbatch_size: int | None,
     stage2_gradient_accumulation_enabled: bool,
+    amp_overflow_retry_limit: int,
     execution_signature: str,
 ) -> None:
     """Persist the selected Stage-1 boundary for audit, not in-place resume.
@@ -2162,6 +2471,7 @@ def _save_stage1_base_checkpoint(
             "stage2_microbatch_size": stage2_microbatch_size,
             "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
             "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+            "amp_overflow_retry_limit": int(amp_overflow_retry_limit),
             "ido_execution_signature": execution_signature,
             "task_contract_sha256": task_contract_sha256,
             "task_id": task_id,
@@ -2200,6 +2510,7 @@ def _save_checkpoints(
     stage2_effective_batch_size: int,
     stage2_microbatch_size: int | None,
     stage2_gradient_accumulation_enabled: bool,
+    amp_overflow_retry_limit: int,
     execution_signature: str,
 ) -> None:
     del model
@@ -2218,6 +2529,7 @@ def _save_checkpoints(
         "stage2_microbatch_size": stage2_microbatch_size,
         "stage2_gradient_accumulation_enabled": bool(stage2_gradient_accumulation_enabled),
         "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+        "amp_overflow_retry_limit": int(amp_overflow_retry_limit),
         "ido_execution_signature": execution_signature,
         "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
         "label_wave_snapshot_policy": IDO_WAVE_SNAPSHOT_POLICY,

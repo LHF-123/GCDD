@@ -235,6 +235,7 @@ class IDOBatchTests(unittest.TestCase):
             "bmm_scope": ido_bmm_scope(config.bmm_mode),
             "stage2_effective_batch_size": 80,
             "stage2_microbatch_size": config.stage2_microbatch_size,
+            "amp_overflow_retry_limit": config.amp_overflow_retry_limit,
             "task_contract_sha256": contract_sha256,
             "task_id": task.task_id,
             "experiment_signature": contract["experiment_signature"],
@@ -330,6 +331,9 @@ class IDOBatchTests(unittest.TestCase):
             writer = csv.DictWriter(handle, fieldnames=["epoch"])
             writer.writeheader()
             writer.writerows({"epoch": epoch} for epoch in range(1, 31))
+        (task.run_dir / "amp_retry_events.csv").write_text(
+            "event,seed,stage2_epoch,effective_batch_number\n", encoding="utf-8"
+        )
         (task.run_dir / "selection_policy.json").write_text(
             json.dumps(
                 {
@@ -337,6 +341,7 @@ class IDOBatchTests(unittest.TestCase):
                     "ido_bmm_mode": config.bmm_mode,
                     "ido_bmm_scope": ido_bmm_scope(config.bmm_mode),
                     "ido_stage2_microbatch_size": config.stage2_microbatch_size,
+                    "ido_amp_overflow_retry_limit": config.amp_overflow_retry_limit,
                     "ido_task_contract_sha256": contract_sha256,
                     "ido_experiment_signature": contract["experiment_signature"],
                 }
@@ -357,6 +362,7 @@ class IDOBatchTests(unittest.TestCase):
                     "stage2_epochs": config.epochs - int(config.stage1_epochs or 0),
                     "stage2_effective_batch_size": 80,
                     "stage2_microbatch_size": config.stage2_microbatch_size,
+                    "amp_overflow_retry_limit": config.amp_overflow_retry_limit,
                     "checkpoint_protocol": "fixed_clean_validation_v1",
                     "official_test_evaluation": "validation_selected_only",
                     "validation_selected_test_top5": score,
@@ -412,9 +418,12 @@ class IDOBatchTests(unittest.TestCase):
             task = build_plan(config, ("cyclic",), attempt=1)[0]
             contract = build_task_contract(config, task)
             self.assertEqual(20, contract["experiment"]["stage2_microbatch_size"])
+            self.assertEqual(4, contract["experiment"]["amp_overflow_retry_limit"])
             command = build_training_command(config, task)
             self.assertIn("--ido-stage2-microbatch-size", command)
             self.assertEqual("20", command[command.index("--ido-stage2-microbatch-size") + 1])
+            self.assertIn("--ido-amp-overflow-retry-limit", command)
+            self.assertEqual("4", command[command.index("--ido-amp-overflow-retry-limit") + 1])
             self._materialize_complete_task(task, config, score=0.2)
             complete, detail = is_complete(task, config)
             self.assertTrue(complete, detail)

@@ -32,6 +32,7 @@ from .lora_training import (
 from .ido import (
     ido_adaptation_name,
     ido_bmm_scope,
+    resolve_ido_amp_overflow_retry_limit,
     resolve_ido_bmm_mode,
     resolve_stage2_microbatch_size,
 )
@@ -44,6 +45,7 @@ PROTOCOL_ORDER = ("cyclic", "idn", "gccn")
 SEEDS = (1, 42, 88)
 REQUIRED_V1 = ("paths.txt", "labels.npy", "eval_paths.txt", "eval_labels.npy", "resolved_config.yaml")
 TASK_CONTRACT_FILENAME = "ido_task_contract.json"
+AMP_RETRY_EVENTS_FILENAME = "amp_retry_events.csv"
 TASK_CONTRACT_SCHEMA_VERSION = 1
 CHECKPOINT_FILENAMES = ("stage1_base.pt", "best_val.pt", "last.pt")
 # The batch contract hashes the local modules that can affect the invoked IDO
@@ -108,6 +110,7 @@ class IDOBatchConfig:
     epochs: int
     stage1_epochs: int | None
     stage2_microbatch_size: int | None
+    amp_overflow_retry_limit: int
     validation_seed: int
     bmm_mode: str
     datasets: tuple[DatasetSpec, ...]
@@ -322,6 +325,7 @@ def load_config(path: Path) -> IDOBatchConfig:
         raise ValueError("formal.stage1_epochs is required when formal.epochs is not divisible by 3.")
     bmm_mode = resolve_ido_bmm_mode(formal.get("bmm_mode", "classwise"))
     stage2_microbatch_size = resolve_stage2_microbatch_size(formal.get("stage2_microbatch_size"))
+    amp_overflow_retry_limit = resolve_ido_amp_overflow_retry_limit(formal.get("amp_overflow_retry_limit"))
     datasets_data = require_mapping(payload, "datasets")
     if set(datasets_data) != set(DATASET_ORDER):
         raise ValueError(f"datasets must contain exactly {list(DATASET_ORDER)}.")
@@ -365,6 +369,7 @@ def load_config(path: Path) -> IDOBatchConfig:
         epochs=int(formal["epochs"]),
         stage1_epochs=stage1_epochs,
         stage2_microbatch_size=stage2_microbatch_size,
+        amp_overflow_retry_limit=amp_overflow_retry_limit,
         validation_seed=int(formal["validation_seed"]),
         bmm_mode=bmm_mode,
         datasets=tuple(datasets),
@@ -697,6 +702,7 @@ def build_training_command(config: IDOBatchConfig, task: IDOTask) -> list[str]:
         command.extend(["--ido-stage1-epochs", str(config.stage1_epochs)])
     if config.stage2_microbatch_size is not None:
         command.extend(["--ido-stage2-microbatch-size", str(config.stage2_microbatch_size)])
+    command.extend(["--ido-amp-overflow-retry-limit", str(config.amp_overflow_retry_limit)])
     for mapping in task.dataset.path_maps:
         command.extend(["--path-map", mapping])
     return command
@@ -771,6 +777,7 @@ def build_task_contract(config: IDOBatchConfig, task: IDOTask) -> dict[str, Any]
         "stage1_epochs": int(stage1_epochs),
         "stage2_epochs": int(stage2_epochs),
         "stage2_microbatch_size": config.stage2_microbatch_size,
+        "amp_overflow_retry_limit": int(config.amp_overflow_retry_limit),
         "validation_seed": int(config.validation_seed),
         "official_test_selected_only": True,
         "posthoc_oracle_test": False,
@@ -804,6 +811,7 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         task.run_dir / "selection_policy.json",
         task.run_dir / "stage1_wrong_event.csv",
         task.run_dir / "bmm_class_fits.csv",
+        task.run_dir / AMP_RETRY_EVENTS_FILENAME,
         *(task.run_dir / "checkpoints" / name for name in CHECKPOINT_FILENAMES),
         task.run_root / "validation_manifest.csv",
         task.run_root / "validation_manifest.json",
@@ -851,6 +859,10 @@ def is_complete(task: IDOTask, config: IDOBatchConfig) -> tuple[bool, str]:
         return False, "result Stage-2 microbatch size does not match the frozen batch config"
     if policy.get("ido_stage2_microbatch_size") != config.stage2_microbatch_size:
         return False, "selection policy Stage-2 microbatch size does not match the frozen batch config"
+    if result.get("amp_overflow_retry_limit") != config.amp_overflow_retry_limit:
+        return False, "result AMP retry limit does not match the frozen batch config"
+    if policy.get("ido_amp_overflow_retry_limit") != config.amp_overflow_retry_limit:
+        return False, "selection policy AMP retry limit does not match the frozen batch config"
     if result.get("d1_recording_status") != "complete":
         return False, "IDO D1 output is incomplete"
     expected_stage1 = config.stage1_epochs if config.stage1_epochs is not None else config.epochs // 3
@@ -1363,6 +1375,7 @@ def validate_checkpoints(
         "bmm_mode": contract_bmm_mode,
         "bmm_scope": ido_bmm_scope(contract_bmm_mode),
         "stage2_microbatch_size": contract["experiment"].get("stage2_microbatch_size"),
+        "amp_overflow_retry_limit": contract["experiment"].get("amp_overflow_retry_limit"),
         "task_contract_sha256": contract_sha256,
         "task_id": task.task_id,
         "experiment_signature": contract["experiment_signature"],

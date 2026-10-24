@@ -20,6 +20,9 @@ formal:
   stage1_epochs: 10
   validation_seed: 20250726
   bmm_mode: classwise
+  # IDO-only numerical execution guard: same effective batch replayed at
+  # successively lower GradScaler scales; it does not skip data or alter loss.
+  amp_overflow_retry_limit: 4
 
 datasets:
   cub:

@@ -41,6 +41,7 @@ from gcdd.ido import (
     IDO_WELoss_SOURCE,
     ido_adaptation_name,
     ido_bmm_scope,
+    resolve_ido_amp_overflow_retry_limit,
     resolve_ido_bmm_mode,
     resolve_stage2_microbatch_size,
     resolve_stage_budget,
@@ -254,6 +255,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ido-amp-overflow-retry-limit",
+        type=int,
+        help=(
+            "IDO-only maximum number of same-effective-batch AMP scale-backoff replays (0 through 4). "
+            "The frozen formal protocol uses 4; it does not skip a failed batch."
+        ),
+    )
+    parser.add_argument(
         "--ido-task-contract",
         type=Path,
         help=(
@@ -364,6 +373,7 @@ def main() -> None:
     ido_stage_budget: tuple[int, int] | None = None
     ido_bmm_mode = "classwise"
     ido_stage2_microbatch_size: int | None = None
+    ido_amp_overflow_retry_limit = 4
     ido_execution_signature = ""
     if "ido" in canonical_methods:
         ido_stage_budget = resolve_stage_budget(int(cfg["lora_train"]["epochs"]), args.ido_stage1_epochs)
@@ -377,6 +387,12 @@ def main() -> None:
             args.ido_stage2_microbatch_size
             if args.ido_stage2_microbatch_size is not None
             else configured_microbatch
+        )
+        configured_amp_retry_limit = existing_ido.get("amp_overflow_retry_limit")
+        ido_amp_overflow_retry_limit = resolve_ido_amp_overflow_retry_limit(
+            args.ido_amp_overflow_retry_limit
+            if args.ido_amp_overflow_retry_limit is not None
+            else configured_amp_retry_limit
         )
         stage2_effective_batch_size = int(cfg["lora_train"]["batch_size"])
         if stage2_effective_batch_size <= 0:
@@ -396,6 +412,8 @@ def main() -> None:
                 "stage2_effective_batch_size": stage2_effective_batch_size,
                 "stage2_microbatch_size": ido_stage2_microbatch_size,
                 "stage2_gradient_accumulation_enabled": accumulation_enabled,
+                "amp_overflow_retry_limit": ido_amp_overflow_retry_limit,
+                "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
             }
         )
         cfg["ido_controlled_adaptation"] = {
@@ -416,6 +434,12 @@ def main() -> None:
                 else ("config" if configured_microbatch is not None else "disabled_default")
             ),
             "stage2_gradient_accumulation_enabled": accumulation_enabled,
+            "amp_overflow_retry_limit": ido_amp_overflow_retry_limit,
+            "amp_overflow_retry_limit_source": (
+                "explicit_cli" if args.ido_amp_overflow_retry_limit is not None
+                else ("config" if configured_amp_retry_limit is not None else "bounded_default")
+            ),
+            "amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
             "stage2_nominal_accumulation_steps": (
                 1 if ido_stage2_microbatch_size is None
                 else (stage2_effective_batch_size + ido_stage2_microbatch_size - 1) // ido_stage2_microbatch_size
@@ -451,6 +475,7 @@ def main() -> None:
         posthoc_oracle_test=bool(args.posthoc_oracle_test),
         bmm_mode=ido_bmm_mode,
         stage2_microbatch_size=ido_stage2_microbatch_size,
+        amp_overflow_retry_limit=ido_amp_overflow_retry_limit,
     )
     if ido_task_contract is not None:
         cfg["ido_batch_task_contract"] = {
@@ -696,6 +721,7 @@ def main() -> None:
                         stage1_epochs=int(ido_stage_budget[0]),
                         bmm_mode=ido_bmm_mode,
                         stage2_microbatch_size=ido_stage2_microbatch_size,
+                        amp_overflow_retry_limit=ido_amp_overflow_retry_limit,
                         path_maps=path_maps,
                         checkpoint_path=checkpoints / "best_val.pt",
                         test_paths=None if args.ido_pilot_no_official_test else data["test_paths"],
@@ -724,6 +750,7 @@ def main() -> None:
                     )
                     raise
                 write_csv(run_dir / "bmm_class_fits.csv", result.bmm_fit_rows, ido_bmm_fit_fields())
+                write_csv(run_dir / "amp_retry_events.csv", result.amp_overflow_events, amp_retry_event_fields())
                 write_ido_wrong_event(
                     run_dir / "stage1_wrong_event.csv",
                     data,
@@ -756,6 +783,7 @@ def main() -> None:
                                 run_cfg["ido_controlled_adaptation"]["stage2_gradient_accumulation_enabled"]
                             ),
                             "ido_amp_overflow_policy": IDO_AMP_OVERFLOW_POLICY,
+                            "ido_amp_overflow_retry_limit": ido_amp_overflow_retry_limit,
                             "ido_execution_signature": ido_execution_signature,
                             "weloss_source": IDO_WELoss_SOURCE,
                             "bmm_degenerate_policy": IDO_DEGENERATE_POLICY,
@@ -1340,8 +1368,18 @@ def main() -> None:
                     "ido_stage2_gradient_accumulation_enabled": result.summary.get("stage2_gradient_accumulation_enabled", ""),
                     "ido_stage2_microbatch_count_total": result.summary.get("stage2_microbatch_count_total", ""),
                     "ido_amp_overflow_policy": result.summary.get("amp_overflow_policy", ""),
+                    "ido_amp_overflow_retry_limit": result.summary.get("amp_overflow_retry_limit", ""),
                     "ido_amp_overflow_events": result.summary.get("amp_overflow_events", ""),
                     "ido_amp_overflow_recovered_batches": result.summary.get("amp_overflow_recovered_batches", ""),
+                    "ido_amp_retry_attempts": result.summary.get("amp_retry_attempts", ""),
+                    "ido_amp_retry_successes": result.summary.get("amp_retry_successes", ""),
+                    "ido_amp_retry_wall_seconds": result.summary.get("amp_retry_wall_seconds", ""),
+                    "ido_amp_scale_initial": result.summary.get("amp_scale_initial", ""),
+                    "ido_amp_scale_success": result.summary.get("amp_scale_success", ""),
+                    "ido_amp_scale_min": result.summary.get("amp_scale_min", ""),
+                    "ido_successful_optimizer_steps": result.summary.get("successful_optimizer_steps", ""),
+                    "ido_successful_scheduler_steps": result.summary.get("successful_scheduler_steps", ""),
+                    "ido_unrecovered_amp_failures": result.summary.get("unrecovered_amp_failures", ""),
                     "ido_amp_overflow_diagnostic_path": result.summary.get("amp_overflow_diagnostic_path", ""),
                     "ido_execution_signature": result.summary.get("ido_execution_signature", ""),
                     "ido_bmm_degenerate_policy": result.summary.get("bmm_degenerate_policy", ""),
@@ -1516,6 +1554,7 @@ def load_ido_task_contract(
     posthoc_oracle_test: bool,
     bmm_mode: str = "classwise",
     stage2_microbatch_size: int | None = None,
+    amp_overflow_retry_limit: int | None = None,
 ) -> dict[str, Any] | None:
     """Load and verify the batch-owned immutable IDO task contract.
 
@@ -1556,6 +1595,8 @@ def load_ido_task_contract(
         raise ValueError("IDO task contract BMM mode differs from the resolved CLI/config mode.")
     if experiment.get("stage2_microbatch_size") != resolve_stage2_microbatch_size(stage2_microbatch_size):
         raise ValueError("IDO task contract Stage-2 microbatch size differs from the resolved CLI/config mode.")
+    if experiment.get("amp_overflow_retry_limit") != resolve_ido_amp_overflow_retry_limit(amp_overflow_retry_limit):
+        raise ValueError("IDO task contract AMP retry limit differs from the resolved CLI/config mode.")
     if experiment.get("official_test_selected_only") is not True or official_test_selected_only is not True or posthoc_oracle_test:
         raise ValueError("IDO task contract requires validation-selected-only test evaluation with no post-hoc oracle test.")
     if experiment.get("path_maps") != [f"{old}={new}" for old, new in path_maps]:
@@ -2101,6 +2142,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--ido-stage1-epochs must be positive when provided.")
     if args.ido_stage2_microbatch_size is not None and args.ido_stage2_microbatch_size <= 0:
         raise ValueError("--ido-stage2-microbatch-size must be positive when provided.")
+    if args.ido_amp_overflow_retry_limit is not None:
+        resolve_ido_amp_overflow_retry_limit(args.ido_amp_overflow_retry_limit)
     if args.official_test_selected_only and args.posthoc_oracle_test:
         raise ValueError("--official-test-selected-only cannot be combined with --posthoc-oracle-test.")
 
@@ -2272,7 +2315,9 @@ def train_log_fields() -> list[str]:
         "bmm_posterior_mass_deficit_sum", "bmm_posterior_mass_deficit_max",
         "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
         "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max",
-        "amp_overflow_policy", "amp_overflow_events_cumulative", "amp_overflow_recovered_batches_cumulative",
+        "amp_overflow_policy", "amp_overflow_retry_limit", "amp_overflow_events_cumulative",
+        "amp_overflow_recovered_batches_cumulative", "amp_retry_attempts_cumulative",
+        "amp_retry_successes_cumulative", "amp_retry_wall_seconds_cumulative",
     ]
 
 
@@ -2293,10 +2338,14 @@ def result_fields() -> list[str]:
         "label_wave_snapshot_policy", "weloss_source", "final_bmm_fallback_classes", "stage1_base_checkpoint",
         "stage2_effective_batch_size", "stage2_microbatch_size", "stage2_gradient_accumulation_enabled",
         "stage2_microbatch_count_total", "stage2_microbatch_count_min", "stage2_microbatch_count_max",
-        "amp_overflow_policy", "amp_overflow_events", "amp_overflow_recovered_batches", "amp_overflow_diagnostic_path", "ido_execution_signature",
+        "amp_overflow_policy", "amp_overflow_retry_limit", "amp_overflow_events", "amp_overflow_recovered_batches",
+        "amp_retry_attempts", "amp_retry_successes", "amp_retry_wall_seconds", "amp_scale_initial",
+        "amp_scale_success", "amp_scale_min", "successful_optimizer_steps", "successful_scheduler_steps",
+        "unrecovered_amp_failures", "amp_overflow_diagnostic_path", "ido_execution_signature",
         "d1_recording_status", "d1_stage1_wall_seconds", "d1_stage2_wall_seconds", "d1_optimizer_loop_wall_seconds",
         "d1_bmm_fit_seconds", "d1_checkpoint_seconds", "d1_official_test_seconds", "d1_end_to_end_wall_seconds",
         "d1_total_wall_seconds", "d1_optimizer_steps_attempted", "d1_optimizer_steps_actual",
+        "d1_scheduler_steps_actual",
         "d1_peak_cuda_allocated_bytes", "d1_peak_cuda_reserved_bytes", "d1_validation_seconds",
         "d1_stage1_processed_samples", "d1_stage2_processed_samples", "d1_stage2_extra_view_forwards",
         "d1_stage2_prediction_prepass_view_forwards",
@@ -2318,6 +2367,20 @@ def ido_bmm_fit_fields() -> list[str]:
         "cdf_1_min", "cdf_1_max", "cdf_2_min", "cdf_2_max",
         "posterior_mass_sum", "posterior_mass_deficit", "posterior_mass_min", "posterior_mass_max",
         "bmm_prediction_clipped_count",
+    ]
+
+
+def amp_retry_event_fields() -> list[str]:
+    """Stable non-oracle schema for IDO Stage-2 AMP replay events."""
+    return [
+        "event", "seed", "stage2_epoch", "effective_batch_number",
+        "effective_batch_size", "microbatch_size", "microbatch_count",
+        "retry_index", "retry_count", "amp_scale_initial", "amp_scale_before",
+        "amp_scale_after_backoff", "amp_scale_success", "amp_scale_min",
+        "amp_scale_min_so_far", "attempt_wall_seconds", "successful_attempt_wall_seconds",
+        "amp_retry_wall_seconds", "amp_retry_wall_seconds_so_far", "loss_terms",
+        "bmm_output_ranges", "replay_capsule_path", "stable_training_indices",
+        "nonfinite_gradients",
     ]
 
 

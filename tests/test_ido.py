@@ -17,7 +17,10 @@ from gcdd.ido import (
     IDO_AMP_OVERFLOW_POLICY,
     IDO_BMM_MODE_GLOBAL,
     IDO_GLOBAL_BMM_SCOPE,
+    _restore_model_buffers,
     _run_stage2_backward_with_amp_retry,
+    _scaler_step_with_observed_optimizer_update,
+    _snapshot_model_buffers,
     ido_adaptation_name,
     official_we_loss,
     official_we_loss_per_sample,
@@ -389,12 +392,12 @@ class IDOTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             resolve_stage2_microbatch_size(0)
 
-    def test_stage2_amp_overflow_retries_same_batch_once_then_remains_fail_closed(self) -> None:
-        """A recovered AMP overflow must not consume an optimizer/scheduler step.
+    def test_stage2_amp_overflow_replays_up_to_four_times_then_remains_fail_closed(self) -> None:
+        """A recovered AMP overflow replays state exactly and preserves one update.
 
         This CPU test uses a minimal scaler double to exercise the control
-        flow without requiring CUDA.  The first backward deliberately injects
-        an infinite gradient; the replay computes the same finite toy loss.
+        flow without requiring CUDA. Four injected non-finite gradients force
+        the prescribed five-scale sequence before the final replay succeeds.
         """
         import torch
 
@@ -420,18 +423,30 @@ class IDOTests(unittest.TestCase):
                 self.update_calls += 1
                 self.scale_value /= 2.0
 
-        model = torch.nn.Linear(3, 2, bias=False)
+        class BufferedLinear(torch.nn.Linear):
+            def __init__(self) -> None:
+                super().__init__(3, 2, bias=False)
+                self.register_buffer("replay_counter", torch.zeros(1))
+
+        model = BufferedLinear()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         scaler = FakeGradScaler()
         events: list[dict[str, object]] = []
-        recovered: list[int] = []
+        recovered: list[dict[str, object]] = []
         inputs = torch.tensor([[1.0, -2.0, 0.5]])
         targets = torch.zeros(1, 2)
+        buffer_snapshot = _snapshot_model_buffers(model)
+        buffer_values_at_attempt_start: list[float] = []
+
+        def restore_retry_state() -> None:
+            _restore_model_buffers(model, buffer_snapshot)
 
         def backward_once(retry_index: int) -> dict[str, object]:
+            buffer_values_at_attempt_start.append(float(model.replay_counter.item()))
+            model.replay_counter.add_(1.0)
             loss = torch.nn.functional.mse_loss(model(inputs), targets)
             scaler.scale(loss).backward()
-            if retry_index == 0:
+            if retry_index < 4:
                 with torch.no_grad():
                     model.weight.grad.fill_(float("inf"))
             return {"loss_terms": {"total": float(loss.detach())}}
@@ -443,6 +458,7 @@ class IDOTests(unittest.TestCase):
             failures: list[dict[str, object]],
             _payload: dict[str, object],
             terminal: bool,
+            retry_metadata: dict[str, object],
         ) -> None:
             events.append(
                 {
@@ -451,10 +467,11 @@ class IDOTests(unittest.TestCase):
                     "scale_after": scale_after,
                     "failures": failures,
                     "terminal": terminal,
+                    "metadata": retry_metadata,
                 }
             )
 
-        payload, retry_count = _run_stage2_backward_with_amp_retry(
+        payload, retry_metadata = _run_stage2_backward_with_amp_retry(
             torch,
             model,
             optimizer,
@@ -462,24 +479,42 @@ class IDOTests(unittest.TestCase):
             backward_once,
             on_overflow,
             recovered.append,
+            retry_limit=4,
+            restore_retry_state=restore_retry_state,
         )
         self.assertEqual({"loss_terms"}, set(payload))
-        self.assertEqual(1, retry_count)
-        self.assertEqual(1, scaler.update_calls)
-        self.assertEqual(2, scaler.unscale_calls)
-        self.assertEqual([1], recovered)
-        self.assertEqual(1, len(events))
-        self.assertFalse(bool(events[0]["terminal"]))
-        self.assertEqual(1024.0, events[0]["scale_before"])
-        self.assertEqual(512.0, events[0]["scale_after"])
+        self.assertEqual(4, retry_metadata["retry_count"])
+        self.assertEqual(4, scaler.update_calls)
+        self.assertEqual(5, scaler.unscale_calls)
+        self.assertEqual(1, len(recovered))
+        self.assertEqual(64.0, recovered[0]["amp_scale_success"])
+        self.assertEqual([0.0] * 5, buffer_values_at_attempt_start)
+        self.assertEqual(1.0, float(model.replay_counter.item()))
+        self.assertEqual(4, len(events))
+        self.assertTrue(all(not bool(event["terminal"]) for event in events))
+        self.assertEqual([1024.0, 512.0, 256.0, 128.0], [event["scale_before"] for event in events])
+        self.assertEqual([512.0, 256.0, 128.0, 64.0], [event["scale_after"] for event in events])
         self.assertTrue(torch.isfinite(model.weight.grad).all())
 
-        terminal_model = torch.nn.Linear(3, 2, bias=False)
+        class StepScaler:
+            def __init__(self, should_step: bool) -> None:
+                self.should_step = should_step
+
+            def step(self, observed_optimizer: torch.optim.Optimizer) -> None:
+                if self.should_step:
+                    observed_optimizer.step()
+
+        self.assertTrue(_scaler_step_with_observed_optimizer_update(StepScaler(True), optimizer))
+        self.assertFalse(_scaler_step_with_observed_optimizer_update(StepScaler(False), optimizer))
+
+        terminal_model = BufferedLinear()
         terminal_optimizer = torch.optim.SGD(terminal_model.parameters(), lr=0.1)
         terminal_scaler = FakeGradScaler()
         terminal_events: list[dict[str, object]] = []
+        terminal_buffer_snapshot = _snapshot_model_buffers(terminal_model)
 
         def always_nonfinite(retry_index: int) -> dict[str, object]:
+            terminal_model.replay_counter.add_(1.0)
             loss = torch.nn.functional.mse_loss(terminal_model(inputs), targets)
             terminal_scaler.scale(loss).backward()
             with torch.no_grad():
@@ -493,7 +528,7 @@ class IDOTests(unittest.TestCase):
                 terminal_optimizer,
                 terminal_scaler,
                 always_nonfinite,
-                lambda retry, before, after, failures, payload, terminal: terminal_events.append(
+                lambda retry, before, after, failures, payload, terminal, metadata: terminal_events.append(
                     {
                         "retry_index": retry,
                         "scale_before": before,
@@ -501,16 +536,20 @@ class IDOTests(unittest.TestCase):
                         "failure_count": len(failures),
                         "terminal": terminal,
                         "payload": payload,
+                        "metadata": metadata,
                     }
                 ),
-                lambda _retries: self.fail("a terminal AMP overflow must not report recovery"),
+                lambda _metadata: self.fail("a terminal AMP overflow must not report recovery"),
+                retry_limit=4,
+                restore_retry_state=lambda: _restore_model_buffers(terminal_model, terminal_buffer_snapshot),
             )
-        self.assertEqual(2, len(terminal_events))
-        self.assertFalse(bool(terminal_events[0]["terminal"]))
-        self.assertTrue(bool(terminal_events[1]["terminal"]))
-        self.assertEqual(1, terminal_scaler.update_calls)
+        self.assertEqual(5, len(terminal_events))
+        self.assertTrue(all(not bool(event["terminal"]) for event in terminal_events[:-1]))
+        self.assertTrue(bool(terminal_events[-1]["terminal"]))
+        self.assertEqual(4, terminal_scaler.update_calls)
+        self.assertEqual(0.0, float(terminal_model.replay_counter.item()))
         self.assertEqual(
-            "stage2_retry_same_effective_batch_once_after_gradscaler_backoff_then_fail_closed",
+            "stage2_replay_same_effective_batch_with_up_to_four_gradscaler_backoffs_then_fail_closed",
             IDO_AMP_OVERFLOW_POLICY,
         )
 
