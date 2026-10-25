@@ -656,6 +656,22 @@ def main() -> None:
                     train_mask = split.train_mask
                     selection_mode = "full_noisy_training_pool"
                     static_score = np.full(len(train_mask), np.nan, dtype=np.float32)
+                # Static full-pool methods use the same opt-in profiler as
+                # dynamic methods.  It observes the pre-existing loop only;
+                # neither the training mask nor any optimization call changes.
+                profiler: RunProfiler | None = None
+                if instrumentation_requested and args.revision_profiling_mode != ProfilingMode.OFF.value:
+                    profiler = RunProfiler(
+                        build_experiment_id(
+                            dataset=str(run_cfg.get("dataset", {}).get("name", "")),
+                            noise_protocol=str(noise_metadata["noise_strategy"]),
+                            noise_seed=int(noise_metadata["noise_seed"]),
+                            method=canonical_key,
+                            training_seed=int(seed),
+                        ),
+                        ProfilingMode(args.revision_profiling_mode),
+                        device_type="cpu",
+                    )
                 result = train_dinov2_lora(
                     data["train_paths"],
                     data["train_labels"],
@@ -675,7 +691,33 @@ def main() -> None:
                     checkpoint_protocol=PROTOCOL_NAME,
                     posthoc_oracle_test=bool(args.posthoc_oracle_test),
                     official_test_selected_only=bool(args.official_test_selected_only),
+                    profiler=profiler,
                 )
+                if revision_output_root is not None:
+                    code_provenance = build_code_provenance(ROOT)
+                    write_instrumentation_outputs(
+                        output_root=revision_output_root,
+                        profiler=profiler,
+                        selection_logger=None,
+                        run_metadata={
+                            "schema_version": "revision_training_integration_v1",
+                            "dataset": str(run_cfg.get("dataset", {}).get("name", "")),
+                            "noise_protocol": str(noise_metadata["noise_strategy"]),
+                            "noise_seed": int(noise_metadata["noise_seed"]),
+                            "training_seed": int(seed),
+                            "method": canonical_key,
+                            "profiling_mode": args.revision_profiling_mode,
+                            "selection_logging_enabled": False,
+                            "selection_strategy": "none_full_noisy_pool",
+                            "prototype_mode": "not_applicable",
+                            "retention_ratio": None,
+                            "proto_keep_ratio": None,
+                            "warmup_epochs": int(args.warmup_epochs),
+                            "update_interval": int(args.update_interval),
+                            "code_commit": code_provenance["git_head"],
+                            "code_provenance": code_provenance,
+                        },
+                    )
                 selection_record = str(run_dir / "static_selection.csv")
                 write_static_selection(
                     Path(selection_record), data, split.train_mask, train_mask, static_score, selection_mode

@@ -12,6 +12,13 @@ from PIL import Image
 
 from .features import load_dinov2_model, resolve_device
 from .progress import log_stage, progress_iter
+from revision_experiments.profiling import RunProfiler
+from revision_experiments.training_integration import (
+    profiling_enabled,
+    profiling_memory_phase,
+    profiling_stage,
+    record_optimizer_and_scheduler_step,
+)
 
 
 # This catalog mirrors the linear modules exposed by the controlled
@@ -237,6 +244,7 @@ def train_dinov2_lora(
     checkpoint_protocol: str = "legacy_test_selected",
     posthoc_oracle_test: bool = False,
     official_test_selected_only: bool = False,
+    profiler: RunProfiler | None = None,
 ) -> LoRARunResult:
     """Train DINOv2 with LoRA on image data for one method and seed.
 
@@ -267,6 +275,16 @@ def train_dinov2_lora(
     if loss_cfg["loss_type"] == "jal_ce" and not np.array_equal(train_mask, expected_jal_mask):
         raise ValueError("JAL-CE must use every sample in its declared full-noisy training pool.")
     device = resolve_device(torch, feature_cfg.get("device", "auto"))
+    if profiling_enabled(profiler):
+        # ``auto`` is resolved above. Recording this fact has no effect on the
+        # device choice, model state, optimiser, or scheduler.
+        assert profiler is not None
+        profiler.device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+    total_training_token = (
+        profiler.start_stage("total_training", phase="train_dinov2_lora")
+        if profiling_enabled(profiler)
+        else None
+    )
     set_torch_seed(torch, seed)
 
     classes = sorted(set(train_labels.tolist()))
@@ -366,30 +384,58 @@ def train_dinov2_lora(
             f"a={loss_cfg['jal_a']}, eps={loss_cfg['jal_eps']}, selection=full_noisy"
         )
 
+    fit_time_token = (
+        profiler.start_stage("fit_time", phase="epoch_loop") if profiling_enabled(profiler) else None
+    )
     for epoch in range(1, epochs + 1):
-        model.train()
+        epoch_token = (
+            profiler.start_stage("epoch", phase=f"epoch_{epoch}") if profiling_enabled(profiler) else None
+        )
         loss_sum = 0.0
         seen = 0
-        progress = progress_iter(train_loader, total=len(train_loader), desc=f"LoRA {method} seed={seed} epoch {epoch}/{epochs}")
-        for images, labels, _ in progress:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                logits = model(images)
-                if loss_cfg["loss_type"] == "ce":
-                    loss = criterion(logits, labels)
-            if loss_cfg["loss_type"] == "jal_ce":
-                loss = criterion(logits.float(), labels)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            batch_size = int(images.shape[0])
-            loss_sum += float(loss.detach().cpu()) * batch_size
-            seen += batch_size
+        with profiling_memory_phase(profiler, "training"):
+            with profiling_stage(
+                profiler,
+                "optimizer_training",
+                phase=f"epoch_{epoch}",
+                data_loading_included=True,
+            ):
+                model.train()
+                progress = progress_iter(train_loader, total=len(train_loader), desc=f"LoRA {method} seed={seed} epoch {epoch}/{epochs}")
+                for images, labels, _ in progress:
+                    if profiling_enabled(profiler):
+                        assert profiler is not None
+                        profiler.record_training_batch()
+                    images = images.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                        logits = model(images)
+                        if loss_cfg["loss_type"] == "ce":
+                            loss = criterion(logits, labels)
+                    if loss_cfg["loss_type"] == "jal_ce":
+                        loss = criterion(logits.float(), labels)
+                    scaler.scale(loss).backward()
+                    track_step_counts = profiling_enabled(profiler)
+                    scale_before = float(scaler.get_scale()) if track_step_counts and scaler.is_enabled() else None
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    if track_step_counts:
+                        scale_after = float(scaler.get_scale()) if scaler.is_enabled() else None
+                        record_optimizer_and_scheduler_step(
+                            profiler,
+                            epoch=epoch,
+                            amp_enabled=bool(scaler.is_enabled()),
+                            scale_before=scale_before,
+                            scale_after=scale_after,
+                        )
+                    batch_size = int(images.shape[0])
+                    loss_sum += float(loss.detach().cpu()) * batch_size
+                    seen += batch_size
 
-        top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
+        with profiling_stage(profiler, "validation", phase=f"epoch_{epoch}", data_loading_included=True):
+            top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
         row = {
             "method": method,
             "seed": int(seed),
@@ -424,43 +470,51 @@ def train_dinov2_lora(
             f"[lora] {method} seed={seed} epoch {epoch}/{epochs}: "
             f"loss={row['loss']:.4f}, top1={top1:.4f}, top5={top5:.4f}"
         )
+        if epoch_token is not None:
+            assert profiler is not None
+            profiler.stop_stage(epoch_token)
+
+    if fit_time_token is not None:
+        assert profiler is not None
+        profiler.stop_stage(fit_time_token)
 
     final_state = trainable_state_dict(model)
     protocol_metrics: dict[str, Any] = {}
     if test_loader is not None and best_state is not None and best_row is not None:
-        epoch_test_metrics: dict[int, tuple[float, float]] = {}
-        if posthoc_oracle_test:
-            epoch_test_metrics = {
-                epoch: evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))
-                for epoch, state in oracle_states
-            }
-            validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
-            final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
-            last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
-        elif official_test_selected_only:
-            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
-                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
-            )
-            final_test_top1 = ""
-            final_test_top5 = ""
-            last5_test_mean = ""
-            last5_test_std = ""
-        else:
-            validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
-                torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
-            )
-            final_test_top1, final_test_top5 = evaluate_state_lora(
-                torch, model, final_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
-            )
-            last5_test_top1 = np.array(
-                [
-                    evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))[0]
-                    for _, state in last5_states
-                ],
-                dtype=np.float32,
-            )
-            last5_test_mean = float(last5_test_top1.mean())
-            last5_test_std = float(last5_test_top1.std())
+        with profiling_stage(profiler, "official_test", phase="validation_selected_checkpoint", data_loading_included=True):
+            epoch_test_metrics: dict[int, tuple[float, float]] = {}
+            if posthoc_oracle_test:
+                epoch_test_metrics = {
+                    epoch: evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))
+                    for epoch, state in oracle_states
+                }
+                validation_selected_test_top1, validation_selected_test_top5 = epoch_test_metrics[int(best_row["epoch"])]
+                final_test_top1, final_test_top5 = epoch_test_metrics[int(epochs)]
+                last5_test_top1 = np.asarray([epoch_test_metrics[epoch][0] for epoch, _ in last5_states], dtype=np.float32)
+            elif official_test_selected_only:
+                validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                    torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+                )
+                final_test_top1 = ""
+                final_test_top5 = ""
+                last5_test_mean = ""
+                last5_test_std = ""
+            else:
+                validation_selected_test_top1, validation_selected_test_top5 = evaluate_state_lora(
+                    torch, model, best_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+                )
+                final_test_top1, final_test_top5 = evaluate_state_lora(
+                    torch, model, final_state, test_loader, device, len(classes), bool(train_cfg.get("amp", True))
+                )
+                last5_test_top1 = np.array(
+                    [
+                        evaluate_state_lora(torch, model, state, test_loader, device, len(classes), bool(train_cfg.get("amp", True)))[0]
+                        for _, state in last5_states
+                    ],
+                    dtype=np.float32,
+                )
+                last5_test_mean = float(last5_test_top1.mean())
+                last5_test_std = float(last5_test_top1.std())
         if posthoc_oracle_test:
             last5_test_mean = float(last5_test_top1.mean())
             last5_test_std = float(last5_test_top1.std())
@@ -496,6 +550,12 @@ def train_dinov2_lora(
                     "oracle_best_to_final_drop": float(oracle_top1 - final_test_top1),
                 }
             )
+    checkpoint_save_token = (
+        profiler.start_stage("checkpoint_save", phase="training_checkpoints")
+        if profiling_enabled(profiler)
+        and (checkpoint_path is not None or final_checkpoint_path is not None or last5_checkpoint_dir is not None)
+        else None
+    )
     if checkpoint_path is not None and best_state is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
@@ -536,15 +596,23 @@ def train_dinov2_lora(
                 last5_checkpoint_dir / f"epoch_{epoch:03d}.pt",
             )
 
+    if checkpoint_save_token is not None:
+        assert profiler is not None
+        profiler.stop_stage(checkpoint_save_token)
+
     summary = summarize_lora_logs(method, seed, logs)
     summary.update(protocol_metrics)
-    return LoRARunResult(
+    result = LoRARunResult(
         logs=logs,
         summary=summary,
         trainable_modules=trainable_modules,
         trainable_params=trainable_params,
         total_params=total_params,
     )
+    if total_training_token is not None:
+        assert profiler is not None
+        profiler.stop_stage(total_training_token)
+    return result
 
 
 def build_transforms(transforms: Any, input_size: int) -> tuple[Any, Any]:
