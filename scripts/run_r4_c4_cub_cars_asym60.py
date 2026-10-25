@@ -104,7 +104,7 @@ def preflight(config: dict) -> dict:
     for relative in ("scripts/run_lora_checkpoint_validation.py", "gcdd/lora_dynamic.py", "gcdd/lora_training.py"):
         path = historical / relative
         findings.append({"dataset": "historical", "check": relative, "status": "PASS" if path.is_file() else "FAIL", "path": str(path)})
-    capacity = gpu_status(int(config["runtime"]["minimum_gpu_memory_gib"]))
+    capacity = gpu_status(int(config["runtime"]["minimum_gpu_memory_mib"]))
     required_ok = all(item["status"] == "PASS" for item in findings)
     local_data_ok = all(item["status"] == "PASS" for item in data_locations)
     status = (

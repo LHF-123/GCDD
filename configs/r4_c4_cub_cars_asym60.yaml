@@ -4,16 +4,17 @@ schema_version: 1
 
 runtime:
   python_executable: python
-  # Formal DINOv2-B/14 + LoRA runs are deliberately blocked below this
-  # capacity; an 8 GiB local GPU is not an accepted substitute.
-  minimum_gpu_memory_gib: 24
+  # Formal runs require a nominal 24 GB GPU. nvidia-smi reports memory in
+  # MiB and can reserve a few MiB (e.g. RTX 4090D: 24564 MiB), so use the
+  # explicit vendor-capacity threshold instead of an accidental 24 GiB gate.
+  minimum_gpu_memory_mib: 24000
 
 output:
   root: ../outputs_major_revision/r4_c4_cub_cars_asym60
   instrumentation_root: ../outputs_major_revision/r4_c4_cub_cars_asym60/instrumentation
 
 historical:
-  repository_root: ../../../
+  repository_root: ..
 
 formal:
   methods: [all_noisy_ce, dynamic_small_loss, jal_ce, pgdf]

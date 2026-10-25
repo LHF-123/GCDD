@@ -544,7 +544,10 @@ def task_status(task: Task) -> tuple[str, list[str]]:
     return ("COMPLETE_VERIFIED" if not issues else "PARTIAL"), issues
 
 
-def gpu_status(required_gib: int) -> dict[str, Any]:
+def gpu_status(required_mib: int) -> dict[str, Any]:
+    """Return eligibility against the explicit nvidia-smi MiB capacity gate."""
+    if required_mib < 0:
+        raise ValueError("required_mib must be non-negative")
     command = ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,utilization.gpu", "--format=csv,noheader,nounits"]
     try:
         completed = subprocess.run(command, check=False, capture_output=True, text=True, timeout=15)
@@ -556,12 +559,18 @@ def gpu_status(required_gib: int) -> dict[str, Any]:
     for line in completed.stdout.splitlines():
         name, total, free, utilisation = [value.strip() for value in line.split(",")]
         devices.append({"name": name, "total_mib": int(total), "free_mib": int(free), "utilization_percent": int(utilisation)})
-    eligible = [device for device in devices if device["total_mib"] >= required_gib * 1024]
+    eligible = [device for device in devices if device["total_mib"] >= required_mib]
     return {
         "status": "READY" if eligible else "READY_WAIT_GPU",
-        "minimum_total_gib": required_gib,
+        "minimum_total_mib": required_mib,
+        "capacity_policy": "nominal_24gb_24000_mib",
         "devices": devices,
-        "reason": "No GPU meets the frozen 24 GiB minimum for formal DINOv2-B/14+LoRA runs." if not eligible else "eligible_gpu_present",
+        "reason": (
+            f"No GPU meets the frozen nominal-24-GB ({required_mib} MiB) capacity gate "
+            "for formal DINOv2-B/14+LoRA runs."
+            if not eligible
+            else "eligible_gpu_present"
+        ),
     }
 
 

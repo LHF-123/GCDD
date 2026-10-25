@@ -4,13 +4,16 @@ import csv
 import json
 import tempfile
 import unittest
+from subprocess import CompletedProcess
 from pathlib import Path
+from unittest.mock import patch
 
 from gcdd.r4_c4_asym60 import (
     FROZEN,
     METHODS,
     Task,
     generate_cyclic_manifest,
+    gpu_status,
     task_command,
     task_status,
 )
@@ -108,6 +111,21 @@ class R4C4Asym60Tests(unittest.TestCase):
         self.assertEqual(1, payload["scheduler_steps_actual"])
         self.assertEqual(1, payload["training_batches_seen"])
         self.assertEqual("not_applicable_cpu_or_cuda_unavailable", payload["memory"]["overall_run_peak"]["status"])
+
+    @patch("gcdd.r4_c4_asym60.subprocess.run")
+    def test_nominal_24gb_gpu_gate_accepts_4090d_nvidia_smi_capacity(self, mocked_run) -> None:
+        mocked_run.return_value = CompletedProcess(
+            args=["nvidia-smi"],
+            returncode=0,
+            stdout="NVIDIA GeForce RTX 4090 D, 24564, 24082, 0\n",
+            stderr="",
+        )
+        accepted = gpu_status(24000)
+        rejected = gpu_status(24576)
+        self.assertEqual("READY", accepted["status"])
+        self.assertEqual(24000, accepted["minimum_total_mib"])
+        self.assertEqual("nominal_24gb_24000_mib", accepted["capacity_policy"])
+        self.assertEqual("READY_WAIT_GPU", rejected["status"])
 
 
 if __name__ == "__main__":
