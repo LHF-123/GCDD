@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from unittest import mock
+import json
 from pathlib import Path
 
 import torch
@@ -26,7 +27,7 @@ from gcdd.lora_training import (
     parse_target_modules,
     resolve_lora_batching,
 )
-from gcdd.r4_c4_clip_vitb16 import FORMAL_RUNS, FROZEN
+from gcdd.r4_c4_clip_vitb16 import FORMAL_RUNS, FROZEN, Task, task_status
 
 
 WEIGHTS = Path.home() / ".cache" / "clip" / "ViT-B-16.pt"
@@ -51,6 +52,27 @@ def clip_config(device: str = "cpu") -> dict:
 
 
 class ClipBackboneTest(unittest.TestCase):
+    def test_task_uses_common_runner_instrumentation_id_and_reports_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            task = Task(
+                dataset_key="cub",
+                dataset_name="CUB-200-2011",
+                method_key="all_noisy_ce",
+                runner_method="all_noisy",
+                selection_logging=False,
+                seed=1,
+                output_root=root,
+                input_dir=root / "input",
+                manifest_path=root / "manifest.csv",
+                validation_dir=root / "validation",
+                instrumentation_root=root / "profiling",
+            )
+            self.assertEqual("CUB-200-2011_adjacent_cyclic_noise42_all_noisy_seed1", task.experiment_id)
+            task.task_dir.mkdir(parents=True)
+            (task.task_dir / "RUNNING.json").write_text(json.dumps({"pid": 1}), encoding="utf-8")
+            self.assertEqual(("RUNNING", []), task_status(task))
+
     def test_fused_qkv_wrapper_is_identity_before_lora_training(self) -> None:
         base = torch.nn.MultiheadAttention(8, 2, dropout=0.0, batch_first=True).eval()
         values = torch.randn(3, 5, 8)

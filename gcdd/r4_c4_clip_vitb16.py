@@ -37,6 +37,7 @@ from gcdd.lora_dynamic import train_dynamic_loss_lora
 from gcdd.lora_training import train_dinov2_lora
 from revision_experiments.profiling import ProfilingMode, RunProfiler
 from revision_experiments.selection_logging import SelectionLogError, read_selection_bundle
+from revision_experiments.training_integration import build_experiment_id
 
 
 METHODS: tuple[tuple[str, str, bool], ...] = (
@@ -95,7 +96,19 @@ class Task:
 
     @property
     def experiment_id(self) -> str:
-        return safe_component(self.dataset_name) + f"_clip_vitb16_cyclic40_{self.runner_method}_seed{self.seed}"
+        """Match the common runner's immutable profiling/selection directory key.
+
+        The common checkpoint-validation entry point derives this key before
+        it sees the R4-C4 wrapper.  The wrapper must therefore consume that
+        exact key rather than inventing a CLIP-specific directory name.
+        """
+        return build_experiment_id(
+            dataset=self.dataset_name,
+            noise_protocol="adjacent_cyclic",
+            noise_seed=42,
+            method=self.runner_method,
+            training_seed=self.seed,
+        )
 
 
 def safe_component(value: str) -> str:
@@ -560,6 +573,13 @@ def stage_shared_validation(task: Task) -> None:
 
 def task_status(task: Task) -> tuple[str, list[str]]:
     issues: list[str] = []
+    # The orchestration parent creates this marker before spawning the
+    # checkpoint-validation child.  Treat it as authoritative while present:
+    # epoch/checkpoint/profile artifacts are necessarily incomplete mid-run.
+    # This also prevents a second --resume process from overwriting the same
+    # formal task directory.
+    if (task.task_dir / "RUNNING.json").is_file():
+        return "RUNNING", []
     result = task.run_dir / "result.json"
     if not result.is_file():
         if (task.task_dir / "FAILED.json").is_file():
@@ -634,6 +654,9 @@ def _runtime_environment() -> dict[str, Any]:
 def run_tasks(tasks: list[Task], *, resume: bool) -> int:
     for task in tasks:
         state, issues = task_status(task)
+        if state == "RUNNING":
+            print(f"ALREADY_RUNNING {task.dataset_key}/{task.method_key}/seed{task.seed}", flush=True)
+            return 5
         if state == "COMPLETE_VERIFIED":
             print(f"SKIP COMPLETE {task.dataset_key}/{task.method_key}/seed{task.seed}", flush=True)
             continue
