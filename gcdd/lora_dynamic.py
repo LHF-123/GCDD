@@ -22,7 +22,9 @@ from .lora_training import (
     freeze_all,
     inject_lora,
     lora_parameters,
+    lora_microbatch_slices,
     parse_target_modules,
+    resolve_lora_batching,
     safe_ratio,
     set_torch_seed,
     summarize_lora_logs,
@@ -265,7 +267,11 @@ def train_dynamic_loss_lora(
         raise ValueError("Eval split has no labels that appear in the train split.")
 
     input_size = int(feature_cfg["input_size"])
-    train_transform, eval_transform = build_transforms(transforms, input_size)
+    train_transform, eval_transform = build_transforms(
+        transforms,
+        input_size,
+        backend=str(feature_cfg.get("backend", "dinov2_vitb14")),
+    )
     eval_dataset = ImageSplitDataset(eval_paths, eval_labels, eval_idx, label_to_id, eval_transform, path_maps)
     eval_loader = DataLoader(
         eval_dataset,
@@ -327,7 +333,7 @@ def train_dynamic_loss_lora(
     )
 
     epochs = int(train_cfg["epochs"])
-    batch_size = int(train_cfg["batch_size"])
+    batch_size, microbatch_size = resolve_lora_batching(train_cfg)
     expected_budget_epochs = selection_update_epochs(epochs, warmup_epochs, update_interval)
     if is_fixed_replay:
         assert replay_selection_masks is not None
@@ -405,7 +411,8 @@ def train_dynamic_loss_lora(
         f"{'not_used' if selection_strategy == 'proto_only' else f'{retention_ratio:.3f}'}, "
         f"proto_keep_ratio={format_optional_ratio(proto_keep_ratio)}, "
         f"selection_strategy={selection_strategy}, prototype_mode={prototype_mode}, fusion_mode={fusion_mode or 'none'}, "
-        f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}"
+        f"auto_proto_keep={'yes' if auto_proto_keep is not None else 'no'}, trainable_params={trainable_params}, "
+        f"effective_batch={batch_size}, microbatch={microbatch_size}"
     )
 
     fit_time_token = (
@@ -440,22 +447,38 @@ def train_dynamic_loss_lora(
                 for images, labels, sample_indices in progress:
                     if profiling_enabled(profiler):
                         profiler.record_training_batch()
-                    images = images.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
-                    optimizer.zero_grad(set_to_none=True)
-                    batch_weights = None
-                    if use_soft_weighting:
-                        batch_weight_values = soft_sample_weights[sample_indices.detach().cpu().numpy()]
-                        batch_weights = torch.as_tensor(batch_weight_values, device=device, dtype=torch.float32)
-                    with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                        logits = model(images)
-                        per_sample_loss = criterion(logits, labels)
-                        loss = (
-                            soft_weighted_mean(per_sample_loss, batch_weights.to(dtype=per_sample_loss.dtype))
-                            if batch_weights is not None
-                            else per_sample_loss
+                    full_batch_size = int(images.shape[0])
+                    if use_soft_weighting and microbatch_size < full_batch_size:
+                        raise RuntimeError(
+                            "Microbatch accumulation is not implemented for the separate fusion-soft ablation; "
+                            "R4-C4 CLIP only permits CE Dynamic/PGDF paths."
                         )
-                    scaler.scale(loss).backward()
+                    optimizer.zero_grad(set_to_none=True)
+                    batch_loss_sum = 0.0
+                    batch_weight_sum = 0.0
+                    for batch_slice in lora_microbatch_slices(full_batch_size, microbatch_size):
+                        images_micro = images[batch_slice].to(device, non_blocking=True)
+                        labels_micro = labels[batch_slice].to(device, non_blocking=True)
+                        current_batch = int(images_micro.shape[0])
+                        batch_weights = None
+                        if use_soft_weighting:
+                            batch_weight_values = soft_sample_weights[sample_indices[batch_slice].detach().cpu().numpy()]
+                            batch_weights = torch.as_tensor(batch_weight_values, device=device, dtype=torch.float32)
+                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                            logits = model(images_micro)
+                            per_sample_loss = criterion(logits, labels_micro)
+                            loss = (
+                                soft_weighted_mean(per_sample_loss, batch_weights.to(dtype=per_sample_loss.dtype))
+                                if batch_weights is not None
+                                else per_sample_loss
+                            )
+                        scaler.scale(loss * (float(current_batch) / float(full_batch_size))).backward()
+                        if batch_weights is None:
+                            batch_loss_sum += float(loss.detach().cpu()) * current_batch
+                        else:
+                            current_weight_sum = float(batch_weights.detach().sum().cpu())
+                            batch_loss_sum += float(loss.detach().cpu()) * current_weight_sum
+                            batch_weight_sum += current_weight_sum
                     # Exact-budget controls share PGDF's scheduler horizon but
                     # must also expose their realized update counts.  This is
                     # a record-only change: optimizer and scheduler calls are
@@ -488,13 +511,11 @@ def train_dynamic_loss_lora(
                         scheduler_steps_actual_total += 1
                         optimizer_steps_attempted_since_selection += 1
                         optimizer_steps_since_selection += int(actual_update)
-                    current_batch = int(images.shape[0])
-                    if batch_weights is None:
-                        loss_sum += float(loss.detach().cpu()) * current_batch
-                        seen += current_batch
+                    if not use_soft_weighting:
+                        loss_sum += batch_loss_sum
+                        seen += full_batch_size
                     else:
-                        batch_weight_sum = float(batch_weights.detach().sum().cpu())
-                        loss_sum += float(loss.detach().cpu()) * batch_weight_sum
+                        loss_sum += batch_loss_sum
                         seen += batch_weight_sum
 
         with profiling_stage(profiler, "validation", phase=f"epoch_{epoch}", data_loading_included=True):
@@ -514,6 +535,9 @@ def train_dynamic_loss_lora(
             "eval_samples": int(len(eval_idx)),
             "trainable_params": int(trainable_params),
             "total_params": int(total_params),
+            "effective_batch_size": int(batch_size),
+            "microbatch_size": int(microbatch_size),
+            "gradient_accumulation_steps": int(math.ceil(batch_size / microbatch_size)),
         }
         logs.append(row)
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -1343,17 +1367,17 @@ def trainable_model_checksum(model: Any) -> str:
 
 
 def assert_lora_backbone_invariants(model: Any) -> None:
-    """Fail closed if a base DINOv2 tensor becomes trainable after LoRA injection."""
+    """Fail closed if a frozen visual-backbone tensor becomes trainable."""
     lora_trainable = 0
     for name, parameter in model.backbone.named_parameters():
-        if "lora_a" in name or "lora_b" in name:
+        if "lora_" in name:
             if parameter.requires_grad:
                 lora_trainable += parameter.numel()
             continue
         if parameter.requires_grad:
-            raise RuntimeError(f"Frozen DINOv2 backbone parameter became trainable: backbone.{name}")
+            raise RuntimeError(f"Frozen visual-backbone parameter became trainable: backbone.{name}")
     if lora_trainable <= 0:
-        raise RuntimeError("No trainable LoRA parameters were found in the DINOv2 backbone.")
+        raise RuntimeError("No trainable LoRA parameters were found in the visual backbone.")
     if not any(parameter.requires_grad for parameter in model.head.parameters()):
         raise RuntimeError("Classifier head must remain trainable.")
 

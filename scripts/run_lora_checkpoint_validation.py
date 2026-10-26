@@ -1349,6 +1349,30 @@ def main() -> None:
             )
             all_logs.extend(result.logs)
             write_csv(run_dir / "train_log.csv", result.logs, train_log_fields())
+            if str(run_cfg.get("feature", {}).get("backend", "")) == "clip_vitb16_openai":
+                # R4-C4 requires positive evidence that its CLIP fused-QKV
+                # adapter, rather than a no-op target pattern, was used by
+                # every formal run. This is record-only and does not affect
+                # any loss, selection, optimiser, or checkpoint decision.
+                write_json(
+                    run_dir / "model_adaptation_audit.json",
+                    {
+                        "backbone": "CLIP ViT-B/16 visual encoder only",
+                        "pretrained_source": run_cfg["feature"].get("clip_pretrained", ""),
+                        "weights_sha256": run_cfg["feature"].get("clip_weights_sha256", ""),
+                        "cls_feature_space": run_cfg["feature"].get("cls_feature_space", ""),
+                        "lora_target_modules": run_cfg["lora"].get("target_modules", ""),
+                        "lora_rank": run_cfg["lora"].get("rank", ""),
+                        "lora_alpha": run_cfg["lora"].get("alpha", ""),
+                        "lora_dropout": run_cfg["lora"].get("dropout", ""),
+                        "lora_module_names": result.trainable_modules,
+                        "trainable_parameter_count": int(result.trainable_params),
+                        "frozen_parameter_count": int(result.total_params - result.trainable_params),
+                        "total_parameter_count": int(result.total_params),
+                        "classifier_head_trainable": True,
+                        "gradient_check": "required successful GPU_24GB_MEMORY_PREFLIGHT before formal launch; that preflight records nonzero LoRA and head gradients.",
+                    },
+                )
             budget_source_path = str(result_row.get("budget_source_path", ""))
             source_root = (
                 Path(budget_source_path).parents[2]
@@ -2349,6 +2373,7 @@ def train_log_fields() -> list[str]:
     return [
         "method", "seed", "epoch", "lr_lora", "lr_head", "loss", "train_loss", "top1", "top5", "val_top1", "val_top5",
         "best_top1", "best_epoch", "train_samples", "candidate_samples", "selected_ratio", "eval_samples", "trainable_params", "total_params",
+        "effective_batch_size", "microbatch_size", "gradient_accumulation_steps",
         "loss_type", "jal_alpha", "jal_beta", "jal_a", "jal_eps", "selection_mode", "remember_rate", "selected_count",
         "selected_clean", "selected_purity", "clean_recall", "top1_a", "top5_a", "top1_b", "top5_b", "mean_ab_top1", "mean_ab_top5",
         "stage", "stage_epoch", "wrong_event_total", "stage1_prediction_changes", "stage1_base_snapshot_selected",

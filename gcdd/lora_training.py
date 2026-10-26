@@ -10,6 +10,14 @@ from typing import Any, Sequence
 import numpy as np
 from PIL import Image
 
+from .clip_vit import (
+    CLIP_MEAN,
+    CLIP_STD,
+    CLIP_VITB16_BACKEND,
+    CLIP_VITB16_CLS_DIM,
+    extract_clip_final_ln_pre_projection_cls,
+    load_clip_vitb16_visual,
+)
 from .features import load_dinov2_model, resolve_device
 from .progress import log_stage, progress_iter
 from revision_experiments.profiling import RunProfiler
@@ -180,6 +188,111 @@ class LoRALinear:
         return _LoRALinear(base)
 
 
+class LoRAMultiheadAttention:
+    """LoRA for CLIP's fused Q/K/V PyTorch ``MultiheadAttention`` layer.
+
+    OpenCLIP ViT-B/16 stores Q, K and V as one ``in_proj_weight`` parameter,
+    rather than DINOv2's ``attn.qkv`` Linear module.  This wrapper preserves
+    the frozen MHA base parameters and adds independent rank-r updates to each
+    of its three projections.  It intentionally supports only the self-
+    attention invocation used by the audited OpenCLIP visual Transformer.
+    """
+
+    @staticmethod
+    def make(torch: Any, base: Any, rank: int, alpha: float, dropout: float) -> Any:
+        import torch.nn.functional as functional
+
+        class _LoRAMultiheadAttention(torch.nn.Module):
+            def __init__(self, base_layer: Any) -> None:
+                super().__init__()
+                if not bool(getattr(base_layer, "_qkv_same_embed_dim", False)):
+                    raise ValueError("CLIP LoRA requires fused self-attention Q/K/V weights.")
+                self.base = base_layer
+                self.embed_dim = int(base_layer.embed_dim)
+                self.num_heads = int(base_layer.num_heads)
+                self.batch_first = bool(getattr(base_layer, "batch_first", False))
+                self.dropout_probability = float(base_layer.dropout)
+                self.scaling = float(alpha) / float(rank)
+                self.lora_dropout = torch.nn.Dropout(float(dropout))
+                factory = {"device": base_layer.in_proj_weight.device, "dtype": base_layer.in_proj_weight.dtype}
+                self.lora_q_a = torch.nn.Linear(self.embed_dim, rank, bias=False, **factory)
+                self.lora_q_b = torch.nn.Linear(rank, self.embed_dim, bias=False, **factory)
+                self.lora_k_a = torch.nn.Linear(self.embed_dim, rank, bias=False, **factory)
+                self.lora_k_b = torch.nn.Linear(rank, self.embed_dim, bias=False, **factory)
+                self.lora_v_a = torch.nn.Linear(self.embed_dim, rank, bias=False, **factory)
+                self.lora_v_b = torch.nn.Linear(rank, self.embed_dim, bias=False, **factory)
+                for layer in (self.lora_q_a, self.lora_k_a, self.lora_v_a):
+                    torch.nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
+                for layer in (self.lora_q_b, self.lora_k_b, self.lora_v_b):
+                    torch.nn.init.zeros_(layer.weight)
+
+            def _lora(self, source: Any, left: Any, right: Any) -> Any:
+                return right(left(self.lora_dropout(source))) * self.scaling
+
+            def forward(
+                self,
+                query: Any,
+                key: Any,
+                value: Any,
+                key_padding_mask: Any = None,
+                need_weights: bool = True,
+                attn_mask: Any = None,
+                average_attn_weights: bool = True,
+                is_causal: bool = False,
+            ) -> tuple[Any, None]:
+                del average_attn_weights
+                if key is not query or value is not query:
+                    raise RuntimeError("R4-C4 CLIP LoRA supports only visual self-attention.")
+                if key_padding_mask is not None:
+                    raise RuntimeError("R4-C4 CLIP visual self-attention must not receive a padding mask.")
+                if need_weights:
+                    raise RuntimeError("R4-C4 CLIP visual blocks must request attention weights=False.")
+                if query.ndim != 3:
+                    raise ValueError(f"Expected [tokens,batch,dim] CLIP attention input, got {tuple(query.shape)}.")
+                # OpenCLIP 3.x creates visual MHA with ``batch_first=True``;
+                # older compatible releases use sequence-first. Normalize the
+                # temporary projection/SDPA calculation to [tokens,batch,dim]
+                # and restore the exact public orientation on return.
+                source = query.transpose(0, 1) if self.batch_first else query
+                tokens, batch, dim = (int(source.shape[0]), int(source.shape[1]), int(source.shape[2]))
+                if dim != self.embed_dim:
+                    raise ValueError("CLIP attention input dimension does not match its frozen projection.")
+                q_weight, k_weight, v_weight = self.base.in_proj_weight.chunk(3, dim=0)
+                if self.base.in_proj_bias is None:
+                    q_bias = k_bias = v_bias = None
+                else:
+                    q_bias, k_bias, v_bias = self.base.in_proj_bias.chunk(3, dim=0)
+                q = functional.linear(source, q_weight, q_bias) + self._lora(source, self.lora_q_a, self.lora_q_b)
+                k = functional.linear(source, k_weight, k_bias) + self._lora(source, self.lora_k_a, self.lora_k_b)
+                v = functional.linear(source, v_weight, v_bias) + self._lora(source, self.lora_v_a, self.lora_v_b)
+                head_dim = self.embed_dim // self.num_heads
+                q = q.reshape(tokens, batch, self.num_heads, head_dim).permute(1, 2, 0, 3)
+                k = k.reshape(tokens, batch, self.num_heads, head_dim).permute(1, 2, 0, 3)
+                v = v.reshape(tokens, batch, self.num_heads, head_dim).permute(1, 2, 0, 3)
+                if attn_mask is not None:
+                    if attn_mask.ndim == 2:
+                        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                    elif attn_mask.ndim == 3 and int(attn_mask.shape[0]) == batch * self.num_heads:
+                        attn_mask = attn_mask.reshape(batch, self.num_heads, tokens, tokens)
+                    elif attn_mask.ndim != 4:
+                        raise RuntimeError("Unsupported CLIP attention-mask shape.")
+                output = functional.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_mask,
+                    dropout_p=self.dropout_probability if self.training else 0.0,
+                    is_causal=bool(is_causal),
+                )
+                output = output.permute(2, 0, 1, 3).reshape(tokens, batch, self.embed_dim)
+                output = functional.linear(output, self.base.out_proj.weight, self.base.out_proj.bias)
+                if self.batch_first:
+                    output = output.transpose(0, 1)
+                return output, None
+
+        return _LoRAMultiheadAttention(base)
+
+
 class ImageSplitDataset:
     def __init__(self, paths: list[str], labels: np.ndarray, indices: np.ndarray, label_to_id: dict[str, int], transform: Any, path_maps: list[tuple[str, str]]):
         self.paths = paths
@@ -206,14 +319,26 @@ class DINOv2LoRAClassifier:
         class _DINOv2LoRAClassifier(torch.nn.Module):
             def __init__(self) -> None:
                 super().__init__()
-                self.backbone = load_dinov2_model(torch, cfg).to(resolve_device(torch, cfg["feature"]["device"]))
-                self.embed_dim = infer_embed_dim(self.backbone)
+                backend = str(cfg.get("feature", {}).get("backend", "dinov2_vitb14"))
+                self.backend = backend
+                if backend == "dinov2_vitb14":
+                    self.backbone = load_dinov2_model(torch, cfg).to(resolve_device(torch, cfg["feature"]["device"]))
+                    self.embed_dim = infer_embed_dim(self.backbone)
+                elif backend == CLIP_VITB16_BACKEND:
+                    self.backbone = load_clip_vitb16_visual(torch, cfg).to(resolve_device(torch, cfg["feature"]["device"]))
+                    self.embed_dim = CLIP_VITB16_CLS_DIM
+                else:
+                    raise ValueError(f"Unsupported LoRA visual backbone: {backend!r}")
                 self.head = torch.nn.Linear(self.embed_dim, num_classes)
 
             def extract_cls_features(self, images: Any) -> Any:
                 """Return the LoRA-adapted CLS representation before the classifier head."""
-                features = self.backbone.forward_features(images)
-                return features["x_norm_clstoken"]
+                if self.backend == "dinov2_vitb14":
+                    features = self.backbone.forward_features(images)
+                    return features["x_norm_clstoken"]
+                if self.backend == CLIP_VITB16_BACKEND:
+                    return extract_clip_final_ln_pre_projection_cls(self.backbone, images)
+                raise RuntimeError(f"Unsupported LoRA visual backbone: {self.backend!r}")
 
             def forward(self, images: Any, return_features: bool = False) -> Any:
                 cls = self.extract_cls_features(images)
@@ -298,7 +423,11 @@ def train_dinov2_lora(
         raise ValueError("Eval split has no labels that appear in the train split.")
 
     input_size = int(feature_cfg["input_size"])
-    train_transform, eval_transform = build_transforms(transforms, input_size)
+    train_transform, eval_transform = build_transforms(
+        transforms,
+        input_size,
+        backend=str(feature_cfg.get("backend", "dinov2_vitb14")),
+    )
     train_dataset = ImageSplitDataset(train_paths, train_labels, train_idx, label_to_id, train_transform, path_maps)
     eval_dataset = ImageSplitDataset(eval_paths, eval_labels, eval_idx, label_to_id, eval_transform, path_maps)
     train_loader = DataLoader(
@@ -309,6 +438,7 @@ def train_dinov2_lora(
         pin_memory=bool(train_cfg.get("pin_memory", True)),
         drop_last=False,
     )
+    effective_batch_size, microbatch_size = resolve_lora_batching(train_cfg)
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=int(train_cfg.get("eval_batch_size", train_cfg["batch_size"])),
@@ -373,10 +503,10 @@ def train_dinov2_lora(
     selection_split_name = "validation" if test_loader is not None else "eval"
     log_stage(
         f"[lora] {method} seed={seed}: train_images={len(train_idx)}, {selection_split_name}_images={len(eval_idx)}, "
-        f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}, selection=full_noisy"
+        f"trainable_params={trainable_params}, effective_batch={effective_batch_size}, microbatch={microbatch_size}, loss_type={loss_cfg['loss_type']}, selection=full_noisy"
         if loss_cfg["loss_type"] == "jal_ce"
         else f"[lora] {method} seed={seed}: train_images={len(train_idx)}, {selection_split_name}_images={len(eval_idx)}, "
-        f"trainable_params={trainable_params}, loss_type={loss_cfg['loss_type']}"
+        f"trainable_params={trainable_params}, effective_batch={effective_batch_size}, microbatch={microbatch_size}, loss_type={loss_cfg['loss_type']}"
     )
     if loss_cfg["loss_type"] == "jal_ce":
         log_stage(
@@ -406,16 +536,25 @@ def train_dinov2_lora(
                     if profiling_enabled(profiler):
                         assert profiler is not None
                         profiler.record_training_batch()
-                    images = images.to(device, non_blocking=True)
-                    labels = labels.to(device, non_blocking=True)
+                    full_batch_size = int(images.shape[0])
                     optimizer.zero_grad(set_to_none=True)
-                    with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
-                        logits = model(images)
-                        if loss_cfg["loss_type"] == "ce":
-                            loss = criterion(logits, labels)
-                    if loss_cfg["loss_type"] == "jal_ce":
-                        loss = criterion(logits.float(), labels)
-                    scaler.scale(loss).backward()
+                    batch_loss_sum = 0.0
+                    for batch_slice in lora_microbatch_slices(full_batch_size, microbatch_size):
+                        images_micro = images[batch_slice].to(device, non_blocking=True)
+                        labels_micro = labels[batch_slice].to(device, non_blocking=True)
+                        current_batch_size = int(images_micro.shape[0])
+                        with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                            logits = model(images_micro)
+                            if loss_cfg["loss_type"] == "ce":
+                                loss = criterion(logits, labels_micro)
+                        if loss_cfg["loss_type"] == "jal_ce":
+                            loss = criterion(logits.float(), labels_micro)
+                        # A sum of b_m/B-scaled microbatch means is exactly the
+                        # full effective-batch mean, including a short final
+                        # microbatch. The optimiser and scheduler still step
+                        # once per original effective DataLoader batch.
+                        scaler.scale(loss * (float(current_batch_size) / float(full_batch_size))).backward()
+                        batch_loss_sum += float(loss.detach().cpu()) * current_batch_size
                     track_step_counts = profiling_enabled(profiler)
                     scale_before = float(scaler.get_scale()) if track_step_counts and scaler.is_enabled() else None
                     scaler.step(optimizer)
@@ -430,9 +569,8 @@ def train_dinov2_lora(
                             scale_before=scale_before,
                             scale_after=scale_after,
                         )
-                    batch_size = int(images.shape[0])
-                    loss_sum += float(loss.detach().cpu()) * batch_size
-                    seen += batch_size
+                    loss_sum += batch_loss_sum
+                    seen += full_batch_size
 
         with profiling_stage(profiler, "validation", phase=f"epoch_{epoch}", data_loading_included=True):
             top1, top5 = evaluate_lora(torch, model, eval_loader, device, len(classes), bool(train_cfg.get("amp", True)))
@@ -452,6 +590,9 @@ def train_dinov2_lora(
             "eval_samples": int(len(eval_idx)),
             "trainable_params": int(trainable_params),
             "total_params": int(total_params),
+            "effective_batch_size": int(effective_batch_size),
+            "microbatch_size": int(microbatch_size),
+            "gradient_accumulation_steps": int(math.ceil(effective_batch_size / microbatch_size)),
             **loss_log_fields(loss_cfg),
         }
         if best_row is None or float(row["top1"]) > float(best_row["top1"]):
@@ -615,7 +756,36 @@ def train_dinov2_lora(
     return result
 
 
-def build_transforms(transforms: Any, input_size: int) -> tuple[Any, Any]:
+def build_transforms(
+    transforms: Any,
+    input_size: int,
+    *,
+    backend: str = "dinov2_vitb14",
+) -> tuple[Any, Any]:
+    """Build the fixed visual preprocessing declared by the selected backbone."""
+    if backend == CLIP_VITB16_BACKEND:
+        if int(input_size) != 224:
+            raise ValueError("R4-C4 CLIP ViT-B/16 preprocessing requires input_size=224.")
+        normalize = transforms.Normalize(mean=CLIP_MEAN, std=CLIP_STD)
+        train_transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+        eval_transform = transforms.Compose(
+            [
+                transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+        return train_transform, eval_transform
+    if backend != "dinov2_vitb14":
+        raise ValueError(f"Unsupported visual preprocessing backend: {backend!r}")
     normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
     train_transform = transforms.Compose(
         [
@@ -635,9 +805,37 @@ def build_transforms(transforms: Any, input_size: int) -> tuple[Any, Any]:
     return train_transform, eval_transform
 
 
+def resolve_lora_batching(train_cfg: dict[str, Any]) -> tuple[int, int]:
+    """Resolve formal effective/physical batch sizes without changing step count."""
+    effective_batch_size = int(train_cfg["batch_size"])
+    microbatch_size = int(train_cfg.get("microbatch_size", effective_batch_size))
+    if effective_batch_size <= 0 or microbatch_size <= 0:
+        raise ValueError("lora_train batch_size and microbatch_size must be positive.")
+    if microbatch_size > effective_batch_size:
+        raise ValueError("lora_train.microbatch_size cannot exceed the effective batch_size.")
+    return effective_batch_size, microbatch_size
+
+
+def lora_microbatch_slices(batch_size: int, microbatch_size: int) -> tuple[slice, ...]:
+    """Partition one effective DataLoader batch without changing its order."""
+    if batch_size <= 0 or microbatch_size <= 0:
+        raise ValueError("Microbatch slices require positive batch sizes.")
+    return tuple(slice(start, min(batch_size, start + microbatch_size)) for start in range(0, batch_size, microbatch_size))
+
+
 def inject_lora(torch: Any, module: Any, target_modules: list[str], rank: int, alpha: float, dropout: float) -> list[str]:
     replaced: list[str] = []
     for name, child in list(module.named_modules()):
+        if isinstance(child, torch.nn.MultiheadAttention):
+            # CLIP's visual attention exposes one fused ``in_proj_weight``;
+            # present it to the common target matcher as a virtual ``qkv``
+            # submodule so the frozen config remains semantically explicit.
+            if not lora_module_matches_target(f"{name}.qkv", target_modules):
+                continue
+            parent, child_name = get_parent_module(module, name)
+            setattr(parent, child_name, LoRAMultiheadAttention.make(torch, child, rank=rank, alpha=alpha, dropout=dropout))
+            replaced.append(f"{name}.qkv")
+            continue
         if not isinstance(child, torch.nn.Linear):
             continue
         if not lora_module_matches_target(name, target_modules):

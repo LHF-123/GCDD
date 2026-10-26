@@ -1,0 +1,66 @@
+# Frozen R4-C4 cross-backbone protocol. Environment variables make the exact
+# source assets portable while the manifest/weight SHA-256 checks remain fixed.
+schema_version: 1
+
+runtime:
+  # A marketed 24GB accelerator can report below 24000 MiB. Admission is
+  # therefore 22000 MiB; peak reserved still uses min(22 GiB, total - 2 GiB).
+  nominal_24gb_minimum_mib: 22000
+  eval_microbatch_size: 32
+
+output:
+  root: ../outputs_major_revision/r4_c4_clip_vitb16_cyclic40
+  instrumentation_root: ../outputs_major_revision/r4_c4_clip_vitb16_cyclic40/profiling
+
+historical:
+  repository_root: ..
+
+backbone:
+  architecture: ViT-B-16
+  pretrained: openai
+  # Set this on each execution host. The declared SHA-256 is invariant.
+  weights_path: "${R4_C4_CLIP_VITB16_WEIGHTS}"
+  weights_sha256: 5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f
+  input_size: 224
+  cls_feature_space: final_ln_pre_projection
+
+formal:
+  methods: [all_noisy_ce, dynamic_small_loss, jal_ce, pgdf]
+  noise_rate: 0.4
+  noise_seed: 42
+  validation_ratio: 0.1
+  validation_seed: 20250726
+  training_seeds: [1, 42, 88]
+  epochs: 30
+  dynamic_ratio: 0.8
+  fixed_p: 0.4
+  warmup_epochs: 5
+  update_interval: 5
+  effective_batch_size: 80
+  microbatch_size: 16
+
+datasets:
+  cub:
+    display_name: CUB-200-2011
+    base_input_dir: ../outputs/CUB_200_2011/CUB-200-2011-asym40-s42/v1_cub_asym_r0p4_s42
+    source_noise_index: ../outputs/CUB_200_2011/noise_indices/cub_asym_r0p4_s42_index.csv
+    source_resolved_config: ../outputs_major_revision/pgdf_dynamic_ref_cub40/resolved_config.yaml
+    source_validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_cub40
+    path_maps:
+      - [/root/autodl-tmp/CUB_200_2011, "${R4_C4_CUB_ROOT}"]
+  cars:
+    display_name: Stanford-Cars
+    base_input_dir: ../outputs/Stanford_Cars/Stanford-Cars-asym40-s42/v1_cars_asym_r0p4_s42
+    source_noise_index: ../outputs/Stanford_Cars/noise_indices/stanford_cars_asym_r0p4_s42_index.csv
+    source_resolved_config: ../outputs_major_revision/pgdf_dynamic_ref_cars40/resolved_config.yaml
+    source_validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_cars40
+    path_maps:
+      - [/root/autodl-tmp/Stanford_Cars, "${R4_C4_CARS_ROOT}"]
+  aircraft:
+    display_name: FGVC-Aircraft
+    base_input_dir: ../outputs/FGVC_Aircraft/FGVC-Aircraft-asym40-s42/v1_aircraft_asym_r0p4_s42
+    source_noise_index: ../outputs/FGVC_Aircraft/noise_indices/fgvc_aircraft_asym_r0p4_s42_index.csv
+    source_resolved_config: ../outputs_major_revision/pgdf_dynamic_ref_aircraft40/resolved_config.yaml
+    source_validation_dir: ../outputs_major_revision/pgdf_dynamic_ref_aircraft40
+    path_maps:
+      - [/root/autodl-tmp/FGVC_Aircraft, "${R4_C4_AIRCRAFT_ROOT}"]
