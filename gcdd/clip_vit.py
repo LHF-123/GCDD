@@ -21,6 +21,11 @@ CLIP_VITB16_CLS_DIM = 768
 CLIP_VITB16_PROJECTED_DIM = 512
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+CLIP_VITB16_OPENAI_SHA256 = "5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f"
+CLIP_VITB16_OPENAI_URL = (
+    "https://openaipublic.azureedge.net/clip/models/"
+    f"{CLIP_VITB16_OPENAI_SHA256}/ViT-B-16.pt"
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -30,6 +35,36 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def download_clip_vitb16_weights(cache_dir: Path) -> Path:
+    """Fetch exactly the registered OpenAI ViT-B/16 file and verify its hash.
+
+    This is intentionally an explicit setup action rather than a training
+    worker side effect. It pins the direct OpenAI URL and never accepts an
+    alternate model or a Hugging Face mirror.
+    """
+    try:
+        import open_clip.pretrained as pretrained
+    except ImportError as exc:  # pragma: no cover - deployment dependency error
+        raise RuntimeError("R4-C4 CLIP weight retrieval requires open_clip_torch==3.2.0.") from exc
+    cfg = pretrained.get_pretrained_cfg(CLIP_VITB16_ARCHITECTURE, CLIP_VITB16_PRETRAINED_SOURCE)
+    if not isinstance(cfg, dict) or cfg.get("url") != CLIP_VITB16_OPENAI_URL:
+        raise RuntimeError("OpenCLIP's registered OpenAI ViT-B/16 URL does not match the frozen R4-C4 protocol.")
+    cache_dir = cache_dir.expanduser()
+    existing = cache_dir / "ViT-B-16.pt"
+    if existing.is_file() and sha256_file(existing) == CLIP_VITB16_OPENAI_SHA256:
+        return existing.resolve()
+    target = Path(pretrained.download_pretrained(cfg, prefer_hf_hub=False, cache_dir=str(cache_dir))).resolve()
+    if target.name != "ViT-B-16.pt":
+        raise RuntimeError(f"Unexpected CLIP ViT-B/16 cache filename: {target.name}")
+    actual_sha = sha256_file(target)
+    if actual_sha != CLIP_VITB16_OPENAI_SHA256:
+        raise RuntimeError(
+            "Downloaded OpenAI CLIP ViT-B/16 SHA-256 does not match the frozen protocol: "
+            f"{actual_sha} != {CLIP_VITB16_OPENAI_SHA256}"
+        )
+    return target
 
 
 def validate_clip_vitb16_config(cfg: dict[str, Any]) -> dict[str, Any]:

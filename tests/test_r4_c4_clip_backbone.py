@@ -11,7 +11,10 @@ import torch
 from gcdd.clip_vit import (
     CLIP_VITB16_BACKEND,
     CLIP_VITB16_CLS_DIM,
+    CLIP_VITB16_OPENAI_SHA256,
+    download_clip_vitb16_weights,
     extract_clip_final_ln_pre_projection_cls,
+    sha256_file,
 )
 from gcdd.lora_training import (
     DINOv2LoRAClassifier,
@@ -71,6 +74,12 @@ class ClipBackboneTest(unittest.TestCase):
         self.assertEqual(0.4, FROZEN["noise_rate"])
         self.assertEqual(80, FROZEN["effective_batch_size"])
         self.assertEqual(16, FROZEN["microbatch_size"])
+
+    @unittest.skipUnless(WEIGHTS.is_file(), "local CLIP ViT-B/16 weights are not installed")
+    def test_explicit_fetch_reuses_verified_openai_cache(self) -> None:
+        resolved = download_clip_vitb16_weights(WEIGHTS.parent)
+        self.assertEqual(WEIGHTS.resolve(), resolved)
+        self.assertEqual(CLIP_VITB16_OPENAI_SHA256, sha256_file(resolved))
 
     @unittest.skipUnless(WEIGHTS.is_file(), "local CLIP ViT-B/16 weights are not installed")
     def test_local_openai_clip_visual_has_preprojection_cls_and_qkv_lora_gradients(self) -> None:

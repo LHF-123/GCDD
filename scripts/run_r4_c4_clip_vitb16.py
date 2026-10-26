@@ -35,6 +35,7 @@ from gcdd.r4_c4_clip_vitb16 import (
     validate_frozen_config,
     write_prepared_assets,
 )
+from gcdd.clip_vit import download_clip_vitb16_weights
 
 
 DEFAULT_CONFIG = ROOT / "configs" / "r4_c4_clip_vitb16_cyclic40.yaml"
@@ -44,6 +45,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument(
+        "--fetch-clip-weights",
+        action="store_true",
+        help="Download and SHA-256-verify the frozen OpenAI ViT-B/16 file; prints only its local path.",
+    )
     modes.add_argument("--preflight", action="store_true", help="CPU/data/weight/GPU-capacity audit; does not load CLIP on CUDA.")
     modes.add_argument("--prepare-only", action="store_true", help="Write isolated manifest adapters, protocol audit, and frozen 36-run commands only.")
     modes.add_argument("--dry-run", action="store_true", help="Print the 36 formal commands without preparing or training.")
@@ -52,6 +58,12 @@ def parse_args() -> argparse.Namespace:
     modes.add_argument("--run-all", action="store_true", help="Run all pending formal tasks after the frozen GPU preflight passes.")
     modes.add_argument("--resume", action="store_true", help="Run only pending tasks; completed verified tasks remain untouched.")
     modes.add_argument("--analyze", action="store_true", help="Summarize only real verified formal outputs.")
+    parser.add_argument(
+        "--weights-cache-dir",
+        type=Path,
+        default=None,
+        help="Cache directory for --fetch-clip-weights (default: $R4_C4_CLIP_VITB16_CACHE_DIR or ~/.cache/clip).",
+    )
     return parser.parse_args()
 
 
@@ -88,6 +100,12 @@ def acquire_lock(root: Path) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.fetch_clip_weights:
+        cache_dir = args.weights_cache_dir or Path(
+            os.environ.get("R4_C4_CLIP_VITB16_CACHE_DIR", str(Path.home() / ".cache" / "clip"))
+        )
+        print(download_clip_vitb16_weights(cache_dir.expanduser()))
+        return 0
     config = load_config(args.config)
     if args.preflight:
         print(json.dumps(preflight(config), ensure_ascii=False, indent=2))
