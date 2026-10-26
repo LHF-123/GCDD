@@ -27,7 +27,7 @@ from gcdd.lora_training import (
     parse_target_modules,
     resolve_lora_batching,
 )
-from gcdd.r4_c4_clip_vitb16 import FORMAL_RUNS, FROZEN, Task, task_status
+from gcdd.r4_c4_clip_vitb16 import FORMAL_RUNS, FROZEN, Task, gpu_preflight_attempt_root, task_status
 
 
 WEIGHTS = Path.home() / ".cache" / "clip" / "ViT-B-16.pt"
@@ -72,6 +72,16 @@ class ClipBackboneTest(unittest.TestCase):
             task.task_dir.mkdir(parents=True)
             (task.task_dir / "RUNNING.json").write_text(json.dumps({"pid": 1}), encoding="utf-8")
             self.assertEqual(("RUNNING", []), task_status(task))
+
+    def test_gpu_preflight_attempt_directory_changes_with_code_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = {"output": {"root": temporary}, "formal": {"epochs": 30}}
+            first = gpu_preflight_attempt_root(config, {"gcdd/r4_c4_clip_vitb16.py": "a"})
+            repeated = gpu_preflight_attempt_root(config, {"gcdd/r4_c4_clip_vitb16.py": "a"})
+            changed = gpu_preflight_attempt_root(config, {"gcdd/r4_c4_clip_vitb16.py": "b"})
+            self.assertEqual(first, repeated)
+            self.assertNotEqual(first, changed)
+            self.assertEqual(Path(temporary) / "gpu_preflight", first.parent)
 
     def test_fused_qkv_wrapper_is_identity_before_lora_training(self) -> None:
         base = torch.nn.MultiheadAttention(8, 2, dropout=0.0, batch_first=True).eval()

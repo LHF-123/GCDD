@@ -696,13 +696,22 @@ def _preflight_subset(info: dict[str, Any], count: int = 96) -> tuple[list[str],
     return ([info["base_paths"][int(item)] for item in chosen], labels, [info["base_paths"][item] for item in validation_indices], info["clean_labels"][validation_indices])
 
 
+def gpu_preflight_attempt_root(config: dict[str, Any], source_code_sha256: dict[str, str]) -> Path:
+    """Return a non-overwriting output root for one frozen preflight identity."""
+    identity = canonical_sha256(
+        {"config_sha256": canonical_sha256(config), "source_code_sha256": source_code_sha256}
+    )[:16]
+    return Path(config["output"]["root"]) / "gpu_preflight" / f"attempt_{identity}"
+
+
 def gpu_preflight(config: dict[str, Any], prepared: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Run actual CUDA smoke paths without creating any formal run artifact."""
     gpu = _runtime_gpu_state(int(config["runtime"]["nominal_24gb_minimum_mib"]))
     root = Path(config["output"]["root"])
     report_path = root / "GPU_24GB_MEMORY_PREFLIGHT.json"
+    source_code_sha256 = current_code_fingerprints()
     if gpu["status"] != "READY_FOR_GPU_PREFLIGHT":
-        payload = {"status": "READY_WAIT_GPU", "config_sha256": canonical_sha256(config), "source_code_sha256": current_code_fingerprints(), "reason": "A nominal 24GB GPU with at least the 2GiB safety reserve is required before CUDA smoke execution.", "gpu": gpu}
+        payload = {"status": "READY_WAIT_GPU", "config_sha256": canonical_sha256(config), "source_code_sha256": source_code_sha256, "reason": "A nominal 24GB GPU with at least the 2GiB safety reserve is required before CUDA smoke execution.", "gpu": gpu}
         write_json(report_path, payload)
         write_text(root / "GPU_24GB_MEMORY_PREFLIGHT.md", "# R4-C4 GPU preflight\n\n`READY_WAIT_GPU`: no eligible 24GB GPU was available; no CUDA model or formal run was started.\n")
         return payload
@@ -715,6 +724,7 @@ def gpu_preflight(config: dict[str, Any], prepared: dict[str, dict[str, Any]]) -
     base_cfg["lora_train"]["epochs"] = 2
     base_cfg["lora_train"]["num_workers"] = 0
     base_cfg["lora_train"]["pin_memory"] = False
+    attempt_root = gpu_preflight_attempt_root(config, source_code_sha256)
     profiles: list[dict[str, Any]] = []
     gradient_check: dict[str, Any] = {}
     failure: str | None = None
@@ -739,7 +749,7 @@ def gpu_preflight(config: dict[str, Any], prepared: dict[str, dict[str, Any]]) -
         for method_key, label in (("all_noisy_ce", "all-noisy CE"), ("jal_ce", "JAL-CE"), ("dynamic_small_loss", "dynamic small-loss"), ("pgdf", "PGDF DynamicProto")):
             cfg = copy.deepcopy(base_cfg)
             profiler = RunProfiler(f"r4-c4-clip-preflight-{method_key}", ProfilingMode.DETAILED, device_type="cuda", torch_module=torch)
-            checkpoint_root = root / "gpu_preflight" / method_key / "checkpoints"
+            checkpoint_root = attempt_root / method_key / "checkpoints"
             if method_key in {"all_noisy_ce", "jal_ce"}:
                 cfg["loss_type"] = "jal_ce" if method_key == "jal_ce" else "ce"
                 result = train_dinov2_lora(train_paths, train_labels, validation_paths, validation_labels, np.ones(len(train_labels), dtype=bool), cfg, label, 1,
@@ -749,7 +759,7 @@ def gpu_preflight(config: dict[str, Any], prepared: dict[str, dict[str, Any]]) -
                                                  retention_ratio=0.8, warmup_epochs=0, update_interval=1, path_maps=[], proto_keep_ratio=0.4 if method_key == "pgdf" else None,
                                                  selection_strategy="loss_and_proto" if method_key == "pgdf" else "loss_only", prototype_mode="dynamic_lora" if method_key == "pgdf" else "fixed",
                                                  checkpoint_path=checkpoint_root / "best_val.pt", final_checkpoint_path=checkpoint_root / "last.pt", profiler=profiler)
-            profile_path = profiler.write_json(root / "gpu_preflight" / "profiling")
+            profile_path = profiler.write_json(attempt_root / "profiling")
             profile = json.loads(profile_path.read_text(encoding="utf-8"))
             checkpoint_readable = False
             if (checkpoint_root / "best_val.pt").is_file() and (checkpoint_root / "last.pt").is_file():
@@ -762,7 +772,7 @@ def gpu_preflight(config: dict[str, Any], prepared: dict[str, dict[str, Any]]) -
     max_reserved = max((item["profile"]["memory"]["overall_run_peak"]["reserved_bytes"] or 0 for item in profiles), default=0)
     selection_peak = max((item["profile"]["memory"]["phases"].get("selection", {}).get("reserved_bytes") or 0 for item in profiles), default=0)
     passed = failure is None and len(profiles) == 4 and max_reserved <= gpu["safe_reserved_limit_bytes"] and all(item["checkpoint_readable"] for item in profiles) and gradient_check.get("nonzero_lora_gradient_parameter_tensors", 0) > 0 and gradient_check.get("nonzero_head_gradient_parameter_tensors", 0) > 0
-    payload = {"status": "PASS" if passed else "BLOCKED_GPU_MEMORY" if failure and "out of memory" in failure.lower() else "FAIL", "config_sha256": canonical_sha256(config), "source_code_sha256": current_code_fingerprints(), "gpu": gpu, "formal_batching": {"effective_batch": 80, "microbatch": 16, "gradient_accumulation_steps": 5, "amp_dtype": "float16 autocast"}, "gradient_check": gradient_check, "methods": profiles, "overall_peak_reserved_bytes": max_reserved, "pgdf_selection_peak_reserved_bytes": selection_peak, "safety_limit_bytes": gpu["safe_reserved_limit_bytes"], "failure": failure}
+    payload = {"status": "PASS" if passed else "BLOCKED_GPU_MEMORY" if failure and "out of memory" in failure.lower() else "FAIL", "config_sha256": canonical_sha256(config), "source_code_sha256": source_code_sha256, "gpu": gpu, "formal_batching": {"effective_batch": 80, "microbatch": 16, "gradient_accumulation_steps": 5, "amp_dtype": "float16 autocast"}, "gradient_check": gradient_check, "methods": profiles, "overall_peak_reserved_bytes": max_reserved, "pgdf_selection_peak_reserved_bytes": selection_peak, "safety_limit_bytes": gpu["safe_reserved_limit_bytes"], "preflight_attempt_root": str(attempt_root), "failure": failure}
     write_json(report_path, payload)
     write_text(root / "GPU_24GB_MEMORY_PREFLIGHT.md", "# R4-C4 GPU preflight\n\n" + json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return payload
