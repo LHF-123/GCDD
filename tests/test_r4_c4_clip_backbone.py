@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -84,7 +85,15 @@ class ClipBackboneTest(unittest.TestCase):
     @unittest.skipUnless(WEIGHTS.is_file(), "local CLIP ViT-B/16 weights are not installed")
     def test_local_openai_clip_visual_has_preprojection_cls_and_qkv_lora_gradients(self) -> None:
         cfg = clip_config()
-        model = DINOv2LoRAClassifier.make(torch, cfg, num_classes=3)
+        import open_clip
+
+        with mock.patch.object(
+            open_clip,
+            "create_model_and_transforms",
+            wraps=open_clip.create_model_and_transforms,
+        ) as create_model:
+            model = DINOv2LoRAClassifier.make(torch, cfg, num_classes=3)
+        self.assertIs(create_model.call_args.kwargs["weights_only"], False)
         freeze_all(model.backbone)
         modules = inject_lora(torch, model.backbone, parse_target_modules("qkv"), rank=8, alpha=16.0, dropout=0.05)
         for parameter in model.head.parameters():

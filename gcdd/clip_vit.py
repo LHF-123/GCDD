@@ -129,6 +129,11 @@ def load_clip_vitb16_visual(torch: Any, cfg: dict[str, Any]) -> Any:
         CLIP_VITB16_ARCHITECTURE,
         pretrained=identity["weights_path"],
         device="cpu",
+        # PyTorch 2.6 defaults torch.load(weights_only=True), which rejects
+        # the original OpenAI TorchScript archive. This is safe here only
+        # because validate_clip_vitb16_config already verified the exact
+        # frozen OpenAI ViT-B/16 SHA-256 above.
+        weights_only=False,
     )
     visual = model.visual
     if tuple(int(value) for value in visual.image_size) != (224, 224):
